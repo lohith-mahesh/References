@@ -7,13 +7,11 @@ import numpy as np
 import pandas as pd
 from IPython.display import display as ipy_display
 from ipywidgets import SelectionRangeSlider
-from matplotlib.collections import LineCollection, PolyCollection
+from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 from matplotlib.transforms import blended_transform_factory
 
 selected_parameters = globals().get("selected_parameters", [])
-
 data_df = _data_df.copy()
 
 if "AssetIdentifier" in data_df.columns:
@@ -21,31 +19,10 @@ if "AssetIdentifier" in data_df.columns:
         data_df["AssetIdentifier"].astype("string") == str(selected_esn)
     ].copy()
 
-if "Timestamp" in data_df.columns:
-    data_df["Timestamp"] = pd.to_datetime(
-        data_df["Timestamp"],
-        errors="coerce",
-    )
-
-if "StartDatetime" in data_df.columns:
-    data_df["StartDatetime"] = pd.to_datetime(
-        data_df["StartDatetime"],
-        errors="coerce",
-    )
-
-if FLIGHT_PHASE_COLUMN in data_df.columns:
-    data_df[FLIGHT_PHASE_COLUMN] = pd.to_numeric(
-        data_df[FLIGHT_PHASE_COLUMN],
-        errors="coerce",
-    )
-
-for phase_column in globals().get("FLIGHT_PHASE_COLUMNS", {}).values():
-    if phase_column in data_df.columns:
-        data_df[phase_column] = pd.to_numeric(
-            data_df[phase_column],
-            errors="coerce",
-        )
-
+data_df["Timestamp"] = pd.to_datetime(data_df["Timestamp"], errors="coerce")
+data_df["StartDatetime"] = pd.to_datetime(
+    data_df["StartDatetime"], errors="coerce"
+)
 data_df = data_df.dropna(
     subset=["Timestamp", "StartDatetime"]
 ).sort_values(
@@ -53,84 +30,26 @@ data_df = data_df.dropna(
     kind="stable",
 )
 
-PLOT_PHASE_COLUMN = "_PlotFlightPhase"
-
-phase_sources = globals().get("FLIGHT_PHASE_COLUMNS", {})
-ac_phase_column = phase_sources.get("AC")
-bc_phase_column = phase_sources.get("BC")
-
-if (
-    ac_phase_column in data_df.columns
-    and bc_phase_column in data_df.columns
-):
-    ac_phase = data_df.groupby(
-        "StartDatetime",
-        sort=False,
-    )[ac_phase_column].ffill()
-
-    bc_phase = data_df.groupby(
-        "StartDatetime",
-        sort=False,
-    )[bc_phase_column].ffill()
-
-    phase_conflict = (
-        ac_phase.notna()
-        & bc_phase.notna()
-        & ac_phase.ne(bc_phase)
-    )
-
-    data_df[PLOT_PHASE_COLUMN] = (
-        ac_phase
-        .combine_first(bc_phase)
-        .mask(phase_conflict)
-    )
-
-elif FLIGHT_PHASE_COLUMN in data_df.columns:
-    data_df[PLOT_PHASE_COLUMN] = data_df.groupby(
-        "StartDatetime",
-        sort=False,
-    )[FLIGHT_PHASE_COLUMN].ffill()
-
-else:
-    data_df[PLOT_PHASE_COLUMN] = np.nan
-
 MAX_SLIDER_POINTS = 1000
 MAX_SIGNAL_GROUPS = 16
 MAX_RENDER_PIXELS = 50_000_000
-
-CHANNEL_COLORS = {
-    "AC": "#1f77b4",
-    "BC": "#ff7f0e",
-}
-
-KNOWN_PHASE_COLORS = {
-    "Phase 1": "#4e79a7",
-    "Phase 2": "#59a14f",
-    "Phase 3": "#f28e2b",
-    "Phase 4": "#e15759",
-    "Phase 5": "#b07aa1",
-    "Phase 6": "#76b7b2",
-    "Unknown": "#bab0ac",
-}
-
-PHASE_ALPHA = 0.12
+CHANNEL_COLORS = {"AC": "#1f77b4", "BC": "#ff7f0e"}
 NO_DATA_COLOR = "#c62828"
 
 
 def _full_parameter_name(short_name):
-    if short_name.startswith(PARAMETER_PREFIX):
-        return short_name
-
-    return PARAMETER_PREFIX + short_name
+    return (
+        short_name
+        if short_name.startswith(PARAMETER_PREFIX)
+        else PARAMETER_PREFIX + short_name
+    )
 
 
 def _channel_and_signal(short_name):
     for channel in CHANNELS:
         prefix = f"{channel}_"
-
         if short_name.startswith(prefix):
             return channel, short_name[len(prefix):]
-
     return "", short_name
 
 
@@ -138,36 +57,27 @@ def _numeric_series(series):
     non_null = series.dropna()
 
     if non_null.empty:
-        return (
-            pd.Series(
-                np.nan,
-                index=series.index,
-                dtype="float64",
-            ),
-            False,
-        )
+        return pd.Series(
+            np.nan,
+            index=series.index,
+            dtype="float64",
+        ), False
 
-    is_boolean = non_null.map(
+    if non_null.map(
         lambda value: isinstance(value, (bool, np.bool_))
-    ).all()
-
-    if is_boolean:
+    ).all():
         return series.map({True: 1.0, False: 0.0}), True
 
-    numeric = pd.to_numeric(
-        series,
-        errors="coerce",
-    )
-
+    numeric = pd.to_numeric(series, errors="coerce")
     values = numeric.dropna().to_numpy(dtype=float)
 
-    is_discrete = bool(
+    discrete = bool(
         len(values)
         and len(np.unique(values)) <= 8
         and np.allclose(values, np.round(values))
     )
 
-    return numeric, is_discrete
+    return numeric, discrete
 
 
 def _match_timestamp_timezone(value, reference):
@@ -185,13 +95,9 @@ def _match_timestamp_timezone(value, reference):
     return timestamp
 
 
-def _format_gap_duration(total_seconds):
-    total_seconds = max(
-        0,
-        int(round(total_seconds)),
-    )
-
-    days, remainder = divmod(total_seconds, 86400)
+def _format_gap_duration(seconds):
+    seconds = max(0, int(round(seconds)))
+    days, remainder = divmod(seconds, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes, seconds = divmod(remainder, 60)
 
@@ -208,78 +114,73 @@ def _format_gap_duration(total_seconds):
 
 
 def _build_compressed_timeline(frame):
-    flight_frames = []
+    raw_flights = []
 
-    for flight_key, flight_frame in frame.groupby(
+    for key, group in frame.groupby(
         "StartDatetime",
         sort=False,
         dropna=False,
     ):
-        ordered = flight_frame.sort_values(
+        group = group.sort_values(
             "Timestamp",
             kind="stable",
         ).copy()
 
-        actual_start = ordered["Timestamp"].iloc[0]
-        actual_end = ordered["Timestamp"].iloc[-1]
+        actual_start = group["Timestamp"].iloc[0]
+        actual_end = group["Timestamp"].iloc[-1]
 
-        positive_deltas = (
-            ordered["Timestamp"]
+        deltas = (
+            group["Timestamp"]
             .drop_duplicates()
             .sort_values()
             .diff()
             .dt.total_seconds()
         )
+        deltas = deltas[deltas > 0]
 
-        positive_deltas = positive_deltas.loc[
-            positive_deltas > 0
-        ]
-
-        cadence_seconds = (
-            float(positive_deltas.median())
-            if not positive_deltas.empty
+        cadence = (
+            float(deltas.median())
+            if not deltas.empty
             else 1.0
         )
 
-        flight_frames.append(
+        raw_flights.append(
             {
-                "key": flight_key,
-                "frame": ordered,
+                "key": key,
+                "frame": group,
                 "actual_start": actual_start,
                 "actual_end": actual_end,
-                "cadence_seconds": max(
-                    cadence_seconds,
-                    0.001,
-                ),
-                "duration_seconds": max(
+                "cadence": max(cadence, 0.001),
+                "duration": max(
                     float(
                         (
                             actual_end
                             - actual_start
                         ).total_seconds()
                     ),
-                    max(cadence_seconds, 1.0),
+                    cadence,
+                    1.0,
                 ),
             }
         )
 
-    flight_frames.sort(
+    raw_flights.sort(
         key=lambda item: item["actual_start"]
     )
 
-    active_seconds = sum(
-        item["duration_seconds"]
-        for item in flight_frames
+    active_duration = sum(
+        item["duration"]
+        for item in raw_flights
     )
 
     gap_count = max(
         0,
-        len(flight_frames) - 1,
+        len(raw_flights) - 1,
     )
 
-    visual_gap_seconds = (
+    display_gap = (
         max(
-            active_seconds
+            active_duration
             * min(
                 0.02,
                 0.15 / gap_count,
@@ -296,16 +197,16 @@ def _build_compressed_timeline(frame):
     gaps = []
     previous = None
 
-    for item in flight_frames:
+    for item in raw_flights:
         if previous is not None:
             gap_start = cursor
-            cursor += visual_gap_seconds
+            cursor += display_gap
 
             gaps.append(
                 {
-                    "plot_start": gap_start,
-                    "plot_end": cursor,
-                    "plot_center": (
+                    "start": gap_start,
+                    "end": cursor,
+                    "center": (
                         gap_start + cursor
                     ) / 2.0,
                     "actual_seconds": max(
@@ -321,7 +222,6 @@ def _build_compressed_timeline(frame):
             )
 
         plot_start = cursor
-
         part = item["frame"].copy()
 
         part["_plot_x"] = (
@@ -334,11 +234,10 @@ def _build_compressed_timeline(frame):
 
         plot_end = (
             plot_start
-            + item["duration_seconds"]
+            + item["duration"]
         )
 
         part["_flight_order"] = len(flights)
-
         timeline_parts.append(part)
 
         flights.append(
@@ -352,231 +251,58 @@ def _build_compressed_timeline(frame):
         cursor = plot_end
         previous = item
 
-    if timeline_parts:
-        timeline = pd.concat(
+    timeline = (
+        pd.concat(
             timeline_parts,
             ignore_index=True,
         )
-    else:
-        timeline = frame.iloc[0:0].copy()
+        if timeline_parts
+        else frame.iloc[0:0].copy()
+    )
 
     return timeline, flights, gaps, cursor
 
 
-def _phase_label(value):
-    if pd.isna(value):
-        return "Unknown"
-
-    numeric_value = float(value)
-
-    if numeric_value.is_integer():
-        return f"Phase {int(numeric_value)}"
-
-    return f"Phase {numeric_value:g}"
-
-
-def _phase_color(label):
-    if label in KNOWN_PHASE_COLORS:
-        return KNOWN_PHASE_COLORS[label]
-
-    numeric_text = label.replace(
-        "Phase ",
-        "",
-        1,
-    )
-
-    try:
-        palette_index = (
-            int(abs(float(numeric_text)) * 997)
-            % 20
-        )
-    except ValueError:
-        palette_index = (
-            sum(
-                ord(character)
-                for character in label
-            )
-            % 20
-        )
-
-    return plt.get_cmap("tab20")(
-        palette_index
-    )
-
-
-def _build_phase_spans(timeline, flights):
-    spans = []
-
-    for flight_order, flight in enumerate(flights):
-        flight_frame = timeline.loc[
-            timeline["_flight_order"] == flight_order,
-            ["_plot_x", PLOT_PHASE_COLUMN],
-        ].sort_values(
-            "_plot_x",
-            kind="stable",
-        )
-
-        if flight_frame.empty:
-            continue
-
-        labels = flight_frame[
-            PLOT_PHASE_COLUMN
-        ].map(_phase_label)
-
-        change_mask = labels.ne(
-            labels.shift()
-        )
-
-        change_positions = np.flatnonzero(
-            change_mask.to_numpy()
-        )
-
-        for run_index, start_position in enumerate(
-            change_positions
-        ):
-            start_x = float(
-                flight_frame["_plot_x"].iloc[
-                    start_position
-                ]
-            )
-
-            if run_index + 1 < len(
-                change_positions
-            ):
-                end_position = change_positions[
-                    run_index + 1
-                ]
-
-                end_x = float(
-                    flight_frame["_plot_x"].iloc[
-                        end_position
-                    ]
-                )
-            else:
-                end_x = float(
-                    flight["plot_end"]
-                )
-
-            if end_x > start_x:
-                spans.append(
-                    (
-                        start_x,
-                        end_x,
-                        labels.iloc[
-                            start_position
-                        ],
-                    )
-                )
-
-    return spans
-
-
-def _draw_phase_background(
-    axis,
-    phase_spans,
-):
-    vertices = []
-    colors = []
-
-    for start_x, end_x, phase_name in phase_spans:
-        if end_x <= start_x:
-            continue
-
-        vertices.append(
-            [
-                (start_x, 0.0),
-                (start_x, 1.0),
-                (end_x, 1.0),
-                (end_x, 0.0),
-            ]
-        )
-
-        colors.append(
-            _phase_color(phase_name)
-        )
-
-    if not vertices:
-        return
-
-    collection = PolyCollection(
-        vertices,
-        facecolors=colors,
-        edgecolors="none",
-        linewidths=0,
-        antialiaseds=False,
-        alpha=PHASE_ALPHA,
-        transform=blended_transform_factory(
-            axis.transData,
-            axis.transAxes,
-        ),
-        zorder=0,
-    )
-
-    axis.add_collection(
-        collection,
-        autolim=False,
-    )
-
-
-def _timeline_ticks(
-    flights,
-    maximum_ticks=14,
-):
+def _timeline_ticks(flights, maximum=14):
     if not flights:
         return [], []
 
     if len(flights) > 7:
-        selected_indices = np.unique(
+        indices = np.unique(
             np.linspace(
                 0,
                 len(flights) - 1,
-                num=min(
-                    maximum_ticks,
-                    len(flights),
-                ),
+                min(maximum, len(flights)),
                 dtype=int,
             )
         )
 
-        tick_specs = [
+        specifications = [
             (flights[index], 0.0)
-            for index in selected_indices
+            for index in indices
         ]
 
     else:
-        ticks_per_flight = max(
+        count = max(
             1,
-            maximum_ticks // len(flights),
+            maximum // len(flights),
         )
 
-        tick_specs = []
-
-        for flight in flights:
-            fractions = np.linspace(
+        specifications = [
+            (flight, float(fraction))
+            for flight in flights
+            for fraction in np.linspace(
                 0.0,
                 1.0,
-                num=ticks_per_flight,
-                endpoint=True,
+                count,
             )
+        ]
 
-            tick_specs.extend(
-                (
-                    flight,
-                    float(fraction),
-                )
-                for fraction in fractions
-            )
+    positions = []
+    labels = []
 
-    tick_positions = []
-    tick_labels = []
-
-    for flight, fraction in tick_specs:
-        elapsed_seconds = (
-            flight["duration_seconds"]
-            * fraction
-        )
-
-        actual_seconds = max(
+    for flight, fraction in specifications:
+        actual_duration = max(
             0.0,
             float(
                 (
@@ -586,26 +312,26 @@ def _timeline_ticks(
             ),
         )
 
-        actual_time = (
+        timestamp = (
             flight["actual_start"]
             + pd.to_timedelta(
-                actual_seconds * fraction,
+                actual_duration * fraction,
                 unit="s",
             )
         )
 
-        tick_positions.append(
+        positions.append(
             flight["plot_start"]
-            + elapsed_seconds
+            + flight["duration"] * fraction
         )
 
-        tick_labels.append(
-            actual_time.strftime(
+        labels.append(
+            timestamp.strftime(
                 "%d %b %Y\n%H:%M:%S"
             )
         )
 
-    return tick_positions, tick_labels
+    return positions, labels
 
 
 def _draw_axis_break(
@@ -620,22 +346,20 @@ def _draw_axis_break(
 
     half_width = max(
         (
-            gap["plot_end"]
-            - gap["plot_start"]
+            gap["end"]
+            - gap["start"]
         )
         * 0.32,
         0.25,
     )
 
-    center = gap["plot_center"]
-
-    x_values = np.linspace(
-        center - half_width,
-        center + half_width,
+    x = np.linspace(
+        gap["center"] - half_width,
+        gap["center"] + half_width,
         7,
     )
 
-    y_values = np.array(
+    y = np.array(
         [
             -0.018,
             0.018,
@@ -648,8 +372,8 @@ def _draw_axis_break(
     )
 
     axis.plot(
-        x_values,
-        y_values,
+        x,
+        y,
         color="#333333",
         linewidth=1.3,
         transform=transform,
@@ -658,12 +382,11 @@ def _draw_axis_break(
     )
 
     axis.axvline(
-        center,
+        gap["center"],
         color="#777777",
         linewidth=0.7,
         linestyle=":",
         alpha=0.45,
-        zorder=1,
     )
 
     if show_label:
@@ -672,7 +395,7 @@ def _draw_axis_break(
                 "Gap\n"
                 f"{_format_gap_duration(gap['actual_seconds'])}"
             ),
-            xy=(center, 0),
+            xy=(gap["center"], 0),
             xycoords=transform,
             xytext=(0, -42),
             textcoords="offset points",
@@ -688,14 +411,13 @@ def _plot_parameters(
     start_time,
     end_time,
 ):
-    chosen = list(
-        selected_parameters
-    )
+    chosen = list(selected_parameters)
 
     if not chosen:
         print(
             "No plot inputs are applied. "
-            "Add at least one parameter in the previous cell."
+            "Add at least one parameter "
+            "in the previous cell."
         )
         return
 
@@ -720,11 +442,9 @@ def _plot_parameters(
 
     if len(grouped) > MAX_SIGNAL_GROUPS:
         print(
-            f"The current selection creates "
-            f"{len(grouped)} signal groups. "
-            f"Reduce it to "
-            f"{MAX_SIGNAL_GROUPS} or fewer "
-            "for a readable plot."
+            f"Reduce the selection to "
+            f"{MAX_SIGNAL_GROUPS} "
+            "signal groups or fewer."
         )
         return
 
@@ -752,68 +472,43 @@ def _plot_parameters(
         visible
     )
 
-    if timeline.empty:
-        print(
-            "No valid flight timestamps "
-            "fall inside the requested time range."
-        )
-        return
-
-    phase_spans = _build_phase_spans(
-        timeline,
-        flights,
-    )
-
-    figure_width = float(
+    width = float(
         plot_width_widget.value
     )
 
-    subplot_height = float(
-        subplot_height_widget.value
+    height = max(
+        5.5,
+        float(
+            subplot_height_widget.value
+        ) * len(grouped),
     )
 
-    figure_dpi = int(
+    dpi = int(
         plot_dpi_widget.value
     )
 
-    figure_height = max(
-        5.5,
-        subplot_height * len(grouped),
-    )
-
-    render_pixels = (
-        figure_width
-        * figure_height
-        * (figure_dpi ** 2)
-    )
-
-    if render_pixels > MAX_RENDER_PIXELS:
+    if (
+        width
+        * height
+        * dpi**2
+        > MAX_RENDER_PIXELS
+    ):
         print(
-            "The requested width, height, and DPI "
-            "would create an excessively large image. "
-            "Reduce one of the size controls and plot again."
+            "The requested graph size is too large. "
+            "Reduce width, height, or DPI."
         )
         return
 
     figure, axes = plt.subplots(
         len(grouped),
         1,
-        figsize=(
-            figure_width,
-            figure_height,
-        ),
-        dpi=figure_dpi,
+        figsize=(width, height),
+        dpi=dpi,
         sharex=True,
         squeeze=False,
     )
 
     skipped = []
-
-    for axis in axes[:, 0]:
-        _draw_phase_background(
-            axis,
-            phase_spans,
-        )
 
     for axis, (
         signal,
@@ -823,7 +518,7 @@ def _plot_parameters(
         grouped.items(),
     ):
         plotted = False
-        axis_gap_segments = []
+        red_segments = []
 
         for channel, short_name in members:
             full_name = (
@@ -838,10 +533,9 @@ def _plot_parameters(
                 )
                 continue
 
-            parameter_frame = timeline[
+            frame = timeline[
                 [
                     "Timestamp",
-                    "StartDatetime",
                     "_plot_x",
                     "_flight_order",
                     full_name,
@@ -849,19 +543,17 @@ def _plot_parameters(
             ].copy()
 
             (
-                parameter_frame["_value"],
-                is_discrete,
+                frame["_value"],
+                discrete,
             ) = _numeric_series(
-                parameter_frame[full_name]
+                frame[full_name]
             )
 
-            parameter_frame = (
-                parameter_frame.dropna(
-                    subset=["_value"]
-                )
+            frame = frame.dropna(
+                subset=["_value"]
             )
 
-            if parameter_frame.empty:
+            if frame.empty:
                 skipped.append(
                     short_name
                 )
@@ -873,69 +565,62 @@ def _plot_parameters(
 
             for (
                 flight_order,
-                flight_segment,
-            ) in parameter_frame.groupby(
+                flight_frame,
+            ) in frame.groupby(
                 "_flight_order",
                 sort=True,
             ):
-                flight_segment = (
-                    flight_segment.sort_values(
+                flight_frame = (
+                    flight_frame.sort_values(
                         "Timestamp",
                         kind="stable",
                     )
                 )
 
-                positive_deltas = (
-                    flight_segment[
+                deltas = (
+                    flight_frame[
                         "Timestamp"
                     ]
                     .diff()
                     .dt.total_seconds()
                 )
 
-                median_cadence = flights[
-                    int(flight_order)
-                ]["cadence_seconds"]
-
-                gap_threshold = max(
-                    3.0 * median_cadence,
+                threshold = max(
+                    3.0
+                    * flights[
+                        int(flight_order)
+                    ]["cadence"],
                     5.0,
-                )
-
-                chunk_ids = (
-                    positive_deltas
-                    .gt(gap_threshold)
-                    .cumsum()
                 )
 
                 chunks = [
                     chunk
                     for _, chunk
-                    in flight_segment.groupby(
-                        chunk_ids,
+                    in flight_frame.groupby(
+                        deltas
+                        .gt(threshold)
+                        .cumsum(),
                         sort=True,
                     )
                 ]
+
+                first = chunks[0].iloc[0]
 
                 if (
                     previous_flight_endpoint
                     is not None
                 ):
-                    first_row = (
-                        chunks[0].iloc[0]
-                    )
-
-                    axis_gap_segments.append(
+                    red_segments.append(
                         [
                             previous_flight_endpoint,
                             (
                                 float(
-                                    first_row[
+                                    first[
                                         "_plot_x"
                                     ]
                                 ),
                                 float(
-                                    first_row[
+                                    first[
                                         "_value"
                                     ]
                                 ),
@@ -943,43 +628,40 @@ def _plot_parameters(
                         ]
                     )
 
-                for (
-                    chunk_index,
-                    chunk,
-                ) in enumerate(chunks):
-                    if chunk_index:
-                        previous_row = (
+                for index, chunk in enumerate(
+                    chunks
+                ):
+                    if index:
+                        left = (
                             chunks[
-                                chunk_index - 1
+                                index - 1
                             ].iloc[-1]
                         )
 
-                        next_row = (
-                            chunk.iloc[0]
-                        )
+                        right = chunk.iloc[0]
 
-                        axis_gap_segments.append(
+                        red_segments.append(
                             [
                                 (
                                     float(
-                                        previous_row[
+                                        left[
                                             "_plot_x"
                                         ]
                                     ),
                                     float(
-                                        previous_row[
+                                        left[
                                             "_value"
                                         ]
                                     ),
                                 ),
                                 (
                                     float(
-                                        next_row[
+                                        right[
                                             "_plot_x"
                                         ]
                                     ),
                                     float(
-                                        next_row[
+                                        right[
                                             "_value"
                                         ]
                                     ),
@@ -1003,26 +685,19 @@ def _plot_parameters(
                         )
                     )
 
-                    solid_x.append(
-                        np.nan
-                    )
+                    solid_x.append(np.nan)
+                    solid_y.append(np.nan)
 
-                    solid_y.append(
-                        np.nan
-                    )
-
-                last_row = (
-                    chunks[-1].iloc[-1]
-                )
+                last = chunks[-1].iloc[-1]
 
                 previous_flight_endpoint = (
                     float(
-                        last_row[
+                        last[
                             "_plot_x"
                         ]
                     ),
                     float(
-                        last_row[
+                        last[
                             "_value"
                         ]
                     ),
@@ -1038,34 +713,30 @@ def _plot_parameters(
                 linewidth=1.25,
                 drawstyle=(
                     "steps-post"
-                    if is_discrete
+                    if discrete
                     else "default"
                 ),
                 label=(
                     channel
                     or short_name
                 ),
-                zorder=4,
+                zorder=3,
             )
 
             plotted = True
 
-        if axis_gap_segments:
-            gap_collection = (
+        if red_segments:
+            axis.add_collection(
                 LineCollection(
-                    axis_gap_segments,
+                    red_segments,
                     colors=NO_DATA_COLOR,
                     linewidths=1.2,
                     linestyles=(
                         0,
                         (2, 3),
                     ),
-                    zorder=3,
-                )
-            )
-
-            axis.add_collection(
-                gap_collection,
+                    zorder=2,
+                ),
                 autolim=False,
             )
 
@@ -1077,7 +748,6 @@ def _plot_parameters(
         axis.grid(
             True,
             alpha=0.22,
-            zorder=1,
         )
 
         axis.margins(
@@ -1089,7 +759,6 @@ def _plot_parameters(
                 _draw_axis_break(
                     axis,
                     gap,
-                    show_label=False,
                 )
 
         if plotted:
@@ -1111,7 +780,7 @@ def _plot_parameters(
                 transform=axis.transAxes,
             )
 
-    bottom_axis = axes[-1, 0]
+    bottom = axes[-1, 0]
 
     (
         tick_positions,
@@ -1120,18 +789,18 @@ def _plot_parameters(
         flights
     )
 
-    bottom_axis.set_xticks(
+    bottom.set_xticks(
         tick_positions
     )
 
-    bottom_axis.set_xticklabels(
+    bottom.set_xticklabels(
         tick_labels,
         rotation=25,
         ha="right",
         fontsize=8,
     )
 
-    bottom_axis.set_xlabel(
+    bottom.set_xlabel(
         (
             "Flight time - calendar timestamps shown; "
             "inter-flight gaps compressed"
@@ -1145,7 +814,7 @@ def _plot_parameters(
 
     for gap in gaps:
         _draw_axis_break(
-            bottom_axis,
+            bottom,
             gap,
             show_label=True,
         )
@@ -1159,55 +828,24 @@ def _plot_parameters(
             ),
         )
 
-    present_phase_names = sorted(
-        {
-            phase_name
-            for _, _, phase_name
-            in phase_spans
-        },
-        key=lambda label: (
-            label == "Unknown",
-            label,
-        ),
-    )
-
-    figure_handles = [
-        Line2D(
-            [0],
-            [0],
-            color=NO_DATA_COLOR,
-            linewidth=1.5,
-            linestyle=(
-                0,
-                (2, 3),
-            ),
-            label="No recorded data",
-        )
-    ]
-
-    figure_handles.extend(
-        Patch(
-            facecolor=_phase_color(
-                phase_name
-            ),
-            alpha=0.30,
-            edgecolor="none",
-            label=phase_name,
-        )
-        for phase_name
-        in present_phase_names
-    )
-
     figure.legend(
-        handles=figure_handles,
+        handles=[
+            Line2D(
+                [0],
+                [0],
+                color=NO_DATA_COLOR,
+                linewidth=1.5,
+                linestyle=(
+                    0,
+                    (2, 3),
+                ),
+                label="No recorded data",
+            )
+        ],
         loc="lower center",
         bbox_to_anchor=(
             0.5,
             0.012,
-        ),
-        ncol=min(
-            4,
-            len(figure_handles),
         ),
         frameon=False,
     )
@@ -1224,14 +862,12 @@ def _plot_parameters(
 
     figure.text(
         0.5,
-        0.065,
+        0.055,
         (
-            "Calendar timestamps are preserved in labels. "
-            "Axis-break marks compress inter-flight no-data intervals. "
+            "Axis breaks compress inter-flight gaps. "
             "Red dotted connectors are not measured data."
         ),
         ha="center",
-        va="bottom",
         fontsize=9,
         color="#444444",
     )
@@ -1239,7 +875,7 @@ def _plot_parameters(
     figure.tight_layout(
         rect=(
             0.02,
-            0.105,
+            0.095,
             0.99,
             0.95,
         )
@@ -1275,16 +911,18 @@ else:
     )
 
     if len(all_timestamps) > MAX_SLIDER_POINTS:
-        indices = np.linspace(
-            0,
-            len(all_timestamps) - 1,
-            num=MAX_SLIDER_POINTS,
-            dtype=int,
+        indices = np.unique(
+            np.linspace(
+                0,
+                len(all_timestamps) - 1,
+                MAX_SLIDER_POINTS,
+                dtype=int,
+            )
         )
 
         slider_timestamps = [
             all_timestamps[index]
-            for index in np.unique(indices)
+            for index in indices
         ]
 
     else:
@@ -1303,25 +941,23 @@ else:
         )
 
 
-    def _nearest_recorded_timestamp(
-        timestamp
-    ):
-        matched = _match_timestamp_timezone(
-            timestamp,
-            all_timestamps[0],
+    def _nearest_timestamp(value):
+        timestamp = (
+            _match_timestamp_timezone(
+                value,
+                all_timestamps[0],
+            )
         )
 
-        nearest_index = (
+        index = (
             all_timestamps.get_indexer(
-                [matched],
+                [timestamp],
                 method="nearest",
             )[0]
         )
 
         return pd.Timestamp(
-            all_timestamps[
-                nearest_index
-            ]
+            all_timestamps[index]
         )
 
 
@@ -1341,11 +977,10 @@ else:
             len(slider_timestamps) - 1,
         ),
         description="Time range:",
-        orientation="horizontal",
+        continuous_update=False,
         layout=widgets.Layout(
             width="1200px"
         ),
-        continuous_update=False,
     )
 
     txt_start = widgets.Text(
@@ -1434,20 +1069,16 @@ else:
 
         with plot_output:
             try:
-                if start_time > end_time:
-                    (
-                        start_time,
-                        end_time,
-                    ) = (
-                        end_time,
-                        start_time,
-                    )
-
                 _plot_parameters(
-                    start_time,
-                    end_time,
+                    min(
+                        start_time,
+                        end_time,
+                    ),
+                    max(
+                        start_time,
+                        end_time,
+                    ),
                 )
-
             except Exception:
                 traceback.print_exc()
 
@@ -1455,13 +1086,13 @@ else:
     def _on_plot_click(_):
         try:
             start_time = (
-                _nearest_recorded_timestamp(
+                _nearest_timestamp(
                     txt_start.value
                 )
             )
 
             end_time = (
-                _nearest_recorded_timestamp(
+                _nearest_timestamp(
                     txt_end.value
                 )
             )
@@ -1478,15 +1109,6 @@ else:
                 )
 
             return
-
-        if start_time > end_time:
-            (
-                start_time,
-                end_time,
-            ) = (
-                end_time,
-                start_time,
-            )
 
         txt_start.value = (
             _timestamp_label(
