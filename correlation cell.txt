@@ -1,0 +1,575 @@
+import html
+import math
+
+import ipywidgets as widgets
+from IPython.display import HTML, clear_output, display as ipy_display
+from pyspark.sql.types import BooleanType, NumericType
+
+CORRELATION_BATCH_SIZE = 100
+CORRELATION_MAX_INPUTS = 8
+CORRELATION_RANDOM_SEED = 1701
+CORRELATION_EXCLUDED_FRAGMENTS = (
+    "timestamp",
+    "datetime",
+    "airlineid",
+    "aircraftid",
+    "engineid",
+    "operatorid",
+    "serialnumber",
+    "assetidentifier",
+    "calendarid",
+)
+
+
+def _quoted_spark_column(name):
+    return F.col(f"`{name.replace('`', '``')}`")
+
+
+def _eligible_correlation_parameter(field):
+    normalized = field.name.lower().replace("_", "")
+    is_parameter = field.name.startswith("Parameter:")
+    is_numeric = isinstance(field.dataType, (NumericType, BooleanType))
+    is_metadata = any(
+        fragment in normalized
+        for fragment in CORRELATION_EXCLUDED_FRAGMENTS
+    )
+    return is_parameter and is_numeric and not is_metadata
+
+
+correlation_candidate_columns = [
+    field.name
+    for field in cda.schema.fields
+    if _eligible_correlation_parameter(field)
+]
+correlation_candidate_set = set(correlation_candidate_columns)
+
+widget_style = {"description_width": "110px"}
+widget_layout = widgets.Layout(
+    width="260px",
+    margin="0 10px 8px 0",
+)
+
+top_results_widget = widgets.BoundedIntText(
+    value=50,
+    min=5,
+    max=200,
+    step=5,
+    description="Top results:",
+    style=widget_style,
+    layout=widget_layout,
+)
+
+row_limit_widget = widgets.BoundedIntText(
+    value=50000,
+    min=1000,
+    max=500000,
+    step=10000,
+    description="Max rows:",
+    style=widget_style,
+    layout=widget_layout,
+)
+
+minimum_pairs_widget = widgets.BoundedIntText(
+    value=30,
+    min=3,
+    max=10000,
+    step=10,
+    description="Minimum pairs:",
+    style=widget_style,
+    layout=widget_layout,
+)
+
+run_correlation_btn = widgets.Button(
+    description="Run correlation analysis",
+    button_style="primary",
+    layout=widgets.Layout(
+        width="240px",
+        margin="0 10px 8px 0",
+    ),
+)
+
+correlation_output = widgets.Output(
+    layout=widgets.Layout(width="100%")
+)
+
+
+def _format_ranked_correlations(records, top_count):
+    positive = sorted(
+        (record for record in records if record[1] > 0),
+        key=lambda record: (-record[1], record[0]),
+    )[:top_count]
+
+    negative = sorted(
+        (record for record in records if record[1] < 0),
+        key=lambda record: (record[1], record[0]),
+    )[:top_count]
+
+    def _table_rows(ranked_records, value_class):
+        if not ranked_records:
+            return (
+                '<tr><td class="ca-empty" colspan="4">'
+                "No qualifying correlations"
+                "</td></tr>"
+            )
+
+        rows = []
+        for rank, (parameter, value, overlap_count) in enumerate(
+            ranked_records,
+            start=1,
+        ):
+            parameter_name = html.escape(
+                _short_parameter_name(parameter)
+            )
+            signed_value = html.escape(f"{value:+.6f}")
+            rows.append(
+                "<tr>"
+                f'<td class="ca-rank">{rank}</td>'
+                f'<td class="ca-parameter">{parameter_name}</td>'
+                f'<td class="ca-value {value_class}">{signed_value}</td>'
+                f'<td class="ca-pairs">{overlap_count:,}</td>'
+                "</tr>"
+            )
+        return "".join(rows)
+
+    positive_rows = _table_rows(positive, "ca-positive-value")
+    negative_rows = _table_rows(negative, "ca-negative-value")
+
+    return f"""
+    <style>
+      .ca-grid {{
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+        width: 100%;
+        margin: 8px 0 20px;
+      }}
+
+      .ca-panel {{
+        min-width: 0;
+        width: 100%;
+      }}
+
+      .ca-table {{
+        width: 100%;
+        table-layout: fixed;
+        border-collapse: collapse;
+        border: 1px solid var(--jp-border-color2, #c8c8c8);
+        background: var(--jp-layout-color0, #ffffff);
+        color: var(--jp-ui-font-color1, #222222);
+        font-size: 13px;
+      }}
+
+      .ca-table col.ca-rank-column {{
+        width: 9%;
+      }}
+
+      .ca-table col.ca-parameter-column {{
+        width: 51%;
+      }}
+
+      .ca-table col.ca-value-column {{
+        width: 20%;
+      }}
+
+      .ca-table col.ca-pairs-column {{
+        width: 20%;
+      }}
+
+      .ca-table caption {{
+        padding: 10px 12px;
+        border: 1px solid var(--jp-border-color2, #c8c8c8);
+        border-bottom: 0;
+        background: var(--jp-layout-color1, #f5f5f5);
+        font-size: 14px;
+        font-weight: 700;
+        text-align: left;
+      }}
+
+      .ca-positive caption {{
+        color: #137333;
+      }}
+
+      .ca-negative caption {{
+        color: #b3261e;
+      }}
+
+      .ca-table th {{
+        padding: 8px;
+        border-bottom: 2px solid var(--jp-border-color2, #b8b8b8);
+        background: var(--jp-layout-color1, #f5f5f5);
+        font-weight: 700;
+        line-height: 1.25;
+        text-align: left;
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }}
+
+      .ca-table td {{
+        padding: 8px;
+        border-bottom: 1px solid var(--jp-border-color2, #e0e0e0);
+        vertical-align: top;
+        line-height: 1.35;
+      }}
+
+      .ca-table tbody tr:last-child td {{
+        border-bottom: 0;
+      }}
+
+      .ca-rank {{
+        text-align: right;
+        color: var(--jp-ui-font-color2, #666666);
+      }}
+
+      .ca-parameter {{
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }}
+
+      .ca-value {{
+        text-align: right;
+        white-space: nowrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-weight: 700;
+      }}
+
+      .ca-pairs {{
+        text-align: right;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }}
+
+      .ca-positive-value {{
+        color: #137333;
+      }}
+
+      .ca-negative-value {{
+        color: #b3261e;
+      }}
+
+      .ca-empty {{
+        padding: 16px !important;
+        color: var(--jp-ui-font-color2, #777777);
+        font-style: italic;
+        text-align: center;
+      }}
+
+      @media (max-width: 900px) {{
+        .ca-grid {{
+          grid-template-columns: minmax(0, 1fr);
+        }}
+      }}
+    </style>
+
+    <div class="ca-grid">
+      <div class="ca-panel">
+        <table class="ca-table ca-positive">
+          <colgroup>
+            <col class="ca-rank-column">
+            <col class="ca-parameter-column">
+            <col class="ca-value-column">
+            <col class="ca-pairs-column">
+          </colgroup>
+          <caption>Positive correlations — highest first</caption>
+          <thead>
+            <tr>
+              <th scope="col">Rank</th>
+              <th scope="col">Parameter</th>
+              <th scope="col">Correlation</th>
+              <th scope="col">Pairs</th>
+            </tr>
+          </thead>
+          <tbody>
+            {positive_rows}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="ca-panel">
+        <table class="ca-table ca-negative">
+          <colgroup>
+            <col class="ca-rank-column">
+            <col class="ca-parameter-column">
+            <col class="ca-value-column">
+            <col class="ca-pairs-column">
+          </colgroup>
+          <caption>Negative correlations — lowest first</caption>
+          <thead>
+            <tr>
+              <th scope="col">Rank</th>
+              <th scope="col">Parameter</th>
+              <th scope="col">Correlation</th>
+              <th scope="col">Pairs</th>
+            </tr>
+          </thead>
+          <tbody>
+            {negative_rows}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    """
+
+
+def _run_correlation_analysis(_):
+    run_correlation_btn.disabled = True
+
+    try:
+        with correlation_output:
+            clear_output(wait=True)
+
+            input_columns = []
+            for short_name in selected_parameters:
+                full_name = _full_parameter_name(short_name)
+                if (
+                    full_name in correlation_candidate_set
+                    and full_name not in input_columns
+                ):
+                    input_columns.append(full_name)
+
+            if not input_columns:
+                print(
+                    "None of the applied input features are eligible "
+                    "numeric or Boolean parameters."
+                )
+                return
+
+            if len(input_columns) > CORRELATION_MAX_INPUTS:
+                print(
+                    f"Correlation is limited to "
+                    f"{CORRELATION_MAX_INPUTS} input features per run. "
+                    "Reduce the applied inputs in the "
+                    "parameter-selection cell."
+                )
+                return
+
+            source_row_count = cda.count()
+            if source_row_count == 0:
+                print(
+                    "No flight samples are available for "
+                    "correlation analysis."
+                )
+                return
+
+            row_limit = int(row_limit_widget.value)
+            sample_fraction = min(
+                1.0,
+                row_limit / source_row_count,
+            )
+            minimum_pairs = int(minimum_pairs_widget.value)
+            top_count = int(top_results_widget.value)
+
+            correlations_by_input = {
+                column: []
+                for column in input_columns
+            }
+
+            print(
+                f"Inputs: {len(input_columns)} | "
+                f"Candidate parameters: "
+                f"{len(correlation_candidate_columns):,} | "
+                f"Flight rows: {source_row_count:,}"
+            )
+
+            if sample_fraction < 1.0:
+                print(
+                    "Using a reproducible random sample of "
+                    f"approximately {row_limit:,} rows to bound "
+                    "runtime and memory use."
+                )
+
+            for batch_start in range(
+                0,
+                len(correlation_candidate_columns),
+                CORRELATION_BATCH_SIZE,
+            ):
+                batch_columns = correlation_candidate_columns[
+                    batch_start:
+                    batch_start + CORRELATION_BATCH_SIZE
+                ]
+
+                required_columns = list(
+                    dict.fromkeys(input_columns + batch_columns)
+                )
+
+                batch_df = cda.select(
+                    *[
+                        _quoted_spark_column(column).alias(column)
+                        for column in required_columns
+                    ]
+                )
+
+                if sample_fraction < 1.0:
+                    batch_df = batch_df.sample(
+                        withReplacement=False,
+                        fraction=sample_fraction,
+                        seed=CORRELATION_RANDOM_SEED,
+                    ).limit(row_limit)
+
+                aggregate_expressions = []
+                result_keys = []
+
+                for input_index, input_column in enumerate(
+                    input_columns
+                ):
+                    left_raw = _quoted_spark_column(
+                        input_column
+                    ).cast("double")
+                    left = F.when(
+                        left_raw.isNull() | F.isnan(left_raw),
+                        None,
+                    ).otherwise(left_raw)
+
+                    for candidate_index, candidate_column in enumerate(
+                        batch_columns
+                    ):
+                        if candidate_column == input_column:
+                            continue
+
+                        right_raw = _quoted_spark_column(
+                            candidate_column
+                        ).cast("double")
+                        right = F.when(
+                            right_raw.isNull() | F.isnan(right_raw),
+                            None,
+                        ).otherwise(right_raw)
+
+                        correlation_alias = (
+                            f"correlation_{input_index}_"
+                            f"{candidate_index}"
+                        )
+                        overlap_alias = (
+                            f"overlap_{input_index}_"
+                            f"{candidate_index}"
+                        )
+
+                        aggregate_expressions.extend(
+                            [
+                                F.corr(left, right).alias(
+                                    correlation_alias
+                                ),
+                                F.count(
+                                    F.when(
+                                        left.isNotNull()
+                                        & right.isNotNull(),
+                                        1,
+                                    )
+                                ).alias(overlap_alias),
+                            ]
+                        )
+
+                        result_keys.append(
+                            (
+                                input_column,
+                                candidate_column,
+                                correlation_alias,
+                                overlap_alias,
+                            )
+                        )
+
+                if aggregate_expressions:
+                    aggregate_row = (
+                        batch_df
+                        .agg(*aggregate_expressions)
+                        .first()
+                        .asDict()
+                    )
+
+                    for (
+                        input_column,
+                        candidate_column,
+                        correlation_alias,
+                        overlap_alias,
+                    ) in result_keys:
+                        correlation_value = aggregate_row.get(
+                            correlation_alias
+                        )
+                        overlap_count = int(
+                            aggregate_row.get(overlap_alias) or 0
+                        )
+
+                        if (
+                            correlation_value is not None
+                            and math.isfinite(
+                                float(correlation_value)
+                            )
+                            and overlap_count >= minimum_pairs
+                        ):
+                            correlations_by_input[
+                                input_column
+                            ].append(
+                                (
+                                    candidate_column,
+                                    float(correlation_value),
+                                    overlap_count,
+                                )
+                            )
+
+                completed = min(
+                    batch_start + CORRELATION_BATCH_SIZE,
+                    len(correlation_candidate_columns),
+                )
+
+                print(
+                    f"Processed {completed:,} of "
+                    f"{len(correlation_candidate_columns):,} "
+                    "candidates."
+                )
+
+            for input_column in input_columns:
+                input_name = html.escape(
+                    _short_parameter_name(input_column)
+                )
+
+                ipy_display(
+                    HTML(
+                        "<h3 style='margin:18px 0 4px'>"
+                        f"Input feature: {input_name}"
+                        "</h3>"
+                        "<p style='margin:0 0 8px'>"
+                        "Pearson correlations with at least "
+                        f"{minimum_pairs:,} paired observations. "
+                        "Self-correlation and exact-zero "
+                        "correlations are omitted."
+                        "</p>"
+                    )
+                )
+
+                ipy_display(
+                    HTML(
+                        _format_ranked_correlations(
+                            correlations_by_input[input_column],
+                            top_count,
+                        )
+                    )
+                )
+    finally:
+        run_correlation_btn.disabled = False
+
+
+run_correlation_btn.on_click(_run_correlation_analysis)
+
+correlation_controls = widgets.Box(
+    [
+        top_results_widget,
+        row_limit_widget,
+        minimum_pairs_widget,
+        run_correlation_btn,
+    ],
+    layout=widgets.Layout(
+        display="flex",
+        flex_flow="row wrap",
+        align_items="center",
+        width="100%",
+    ),
+)
+
+ipy_display(
+    widgets.VBox(
+        [
+            correlation_controls,
+            correlation_output,
+        ],
+        layout=widgets.Layout(width="100%"),
+    )
+)
