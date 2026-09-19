@@ -3,1197 +3,630 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from collections import defaultdict
+from IPython.display import display as ipy_display
 
-AD_MIN_BASELINE_FLIGHTS = 12
-AD_BASELINE_FLIGHTS = 20
+AD_MIN_BASELINE = 12
+AD_TARGET_BASELINE = 20
 AD_MIN_PHASE_SAMPLES = 10
-AD_MIN_SEQUENCE_POINTS = 6
+AD_EPS = 1e-12
 
 AD_ABRUPT_Z = 6.0
-AD_ABRUPT_ALPHA = 0.01
+AD_FWER_ALPHA = 0.01
 
-AD_SHIFT_Z = 3.5
-AD_SHIFT_PERSISTENCE = 3
-
-AD_CUSUM_K = 0.20
-AD_CUSUM_THRESHOLD = 8.0
+AD_SEQ_WINDOW = 8
+AD_CONFIRMATIONS = 2
+AD_DIRECTIONAL_FRACTION = 0.75
+AD_MIN_NET_Z = 1.75
+AD_MIN_THEILSEN = 0.10
+AD_MK_P = 0.05
 
 AD_EWMA_LAMBDA = 0.12
-AD_EWMA_THRESHOLD = 1.75
+AD_EWMA_WARN = 1.15
+AD_EWMA_STRONG = 1.75
 
-AD_GRADUAL_WINDOW = 8
-AD_GRADUAL_MIN_DIRECTIONAL_FRACTION = 0.75
-AD_GRADUAL_MIN_NET_Z = 2.0
-AD_GRADUAL_MIN_SLOPE_Z = 0.12
-AD_GRADUAL_MIN_CUSUM = 8.0
-AD_GRADUAL_MIN_EWMA = 1.25
+AD_CUSUM_K = 0.20
+AD_CUSUM_WARN = 7.0
+AD_CUSUM_STRONG = 10.0
 
-AD_CONFIRMATION_POINTS = 2
-AD_EPS = 1e-12
+AD_PH_DELTA = 0.10
+AD_PH_WARN = 6.0
+AD_PH_STRONG = 9.0
+
+AD_SHIFT_Z = 3.5
+AD_SHIFT_COUNT = 3
+
 AD_MAX_REPORT_ROWS = 500
-AD_MAX_PLOT_SIGNALS = 20
+AD_MAX_PLOT_SIGNALS = 30
+AD_COMPRESSED_GAP = 120.0
 
 if "_data_df" not in globals():
-    raise RuntimeError("_data_df is missing. Run all preceding notebook cells first.")
+    raise RuntimeError("_data_df is unavailable. Run the notebook above this cell first.")
 
 if "PARAMETER_COLUMNS" not in globals():
-    raise RuntimeError("PARAMETER_COLUMNS is missing.")
+    raise RuntimeError("PARAMETER_COLUMNS is unavailable.")
 
 if "FLIGHT_PHASE_COLUMN" not in globals():
-    raise RuntimeError("FLIGHT_PHASE_COLUMN is missing.")
+    raise RuntimeError("FLIGHT_PHASE_COLUMN is unavailable.")
+
+prefix = globals().get("PARAMETER_PREFIX", "")
+
+def ad_short(column):
+    value = str(column)
+    return value[len(prefix):] if prefix and value.startswith(prefix) else value
+
+def ad_split_channel(column):
+    value = ad_short(column)
+    if value.startswith("AC_"):
+        return "AC", value[3:]
+    if value.startswith("BC_"):
+        return "BC", value[3:]
+    return "", value
+
+def ad_robust_center_scale(values):
+    x = np.asarray(values, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return np.nan, np.nan
+    center = float(np.median(x))
+    mad = float(np.median(np.abs(x - center)))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale <= AD_EPS:
+        q25, q75 = np.percentile(x, [25, 75])
+        scale = float((q75 - q25) / 1.349)
+    if not np.isfinite(scale) or scale <= AD_EPS:
+        scale = float(np.std(x))
+    if not np.isfinite(scale) or scale <= AD_EPS:
+        scale = AD_EPS
+    return center, scale
+
+def ad_normal_p(z):
+    if not np.isfinite(z):
+        return 1.0
+    return float(math.erfc(abs(float(z)) / math.sqrt(2.0)))
+
+def ad_pct(value, baseline):
+    if not np.isfinite(value) or not np.isfinite(baseline) or abs(baseline) <= AD_EPS:
+        return np.nan
+    return 100.0 * (value - baseline) / abs(baseline)
+
+def ad_linear_slope(values):
+    y = np.asarray(values, dtype=float)
+    mask = np.isfinite(y)
+    if mask.sum() < 3:
+        return np.nan
+    y = y[mask]
+    x = np.arange(len(y), dtype=float)
+    x -= x.mean()
+    y -= y.mean()
+    denom = float(np.dot(x, x))
+    if denom <= AD_EPS:
+        return np.nan
+    return float(np.dot(x, y) / denom)
+
+def ad_theilsen(values):
+    y = np.asarray(values, dtype=float)
+    y = y[np.isfinite(y)]
+    if len(y) < 3:
+        return np.nan
+    slopes = []
+    for i in range(len(y) - 1):
+        for j in range(i + 1, len(y)):
+            slopes.append((y[j] - y[i]) / (j - i))
+    return float(np.median(slopes)) if slopes else np.nan
+
+def ad_directionality(values):
+    y = np.asarray(values, dtype=float)
+    y = y[np.isfinite(y)]
+    if len(y) < 3:
+        return 0.0, 0
+    d = np.diff(y)
+    pos = int(np.sum(d > 0))
+    neg = int(np.sum(d < 0))
+    total = pos + neg
+    if total == 0:
+        return 0.0, 0
+    if pos >= neg:
+        return pos / total, 1
+    return neg / total, -1
+
+def ad_mann_kendall(values):
+    y = np.asarray(values, dtype=float)
+    y = y[np.isfinite(y)]
+    n = len(y)
+    if n < 5:
+        return 0.0, 1.0
+    s = 0
+    for i in range(n - 1):
+        s += int(np.sum(np.sign(y[i + 1:] - y[i])))
+    _, counts = np.unique(y, return_counts=True)
+    tie_term = float(np.sum(counts * (counts - 1) * (2 * counts + 5)))
+    var_s = (n * (n - 1) * (2 * n + 5) - tie_term) / 18.0
+    if var_s <= 0:
+        return 0.0, 1.0
+    if s > 0:
+        z = (s - 1) / math.sqrt(var_s)
+    elif s < 0:
+        z = (s + 1) / math.sqrt(var_s)
+    else:
+        z = 0.0
+    p = math.erfc(abs(z) / math.sqrt(2.0))
+    return float(z), float(p)
+
+def ad_feature_rows(frame, parameter, flight_start, flight_idx, phase):
+    values = pd.to_numeric(frame[parameter], errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < AD_MIN_PHASE_SAMPLES:
+        return []
+    median = float(np.median(values))
+    q10, q90 = np.percentile(values, [10, 90])
+    mad = float(np.median(np.abs(values - median)))
+    slope = ad_linear_slope(values)
+    result = [
+        (parameter, "LEVEL", median),
+        (parameter, "SPREAD", float(q90 - q10)),
+        (parameter, "VARIABILITY", mad)
+    ]
+    if np.isfinite(slope):
+        result.append((parameter, "WITHIN_PHASE_TREND", slope))
+    return [
+        {
+            "FlightStart": pd.Timestamp(flight_start),
+            "FlightIndex": int(flight_idx),
+            "FlightPhase": float(phase),
+            "Parameter": p,
+            "Feature": f,
+            "Value": float(v),
+            "Samples": int(values.size)
+        }
+        for p, f, v in result
+    ]
 
 ad_df = _data_df.copy()
 
-required_columns = [
-    "Timestamp",
-    "StartDatetime",
-    FLIGHT_PHASE_COLUMN
-]
+if "AssetIdentifier" in ad_df.columns and "selected_esn" in globals():
+    ad_df = ad_df.loc[
+        ad_df["AssetIdentifier"].astype("string") == str(selected_esn)
+    ].copy()
 
-missing_columns = [
-    c for c in required_columns
-    if c not in ad_df.columns
-]
+for c in ["Timestamp", "StartDatetime"]:
+    if c not in ad_df.columns:
+        raise RuntimeError(f"Required column {c} is unavailable.")
+    ad_df[c] = pd.to_datetime(ad_df[c], errors="coerce")
 
-if missing_columns:
-    raise RuntimeError(
-        "Missing required columns: "
-        + ", ".join(missing_columns)
-    )
+if FLIGHT_PHASE_COLUMN not in ad_df.columns:
+    raise RuntimeError(f"{FLIGHT_PHASE_COLUMN} is unavailable.")
 
-ad_df["Timestamp"] = pd.to_datetime(
-    ad_df["Timestamp"],
-    errors="coerce"
-)
-
-ad_df["StartDatetime"] = pd.to_datetime(
-    ad_df["StartDatetime"],
-    errors="coerce"
-)
-
-ad_df["_AD_Phase"] = pd.to_numeric(
-    ad_df[FLIGHT_PHASE_COLUMN],
-    errors="coerce"
-)
+ad_df["_AD_Phase"] = pd.to_numeric(ad_df[FLIGHT_PHASE_COLUMN], errors="coerce")
 
 ad_df = (
     ad_df
-    .dropna(
-        subset=[
-            "Timestamp",
-            "StartDatetime",
-            "_AD_Phase"
-        ]
-    )
-    .sort_values(
-        ["StartDatetime", "Timestamp"],
-        kind="stable"
-    )
+    .dropna(subset=["Timestamp", "StartDatetime", "_AD_Phase"])
+    .sort_values(["StartDatetime", "Timestamp"], kind="stable")
     .reset_index(drop=True)
 )
 
 if ad_df.empty:
-    raise RuntimeError("No valid telemetry data remains.")
+    raise RuntimeError("No usable telemetry rows remain.")
 
-flight_starts = sorted(
-    pd.Timestamp(x)
-    for x in ad_df["StartDatetime"].unique()
-)
+flight_starts = sorted(pd.Timestamp(x) for x in ad_df["StartDatetime"].unique())
+flight_index = {flight: i for i, flight in enumerate(flight_starts)}
+ad_df["_AD_FlightIndex"] = ad_df["StartDatetime"].map(flight_index)
 
-flight_number = {
-    flight: i
-    for i, flight in enumerate(flight_starts)
-}
-
-ad_df["_AD_Flight"] = (
-    ad_df["StartDatetime"]
-    .map(flight_number)
-)
-
-prefix = globals().get(
-    "PARAMETER_PREFIX",
-    ""
-)
-
-def short_name(column):
-    value = str(column)
-
-    if prefix and value.startswith(prefix):
-        return value[len(prefix):]
-
-    return value
-
-def split_channel(column):
-    name = short_name(column)
-
-    if name.startswith("AC_"):
-        return "AC", name[3:]
-
-    if name.startswith("BC_"):
-        return "BC", name[3:]
-
-    return "", name
-
-def robust_center_scale(values):
-    x = np.asarray(values, dtype=float)
-    x = x[np.isfinite(x)]
-
-    if x.size == 0:
-        return np.nan, np.nan
-
-    center = float(np.median(x))
-
-    mad = float(
-        np.median(
-            np.abs(x - center)
-        )
-    )
-
-    scale = 1.4826 * mad
-
-    if (
-        not np.isfinite(scale)
-        or scale <= AD_EPS
-    ):
-        q25, q75 = np.percentile(
-            x,
-            [25, 75]
-        )
-
-        scale = float(
-            (q75 - q25) / 1.349
-        )
-
-    if (
-        not np.isfinite(scale)
-        or scale <= AD_EPS
-    ):
-        scale = float(
-            np.std(x)
-        )
-
-    if (
-        not np.isfinite(scale)
-        or scale <= AD_EPS
-    ):
-        scale = AD_EPS
-
-    return center, scale
-
-def normal_p(z):
-    if not np.isfinite(z):
-        return 1.0
-
-    return float(
-        math.erfc(
-            abs(float(z))
-            / math.sqrt(2.0)
-        )
-    )
-
-def percent_deviation(
-    value,
-    baseline
-):
-    if (
-        not np.isfinite(value)
-        or not np.isfinite(baseline)
-        or abs(baseline) <= AD_EPS
-    ):
-        return np.nan
-
-    return (
-        100.0
-        * (value - baseline)
-        / abs(baseline)
-    )
-
-def linear_slope(values):
-    y = np.asarray(
-        values,
-        dtype=float
-    )
-
-    mask = np.isfinite(y)
-
-    if mask.sum() < 3:
-        return np.nan
-
-    y = y[mask]
-
-    x = np.arange(
-        len(y),
-        dtype=float
-    )
-
-    x = x - x.mean()
-    y = y - y.mean()
-
-    denominator = float(
-        np.dot(x, x)
-    )
-
-    if denominator <= AD_EPS:
-        return np.nan
-
-    return float(
-        np.dot(x, y)
-        / denominator
-    )
-
-def median_pairwise_slope(values):
-    y = np.asarray(
-        values,
-        dtype=float
-    )
-
-    y = y[
-        np.isfinite(y)
-    ]
-
-    n = len(y)
-
-    if n < 3:
-        return np.nan
-
-    slopes = []
-
-    for i in range(n - 1):
-        for j in range(i + 1, n):
-            slopes.append(
-                (y[j] - y[i])
-                / (j - i)
-            )
-
-    if not slopes:
-        return np.nan
-
-    return float(
-        np.median(slopes)
-    )
-
-def directional_fraction(values):
-    y = np.asarray(
-        values,
-        dtype=float
-    )
-
-    y = y[
-        np.isfinite(y)
-    ]
-
-    if len(y) < 3:
-        return 0.0, 0
-
-    differences = np.diff(y)
-
-    positive = np.sum(
-        differences > 0
-    )
-
-    negative = np.sum(
-        differences < 0
-    )
-
-    total = max(
-        positive + negative,
-        1
-    )
-
-    if positive >= negative:
-        return (
-            positive / total,
-            1
-        )
-
-    return (
-        negative / total,
-        -1
-    )
-
-parameter_columns = [
-    c
-    for c in PARAMETER_COLUMNS
-    if (
-        c in ad_df.columns
-        and c != FLIGHT_PHASE_COLUMN
-    )
+candidate_columns = [
+    c for c in PARAMETER_COLUMNS
+    if c in ad_df.columns and c != FLIGHT_PHASE_COLUMN
 ]
 
 numeric_parameters = []
 
-for column in parameter_columns:
-    numeric = pd.to_numeric(
-        ad_df[column],
-        errors="coerce"
-    )
-
-    if (
-        numeric.notna().sum()
-        >= AD_MIN_PHASE_SAMPLES
-    ):
-        ad_df[column] = numeric
-        numeric_parameters.append(
-            column
-        )
+for column in candidate_columns:
+    converted = pd.to_numeric(ad_df[column], errors="coerce")
+    if converted.notna().sum() >= AD_MIN_PHASE_SAMPLES:
+        ad_df[column] = converted
+        numeric_parameters.append(column)
 
 if not numeric_parameters:
-    raise RuntimeError(
-        "No sufficiently populated numeric parameters."
-    )
+    raise RuntimeError("No usable numeric telemetry parameters were found.")
 
-print(
-    f"Preparing phase-conditioned health features for "
-    f"{len(flight_starts):,} flights and "
-    f"{len(numeric_parameters):,} numeric parameters..."
-)
+print("=" * 130)
+print("ADVANCED PHASE-CONDITIONED ENGINE DEGRADATION DETECTOR")
+print("=" * 130)
+print(f"Flights available:               {len(flight_starts):,}")
+print(f"Materialized numeric parameters: {len(numeric_parameters):,}")
+print(f"Raw rows:                        {len(ad_df):,}")
+print()
+print("Building flight/FlightPhase health features...")
 
 feature_records = []
 
-for (
-    flight_start,
-    phase
-), group in ad_df.groupby(
-    [
-        "StartDatetime",
-        "_AD_Phase"
-    ],
-    sort=True,
-    dropna=True
-):
-
-    flight_id = (
-        flight_number[
-            pd.Timestamp(
-                flight_start
-            )
-        ]
+phase_groups = list(
+    ad_df.groupby(
+        ["StartDatetime", "_AD_Phase"],
+        sort=True,
+        dropna=True
     )
-
-    for column in numeric_parameters:
-
-        values = (
-            group[column]
-            .to_numpy(
-                dtype=float
-            )
-        )
-
-        values = values[
-            np.isfinite(values)
-        ]
-
-        if (
-            values.size
-            < AD_MIN_PHASE_SAMPLES
-        ):
-            continue
-
-        median = float(
-            np.median(values)
-        )
-
-        q10, q90 = np.percentile(
-            values,
-            [10, 90]
-        )
-
-        mad = float(
-            np.median(
-                np.abs(
-                    values - median
-                )
-            )
-        )
-
-        feature_records.append(
-            {
-                "FlightStart":
-                    pd.Timestamp(
-                        flight_start
-                    ),
-                "FlightIndex":
-                    flight_id,
-                "FlightPhase":
-                    float(phase),
-                "Parameter":
-                    column,
-                "Feature":
-                    "LEVEL",
-                "Value":
-                    median,
-                "Samples":
-                    int(values.size)
-            }
-        )
-
-        feature_records.append(
-            {
-                "FlightStart":
-                    pd.Timestamp(
-                        flight_start
-                    ),
-                "FlightIndex":
-                    flight_id,
-                "FlightPhase":
-                    float(phase),
-                "Parameter":
-                    column,
-                "Feature":
-                    "SPREAD",
-                "Value":
-                    float(q90 - q10),
-                "Samples":
-                    int(values.size)
-            }
-        )
-
-        feature_records.append(
-            {
-                "FlightStart":
-                    pd.Timestamp(
-                        flight_start
-                    ),
-                "FlightIndex":
-                    flight_id,
-                "FlightPhase":
-                    float(phase),
-                "Parameter":
-                    column,
-                "Feature":
-                    "VARIABILITY",
-                "Value":
-                    mad,
-                "Samples":
-                    int(values.size)
-            }
-        )
-
-        within_slope = (
-            linear_slope(
-                values
-            )
-        )
-
-        if np.isfinite(
-            within_slope
-        ):
-            feature_records.append(
-                {
-                    "FlightStart":
-                        pd.Timestamp(
-                            flight_start
-                        ),
-                    "FlightIndex":
-                        flight_id,
-                    "FlightPhase":
-                        float(phase),
-                    "Parameter":
-                        column,
-                    "Feature":
-                        "WITHIN_PHASE_TREND",
-                    "Value":
-                        within_slope,
-                    "Samples":
-                        int(values.size)
-                }
-            )
-
-pair_map = defaultdict(
-    dict
 )
 
-for column in numeric_parameters:
-    channel, signal = (
-        split_channel(
-            column
+for (flight_start, phase), group in phase_groups:
+    fi = flight_index[pd.Timestamp(flight_start)]
+    for column in numeric_parameters:
+        feature_records.extend(
+            ad_feature_rows(
+                group,
+                column,
+                flight_start,
+                fi,
+                phase
+            )
         )
-    )
 
-    if channel in (
-        "AC",
-        "BC"
-    ):
-        pair_map[
-            signal
-        ][
-            channel
-        ] = column
+pair_map = defaultdict(dict)
 
-for signal, channels in (
-    pair_map.items()
-):
+for column in numeric_parameters:
+    channel, signal = ad_split_channel(column)
+    if channel in ("AC", "BC"):
+        pair_map[signal][channel] = column
 
-    if (
-        "AC" not in channels
-        or "BC" not in channels
-    ):
+for signal, channels in pair_map.items():
+    if "AC" not in channels or "BC" not in channels:
         continue
 
     ac = channels["AC"]
     bc = channels["BC"]
 
-    pair_df = ad_df[
-        [
-            "StartDatetime",
-            "_AD_Phase",
-            ac,
-            bc
-        ]
+    pair_frame = ad_df[
+        ["StartDatetime", "_AD_Phase", ac, bc]
     ].copy()
 
-    pair_df["_Delta"] = (
-        pair_df[ac]
-        - pair_df[bc]
+    pair_frame["_AD_Delta"] = (
+        pd.to_numeric(pair_frame[ac], errors="coerce")
+        - pd.to_numeric(pair_frame[bc], errors="coerce")
     )
 
-    for (
-        flight_start,
-        phase
-    ), group in pair_df.groupby(
-        [
-            "StartDatetime",
-            "_AD_Phase"
-        ],
+    for (flight_start, phase), group in pair_frame.groupby(
+        ["StartDatetime", "_AD_Phase"],
         sort=True,
         dropna=True
     ):
+        values = group["_AD_Delta"].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
 
-        values = (
-            group["_Delta"]
-            .to_numpy(
-                dtype=float
-            )
-        )
-
-        values = values[
-            np.isfinite(values)
-        ]
-
-        if (
-            values.size
-            < AD_MIN_PHASE_SAMPLES
-        ):
+        if values.size < AD_MIN_PHASE_SAMPLES:
             continue
 
-        flight_id = (
-            flight_number[
-                pd.Timestamp(
-                    flight_start
-                )
-            ]
-        )
+        fi = flight_index[pd.Timestamp(flight_start)]
+        median = float(np.median(values))
+        q10, q90 = np.percentile(values, [10, 90])
+        mad = float(np.median(np.abs(values - median)))
 
-        median = float(
-            np.median(
-                values
+        for feature, value in [
+            ("CHANNEL_OFFSET", median),
+            ("CHANNEL_SPREAD", float(q90 - q10)),
+            ("CHANNEL_VARIABILITY", mad)
+        ]:
+            feature_records.append(
+                {
+                    "FlightStart": pd.Timestamp(flight_start),
+                    "FlightIndex": int(fi),
+                    "FlightPhase": float(phase),
+                    "Parameter": f"AC-BC::{signal}",
+                    "Feature": feature,
+                    "Value": float(value),
+                    "Samples": int(values.size)
+                }
             )
-        )
 
-        q10, q90 = (
-            np.percentile(
-                values,
-                [10, 90]
-            )
-        )
-
-        feature_records.append(
-            {
-                "FlightStart":
-                    pd.Timestamp(
-                        flight_start
-                    ),
-                "FlightIndex":
-                    flight_id,
-                "FlightPhase":
-                    float(phase),
-                "Parameter":
-                    f"AC-BC::{signal}",
-                "Feature":
-                    "CHANNEL_OFFSET",
-                "Value":
-                    median,
-                "Samples":
-                    int(values.size)
-            }
-        )
-
-        feature_records.append(
-            {
-                "FlightStart":
-                    pd.Timestamp(
-                        flight_start
-                    ),
-                "FlightIndex":
-                    flight_id,
-                "FlightPhase":
-                    float(phase),
-                "Parameter":
-                    f"AC-BC::{signal}",
-                "Feature":
-                    "CHANNEL_SPREAD",
-                "Value":
-                    float(
-                        q90 - q10
-                    ),
-                "Samples":
-                    int(values.size)
-            }
-        )
-
-feature_df = pd.DataFrame(
-    feature_records
-)
+feature_df = pd.DataFrame(feature_records)
 
 if feature_df.empty:
-    raise RuntimeError(
-        "No usable phase-conditioned features were generated."
-    )
+    raise RuntimeError("No flight/phase health features could be constructed.")
 
-print(
-    f"Generated {len(feature_df):,} "
-    f"flight/phase health measurements."
-)
+feature_df = feature_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Value"])
 
-series_count = (
+series_keys = (
     feature_df[
-        [
-            "Parameter",
-            "FlightPhase",
-            "Feature"
-        ]
+        ["Parameter", "FlightPhase", "Feature"]
     ]
     .drop_duplicates()
-    .shape[0]
 )
 
-abrupt_alpha_per_series = (
-    AD_ABRUPT_ALPHA
-    / max(
-        series_count,
-        1
-    )
-)
+series_count = len(series_keys)
+abrupt_p_limit = AD_FWER_ALPHA / max(series_count, 1)
 
-detection_records = []
+print(f"Health measurements:             {len(feature_df):,}")
+print(f"Independent health series:       {series_count:,}")
+print(f"Abrupt-event p threshold:        {abrupt_p_limit:.3e}")
+print()
+print("Running sequential, trend, change and consensus detection...")
 
-for (
-    parameter,
-    phase,
-    feature
-), series in feature_df.groupby(
-    [
-        "Parameter",
-        "FlightPhase",
-        "Feature"
-    ],
+detections = []
+
+for (parameter, phase, feature), series in feature_df.groupby(
+    ["Parameter", "FlightPhase", "Feature"],
     sort=False
 ):
-
     series = (
         series
-        .sort_values(
-            "FlightIndex",
-            kind="stable"
-        )
-        .reset_index(
-            drop=True
-        )
+        .sort_values("FlightIndex", kind="stable")
+        .reset_index(drop=True)
     )
 
-    if (
-        len(series)
-        < (
-            AD_MIN_BASELINE_FLIGHTS
-            + AD_MIN_SEQUENCE_POINTS
-        )
-    ):
+    if len(series) < AD_MIN_BASELINE + AD_SEQ_WINDOW:
         continue
 
     baseline_count = min(
-        AD_BASELINE_FLIGHTS,
-        max(
-            AD_MIN_BASELINE_FLIGHTS,
-            len(series)
-            - AD_MIN_SEQUENCE_POINTS
-        )
+        AD_TARGET_BASELINE,
+        len(series) - AD_SEQ_WINDOW
     )
 
-    baseline_values = (
-        series
-        .iloc[
-            :baseline_count
-        ]["Value"]
-        .to_numpy(
-            dtype=float
-        )
-    )
-
-    baseline_center, baseline_scale = (
-        robust_center_scale(
-            baseline_values
-        )
-    )
-
-    if (
-        not np.isfinite(
-            baseline_center
-        )
-        or not np.isfinite(
-            baseline_scale
-        )
-    ):
+    if baseline_count < AD_MIN_BASELINE:
         continue
 
-    values = (
-        series["Value"]
-        .to_numpy(
-            dtype=float
-        )
-    )
+    baseline_values = series.iloc[:baseline_count]["Value"].to_numpy(dtype=float)
+    baseline_center, baseline_scale = ad_robust_center_scale(baseline_values)
 
-    z_values = (
-        (
-            values
-            - baseline_center
-        )
-        / max(
-            baseline_scale,
-            AD_EPS
-        )
-    )
+    if not np.isfinite(baseline_center) or not np.isfinite(baseline_scale):
+        continue
 
+    values = series["Value"].to_numpy(dtype=float)
     z_values = np.clip(
-        z_values,
+        (values - baseline_center) / max(baseline_scale, AD_EPS),
         -100.0,
         100.0
     )
 
-    positive_cusum = 0.0
-    negative_cusum = 0.0
     ewma = 0.0
+    cplus = 0.0
+    cminus = 0.0
+    ph_plus = 0.0
+    ph_minus = 0.0
 
-    gradual_candidate_count = 0
-    gradual_candidate_direction = 0
+    gradual_streak = 0
+    gradual_direction = 0
 
-    for i in range(
-        baseline_count,
-        len(series)
-    ):
-
+    for i in range(baseline_count, len(series)):
         row = series.iloc[i]
-
-        z = float(
-            z_values[i]
-        )
+        z = float(z_values[i])
 
         ewma = (
-            AD_EWMA_LAMBDA
-            * z
-            + (
-                1.0
-                - AD_EWMA_LAMBDA
-            )
-            * ewma
+            AD_EWMA_LAMBDA * z
+            + (1.0 - AD_EWMA_LAMBDA) * ewma
         )
 
-        positive_cusum = max(
+        cplus = max(
             0.0,
-            positive_cusum
-            + z
-            - AD_CUSUM_K
+            cplus + z - AD_CUSUM_K
         )
 
-        negative_cusum = min(
+        cminus = min(
             0.0,
-            negative_cusum
-            + z
-            + AD_CUSUM_K
+            cminus + z + AD_CUSUM_K
         )
 
-        cusum_strength = max(
-            positive_cusum,
-            abs(
-                negative_cusum
-            )
+        cusum = max(cplus, abs(cminus))
+        cusum_direction = 1 if cplus >= abs(cminus) else -1
+
+        ph_plus = max(
+            0.0,
+            ph_plus + z - AD_PH_DELTA
         )
 
-        cusum_direction = (
-            1
-            if (
-                positive_cusum
-                >= abs(
-                    negative_cusum
-                )
-            )
-            else -1
+        ph_minus = max(
+            0.0,
+            ph_minus - z - AD_PH_DELTA
         )
 
-        p_value = (
-            normal_p(
-                z
-            )
-        )
+        ph_score = max(ph_plus, ph_minus)
+        ph_direction = 1 if ph_plus >= ph_minus else -1
 
+        raw_p = ad_normal_p(z)
         abrupt = (
-            abs(z)
-            >= AD_ABRUPT_Z
-            and p_value
-            <= abrupt_alpha_per_series
+            abs(z) >= AD_ABRUPT_Z
+            and raw_p <= abrupt_p_limit
         )
 
-        recent_shift_start = max(
+        shift_start = max(
             baseline_count,
-            i
-            - AD_SHIFT_PERSISTENCE
-            + 1
+            i - AD_SHIFT_COUNT + 1
         )
 
-        recent_shift = (
-            z_values[
-                recent_shift_start:
-                i + 1
-            ]
+        shift_z = z_values[shift_start:i + 1]
+
+        persistent_shift = (
+            len(shift_z) >= AD_SHIFT_COUNT
+            and np.all(np.abs(shift_z) >= AD_SHIFT_Z)
+            and (
+                np.all(shift_z > 0)
+                or np.all(shift_z < 0)
+            )
         )
-
-        persistent_shift = False
-
-        if (
-            len(recent_shift)
-            >= AD_SHIFT_PERSISTENCE
-        ):
-            signs = np.sign(
-                recent_shift
-            )
-
-            persistent_shift = (
-                np.all(
-                    np.abs(
-                        recent_shift
-                    )
-                    >= AD_SHIFT_Z
-                )
-                and (
-                    np.all(
-                        signs > 0
-                    )
-                    or np.all(
-                        signs < 0
-                    )
-                )
-            )
 
         gradual = False
-        robust_slope = np.nan
-        direction_fraction = 0.0
+        theilsen = np.nan
+        direction_fraction = np.nan
+        direction = 0
         net_z = np.nan
-        gradual_direction = 0
+        mk_z = np.nan
+        mk_p = np.nan
 
-        if (
-            i
-            - baseline_count
-            + 1
-            >= AD_GRADUAL_WINDOW
-        ):
+        if i - baseline_count + 1 >= AD_SEQ_WINDOW:
+            recent_z = z_values[i - AD_SEQ_WINDOW + 1:i + 1]
 
-            recent_z = (
-                z_values[
-                    i
-                    - AD_GRADUAL_WINDOW
-                    + 1:
-                    i + 1
+            theilsen = ad_theilsen(recent_z)
+            direction_fraction, direction = ad_directionality(recent_z)
+            net_z = float(recent_z[-1] - recent_z[0])
+            mk_z, mk_p = ad_mann_kendall(recent_z)
+
+            trend_direction_ok = (
+                direction != 0
+                and np.sign(net_z) == direction
+                and np.sign(theilsen) == direction
+                and np.sign(mk_z) == direction
+            )
+
+            sequential_direction_ok = (
+                cusum_direction == direction
+                and ph_direction == direction
+                and np.sign(ewma) == direction
+            )
+
+            evidence_count = sum(
+                [
+                    direction_fraction >= AD_DIRECTIONAL_FRACTION,
+                    abs(net_z) >= AD_MIN_NET_Z,
+                    abs(theilsen) >= AD_MIN_THEILSEN,
+                    mk_p <= AD_MK_P,
+                    abs(ewma) >= AD_EWMA_WARN,
+                    cusum >= AD_CUSUM_WARN,
+                    ph_score >= AD_PH_WARN
                 ]
             )
 
-            robust_slope = (
-                median_pairwise_slope(
-                    recent_z
-                )
-            )
-
-            (
-                direction_fraction,
-                gradual_direction
-            ) = directional_fraction(
-                recent_z
-            )
-
-            net_z = float(
-                recent_z[-1]
-                - recent_z[0]
-            )
-
-            direction_consistent = (
-                gradual_direction
-                != 0
-                and np.sign(
-                    net_z
-                )
-                == gradual_direction
-                and np.sign(
-                    robust_slope
-                )
-                == gradual_direction
-                and cusum_direction
-                == gradual_direction
-            )
-
             gradual = (
-                direction_consistent
-                and direction_fraction
-                >= AD_GRADUAL_MIN_DIRECTIONAL_FRACTION
-                and abs(
-                    net_z
+                trend_direction_ok
+                and sequential_direction_ok
+                and evidence_count >= 6
+                and (
+                    abs(ewma) >= AD_EWMA_STRONG
+                    or cusum >= AD_CUSUM_STRONG
+                    or ph_score >= AD_PH_STRONG
                 )
-                >= AD_GRADUAL_MIN_NET_Z
-                and abs(
-                    robust_slope
-                )
-                >= AD_GRADUAL_MIN_SLOPE_Z
-                and cusum_strength
-                >= AD_GRADUAL_MIN_CUSUM
-                and abs(
-                    ewma
-                )
-                >= AD_GRADUAL_MIN_EWMA
             )
 
         if gradual:
-            if (
-                gradual_candidate_direction
-                == gradual_direction
-            ):
-                gradual_candidate_count += 1
+            if direction == gradual_direction:
+                gradual_streak += 1
             else:
-                gradual_candidate_direction = (
-                    gradual_direction
-                )
-                gradual_candidate_count = 1
+                gradual_direction = direction
+                gradual_streak = 1
         else:
-            gradual_candidate_count = 0
-            gradual_candidate_direction = 0
+            gradual_streak = 0
+            gradual_direction = 0
 
-        confirmed_gradual = (
-            gradual_candidate_count
-            >= AD_CONFIRMATION_POINTS
-        )
+        confirmed_gradual = gradual_streak >= AD_CONFIRMATIONS
 
         detection_type = None
 
         if abrupt:
-            detection_type = (
-                "ABRUPT EXTREME"
-            )
-
+            detection_type = "ABRUPT EXTREME"
         elif persistent_shift:
-            detection_type = (
-                "PERSISTENT LEVEL SHIFT"
-            )
-
+            detection_type = "PERSISTENT LEVEL SHIFT"
         elif confirmed_gradual:
-            detection_type = (
-                "GRADUAL DEGRADATION"
-            )
+            detection_type = "GRADUAL DEGRADATION"
 
         if detection_type is None:
             continue
 
-        value = float(
-            row["Value"]
-        )
-
-        pct = percent_deviation(
-            value,
-            baseline_center
-        )
+        pct = ad_pct(float(row["Value"]), baseline_center)
 
         evidence = []
 
         evidence.append(
-            f"same-phase robust deviation "
-            f"{z:+.2f}σ"
+            f"same-phase deviation {z:+.2f} robust sigma"
         )
 
-        if np.isfinite(
-            pct
-        ):
+        if np.isfinite(pct):
             evidence.append(
-                f"value deviation "
-                f"{pct:+.3f}%"
+                f"{pct:+.3f}% from frozen healthy baseline"
             )
 
         if abrupt:
             evidence.append(
-                f"extreme-event p="
-                f"{p_value:.2e}"
+                f"family-wise corrected abrupt-event p evidence {raw_p:.2e}"
             )
 
         if persistent_shift:
             evidence.append(
-                f"{AD_SHIFT_PERSISTENCE} "
-                f"consecutive same-direction "
-                f"large deviations"
+                f"{AD_SHIFT_COUNT} consecutive same-direction >= {AD_SHIFT_Z:.1f} sigma observations"
             )
 
         if confirmed_gradual:
-            evidence.append(
-                f"{AD_GRADUAL_WINDOW}-point "
-                f"robust slope "
-                f"{robust_slope:+.3f}σ/flight"
+            evidence.extend(
+                [
+                    f"{AD_SEQ_WINDOW}-flight Theil-Sen trend {theilsen:+.3f} sigma/flight",
+                    f"directional consistency {direction_fraction:.0%}",
+                    f"net movement {net_z:+.2f} sigma",
+                    f"Mann-Kendall p={mk_p:.3g}",
+                    f"EWMA {ewma:+.2f} sigma",
+                    f"CUSUM {cusum:.2f}",
+                    f"Page-Hinkley evidence {ph_score:.2f}",
+                    f"confirmed across {gradual_streak} successive evaluations"
+                ]
             )
 
-            evidence.append(
-                f"directional consistency "
-                f"{direction_fraction:.0%}"
-            )
+        strength_votes = 0
 
-            evidence.append(
-                f"net movement "
-                f"{net_z:+.2f}σ"
-            )
-
-            evidence.append(
-                f"EWMA "
-                f"{ewma:+.2f}σ"
-            )
-
-            evidence.append(
-                f"CUSUM "
-                f"{cusum_strength:.2f}"
-            )
+        if abs(z) >= 6.0:
+            strength_votes += 1
+        if abs(ewma) >= AD_EWMA_STRONG:
+            strength_votes += 1
+        if cusum >= AD_CUSUM_STRONG:
+            strength_votes += 1
+        if ph_score >= AD_PH_STRONG:
+            strength_votes += 1
+        if np.isfinite(mk_p) and mk_p <= 0.02:
+            strength_votes += 1
+        if np.isfinite(direction_fraction) and direction_fraction >= 0.85:
+            strength_votes += 1
 
         if detection_type == "ABRUPT EXTREME":
             confidence = "VERY HIGH"
-
-        elif (
-            detection_type
-            == "PERSISTENT LEVEL SHIFT"
-            and abs(z) >= 5.0
-        ):
+        elif detection_type == "PERSISTENT LEVEL SHIFT" and strength_votes >= 2:
             confidence = "VERY HIGH"
-
-        elif (
-            detection_type
-            == "GRADUAL DEGRADATION"
-            and direction_fraction >= 0.85
-            and abs(net_z) >= 3.0
-            and cusum_strength >= 12.0
-        ):
+        elif detection_type == "GRADUAL DEGRADATION" and strength_votes >= 4:
             confidence = "VERY HIGH"
-
         else:
             confidence = "HIGH"
 
-        detection_records.append(
+        detections.append(
             {
-                "FlightStart":
-                    row[
-                        "FlightStart"
-                    ],
-                "FlightIndex":
-                    int(
-                        row[
-                            "FlightIndex"
-                        ]
-                    ),
-                "FlightPhase":
-                    row[
-                        "FlightPhase"
-                    ],
-                "Parameter":
-                    parameter,
-                "Feature":
-                    feature,
-                "DetectionType":
-                    detection_type,
-                "Confidence":
-                    confidence,
-                "Observed":
-                    value,
-                "Baseline":
-                    baseline_center,
-                "DeviationPct":
-                    pct,
-                "RobustZ":
-                    z,
-                "EWMA":
-                    ewma,
-                "CUSUM":
-                    cusum_strength,
-                "RobustSlope":
-                    robust_slope,
-                "DirectionalConsistency":
-                    direction_fraction,
-                "NetMovementZ":
-                    net_z,
-                "Reason":
-                    "; ".join(
-                        evidence
-                    )
+                "FlightStart": pd.Timestamp(row["FlightStart"]),
+                "FlightIndex": int(row["FlightIndex"]),
+                "FlightPhase": float(row["FlightPhase"]),
+                "Parameter": parameter,
+                "Feature": feature,
+                "Detection": detection_type,
+                "Confidence": confidence,
+                "Observed": float(row["Value"]),
+                "Baseline": float(baseline_center),
+                "DeviationPct": pct,
+                "RobustZ": z,
+                "EWMA": ewma,
+                "CUSUM": cusum,
+                "PageHinkley": ph_score,
+                "TrendSigmaPerFlight": theilsen,
+                "DirectionalConsistency": direction_fraction,
+                "MannKendallP": mk_p,
+                "NetMovementZ": net_z,
+                "Reason": "; ".join(evidence)
             }
         )
 
-anomaly_detail_df = pd.DataFrame(
-    detection_records
-)
+anomaly_detail_df = pd.DataFrame(detections)
 
-if anomaly_detail_df.empty:
-
-    print()
-    print("=" * 125)
-    print(
-        "HIGH-CONFIDENCE ANOMALY REPORT"
-    )
-    print("=" * 125)
-    print(
-        "No anomaly crossed the final "
-        "confirmation criteria."
-    )
-    print()
-    print(
-        "The detector searched independently "
-        "for abrupt extreme events, persistent "
-        "level shifts, and slow monotonic "
-        "degradation within each FlightPhase."
-    )
-    print(
-        "No detection does not prove that no "
-        "physical degradation exists."
-    )
-
-else:
-
-    confidence_order = {
-        "VERY HIGH": 2,
-        "HIGH": 1
-    }
-
-    type_order = {
-        "GRADUAL DEGRADATION": 3,
-        "PERSISTENT LEVEL SHIFT": 2,
-        "ABRUPT EXTREME": 1
-    }
-
-    anomaly_detail_df[
-        "_ConfidenceOrder"
-    ] = (
-        anomaly_detail_df[
-            "Confidence"
-        ]
-        .map(
-            confidence_order
+if not anomaly_detail_df.empty:
+    anomaly_detail_df["_Signal"] = anomaly_detail_df["Parameter"].map(
+        lambda p: (
+            str(p).split("::", 1)[1]
+            if str(p).startswith("AC-BC::")
+            else ad_split_channel(p)[1]
         )
+    )
+
+    anomaly_detail_df["_ConfidenceRank"] = (
+        anomaly_detail_df["Confidence"]
+        .map({"VERY HIGH": 2, "HIGH": 1})
         .fillna(0)
     )
 
-    anomaly_detail_df[
-        "_TypeOrder"
-    ] = (
-        anomaly_detail_df[
-            "DetectionType"
-        ]
+    anomaly_detail_df["_DetectionRank"] = (
+        anomaly_detail_df["Detection"]
         .map(
-            type_order
+            {
+                "GRADUAL DEGRADATION": 3,
+                "PERSISTENT LEVEL SHIFT": 2,
+                "ABRUPT EXTREME": 1
+            }
         )
         .fillna(0)
     )
@@ -1203,10 +636,10 @@ else:
         .sort_values(
             [
                 "FlightStart",
-                "_ConfidenceOrder",
-                "_TypeOrder",
+                "_ConfidenceRank",
+                "_DetectionRank",
                 "CUSUM",
-                "RobustZ"
+                "PageHinkley"
             ],
             ascending=[
                 True,
@@ -1217,586 +650,498 @@ else:
             ],
             kind="stable"
         )
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
 
-    def pretty_parameter(
-        value
-    ):
-        value = str(
-            value
-        )
-
-        if value.startswith(
-            "AC-BC::"
-        ):
-            return (
-                "AC/BC Δ — "
-                + value.split(
-                    "::",
-                    1
-                )[1]
-            )
-
-        return short_name(
-            value
-        )
+    def ad_pretty_parameter(value):
+        value = str(value)
+        if value.startswith("AC-BC::"):
+            return "AC/BC delta - " + value.split("::", 1)[1]
+        return ad_short(value)
 
     report_df = pd.DataFrame(
         {
-            "DATE / FLIGHT":
-                pd.to_datetime(
-                    anomaly_detail_df[
-                        "FlightStart"
-                    ]
-                ).dt.strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
+            "DATE / FLIGHT": pd.to_datetime(
+                anomaly_detail_df["FlightStart"]
+            ).dt.strftime("%Y-%m-%d %H:%M:%S"),
 
-            "PHASE":
-                anomaly_detail_df[
-                    "FlightPhase"
-                ].map(
-                    lambda x:
-                    f"{x:g}"
-                ),
+            "PHASE": anomaly_detail_df["FlightPhase"].map(
+                lambda x: f"{x:g}"
+            ),
 
-            "PARAMETER":
-                anomaly_detail_df[
-                    "Parameter"
-                ].map(
-                    pretty_parameter
-                ),
+            "PARAMETER": anomaly_detail_df["Parameter"].map(
+                ad_pretty_parameter
+            ),
 
-            "DETECTION":
-                anomaly_detail_df[
-                    "DetectionType"
-                ],
+            "FEATURE": anomaly_detail_df["Feature"],
 
-            "CONFIDENCE":
-                anomaly_detail_df[
-                    "Confidence"
-                ],
+            "DETECTION": anomaly_detail_df["Detection"],
 
-            "FEATURE":
-                anomaly_detail_df[
-                    "Feature"
-                ],
+            "CONFIDENCE": anomaly_detail_df["Confidence"],
 
-            "OBSERVED":
-                anomaly_detail_df[
-                    "Observed"
-                ].map(
-                    lambda x:
-                    f"{x:,.6g}"
-                ),
+            "OBSERVED": anomaly_detail_df["Observed"].map(
+                lambda x: f"{x:,.6g}"
+            ),
 
-            "BASELINE":
-                anomaly_detail_df[
-                    "Baseline"
-                ].map(
-                    lambda x:
-                    f"{x:,.6g}"
-                ),
+            "BASELINE": anomaly_detail_df["Baseline"].map(
+                lambda x: f"{x:,.6g}"
+            ),
 
-            "DEVIATION":
-                anomaly_detail_df[
-                    "DeviationPct"
-                ].map(
-                    lambda x:
-                    (
-                        f"{x:+.3f}%"
-                        if np.isfinite(
-                            x
-                        )
-                        else "N/A"
-                    )
-                ),
+            "DEVIATION": anomaly_detail_df["DeviationPct"].map(
+                lambda x: f"{x:+.3f}%" if np.isfinite(x) else "N/A"
+            ),
 
-            "ROBUST σ":
-                anomaly_detail_df[
-                    "RobustZ"
-                ].map(
-                    lambda x:
-                    f"{x:+.2f}"
-                ),
+            "ROBUST SIGMA": anomaly_detail_df["RobustZ"].map(
+                lambda x: f"{x:+.2f}"
+            ),
 
-            "EWMA":
-                anomaly_detail_df[
-                    "EWMA"
-                ].map(
-                    lambda x:
-                    f"{x:+.2f}"
-                ),
+            "EWMA": anomaly_detail_df["EWMA"].map(
+                lambda x: f"{x:+.2f}"
+            ),
 
-            "CUSUM":
-                anomaly_detail_df[
-                    "CUSUM"
-                ].map(
-                    lambda x:
-                    f"{x:.2f}"
-                ),
+            "CUSUM": anomaly_detail_df["CUSUM"].map(
+                lambda x: f"{x:.2f}"
+            ),
 
-            "TREND σ/FLIGHT":
-                anomaly_detail_df[
-                    "RobustSlope"
-                ].map(
-                    lambda x:
-                    (
-                        f"{x:+.3f}"
-                        if np.isfinite(
-                            x
-                        )
-                        else "—"
-                    )
-                ),
+            "PAGE-HINKLEY": anomaly_detail_df["PageHinkley"].map(
+                lambda x: f"{x:.2f}"
+            ),
 
-            "DIRECTIONAL":
-                anomaly_detail_df[
-                    "DirectionalConsistency"
-                ].map(
-                    lambda x:
-                    (
-                        f"{x:.0%}"
-                        if np.isfinite(
-                            x
-                        )
-                        else "—"
-                    )
-                ),
+            "TREND SIGMA/FLIGHT": anomaly_detail_df[
+                "TrendSigmaPerFlight"
+            ].map(
+                lambda x: f"{x:+.3f}" if np.isfinite(x) else "-"
+            ),
 
-            "REASON":
-                anomaly_detail_df[
-                    "Reason"
-                ]
+            "DIRECTIONAL": anomaly_detail_df[
+                "DirectionalConsistency"
+            ].map(
+                lambda x: f"{x:.0%}" if np.isfinite(x) else "-"
+            ),
+
+            "MK p": anomaly_detail_df["MannKendallP"].map(
+                lambda x: f"{x:.3g}" if np.isfinite(x) else "-"
+            ),
+
+            "REASON": anomaly_detail_df["Reason"]
         }
     )
 
     print()
-    print("=" * 125)
-    print(
-        "HIGH-CONFIDENCE "
-        "FLIGHTPHASE-CONDITIONED "
-        "ANOMALY REPORT"
-    )
-    print("=" * 125)
-
-    print(
-        f"Flights analysed:       "
-        f"{len(flight_starts):,}"
-    )
-
-    print(
-        f"Numeric parameters:     "
-        f"{len(numeric_parameters):,}"
-    )
-
-    print(
-        f"Independent series:     "
-        f"{series_count:,}"
-    )
-
-    print(
-        f"Confirmed detections:   "
-        f"{len(report_df):,}"
-    )
-
-    print(
-        f"Affected flights:       "
-        f"{anomaly_detail_df['FlightStart'].nunique():,}"
-    )
-
+    print("=" * 130)
+    print("CONFIRMED ANOMALY / DEGRADATION REPORT")
+    print("=" * 130)
+    print(f"Confirmed detection rows: {len(report_df):,}")
+    print(f"Affected flights:         {anomaly_detail_df['FlightStart'].nunique():,}")
+    print(f"Affected signals:         {anomaly_detail_df['_Signal'].nunique():,}")
     print()
 
-    display(
-        report_df.head(
-            AD_MAX_REPORT_ROWS
+    try:
+        styled_report = (
+            report_df
+            .head(AD_MAX_REPORT_ROWS)
+            .style
+            .set_properties(
+                **{
+                    "text-align": "left",
+                    "white-space": "normal"
+                }
+            )
+            .set_table_styles(
+                [
+                    {
+                        "selector": "th",
+                        "props": [
+                            ("text-align", "left"),
+                            ("font-weight", "bold"),
+                            ("position", "sticky"),
+                            ("top", "0")
+                        ]
+                    }
+                ]
+            )
         )
-    )
+        ipy_display(styled_report)
+    except Exception:
+        ipy_display(report_df.head(AD_MAX_REPORT_ROWS))
 
-    if (
-        len(report_df)
-        > AD_MAX_REPORT_ROWS
-    ):
-        print(
-            f"Showing first "
-            f"{AD_MAX_REPORT_ROWS:,} "
-            f"of {len(report_df):,} rows."
-        )
-
-confirmed_flights = set()
+else:
+    report_df = pd.DataFrame()
+    print()
+    print("=" * 130)
+    print("CONFIRMED ANOMALY / DEGRADATION REPORT")
+    print("=" * 130)
+    print("No telemetry series satisfied the final consensus criteria.")
 
 if not anomaly_detail_df.empty:
-    confirmed_flights = set(
-        pd.to_datetime(
-            anomaly_detail_df[
-                "FlightStart"
-            ]
+    detected_signals = list(
+        dict.fromkeys(
+            anomaly_detail_df["_Signal"].tolist()
         )
     )
 
-plot_parameters = []
+    signal_columns = {}
 
-if (
-    "selected_parameters"
-    in globals()
-):
-    for parameter in (
-        selected_parameters
-    ):
-        candidate = str(
-            parameter
-        )
-
-        if candidate in ad_df.columns:
-            plot_parameters.append(
-                candidate
-            )
-
-        elif (
-            prefix + candidate
-            in ad_df.columns
-        ):
-            plot_parameters.append(
-                prefix + candidate
-            )
-
-if (
-    not plot_parameters
-    and not anomaly_detail_df.empty
-):
-
-    ranked_parameters = (
-        anomaly_detail_df[
-            "Parameter"
-        ]
-        .value_counts()
-        .index
-        .tolist()
-    )
-
-    for parameter in (
-        ranked_parameters
-    ):
-
-        if len(
-            plot_parameters
-        ) >= AD_MAX_PLOT_SIGNALS:
-            break
-
-        parameter = str(
-            parameter
-        )
-
-        if parameter.startswith(
-            "AC-BC::"
-        ):
-            signal = (
-                parameter.split(
-                    "::",
-                    1
-                )[1]
-            )
-
-            for channel in (
-                "AC",
-                "BC"
-            ):
-                candidate = (
-                    prefix
-                    + channel
-                    + "_"
-                    + signal
+    for signal in detected_signals:
+        members = []
+        for column in numeric_parameters:
+            channel, base = ad_split_channel(column)
+            if base == signal:
+                members.append((channel, column))
+        if members:
+            members.sort(
+                key=lambda x: (
+                    0 if x[0] == "AC"
+                    else 1 if x[0] == "BC"
+                    else 2,
+                    x[1]
                 )
-
-                if (
-                    candidate
-                    in ad_df.columns
-                ):
-                    plot_parameters.append(
-                        candidate
-                    )
-
-        elif (
-            parameter
-            in ad_df.columns
-        ):
-            plot_parameters.append(
-                parameter
             )
+            signal_columns[signal] = members
 
-plot_parameters = list(
-    dict.fromkeys(
-        plot_parameters
-    )
-)
+    if len(signal_columns) > AD_MAX_PLOT_SIGNALS:
+        signal_priority = (
+            anomaly_detail_df
+            .groupby("_Signal")
+            .agg(
+                Detections=("Detection", "size"),
+                MaxCUSUM=("CUSUM", "max"),
+                MaxPH=("PageHinkley", "max"),
+                MaxZ=("RobustZ", lambda x: float(np.max(np.abs(x))))
+            )
+            .assign(
+                Priority=lambda x:
+                    x["Detections"]
+                    + x["MaxCUSUM"] / 10.0
+                    + x["MaxPH"] / 10.0
+                    + x["MaxZ"] / 6.0
+            )
+            .sort_values("Priority", ascending=False)
+        )
 
-if plot_parameters:
+        keep_signals = set(
+            signal_priority.head(
+                AD_MAX_PLOT_SIGNALS
+            ).index
+        )
+
+        signal_columns = {
+            k: v
+            for k, v in signal_columns.items()
+            if k in keep_signals
+        }
 
     flight_info = []
     cursor = 0.0
-    compressed_gap = 120.0
 
     for flight in flight_starts:
-
         subset = ad_df.loc[
-            ad_df[
-                "StartDatetime"
-            ]
-            == flight
+            ad_df["StartDatetime"] == flight
         ]
 
         if subset.empty:
             continue
 
-        start = subset[
-            "Timestamp"
-        ].min()
-
-        end = subset[
-            "Timestamp"
-        ].max()
+        start = subset["Timestamp"].min()
+        end = subset["Timestamp"].max()
 
         duration = max(
-            (
-                end - start
-            ).total_seconds(),
+            (end - start).total_seconds(),
             1.0
         )
 
         flight_info.append(
             {
-                "FlightStart":
-                    flight,
-                "Start":
-                    start,
-                "End":
-                    end,
-                "PlotStart":
-                    cursor,
-                "PlotEnd":
-                    cursor
-                    + duration
+                "FlightStart": flight,
+                "ActualStart": start,
+                "ActualEnd": end,
+                "PlotStart": cursor,
+                "PlotEnd": cursor + duration
             }
         )
 
-        cursor += (
-            duration
-            + compressed_gap
-        )
+        cursor += duration + AD_COMPRESSED_GAP
 
-    plotting_frames = []
+    plot_frames = []
 
     for info in flight_info:
-
         subset = ad_df.loc[
-            ad_df[
-                "StartDatetime"
-            ]
-            == info[
-                "FlightStart"
-            ]
+            ad_df["StartDatetime"] == info["FlightStart"]
         ].copy()
 
-        subset[
-            "_AD_PlotX"
-        ] = (
-            info[
-                "PlotStart"
-            ]
+        subset["_AD_PlotX"] = (
+            info["PlotStart"]
             + (
-                subset[
-                    "Timestamp"
-                ]
-                - info[
-                    "Start"
-                ]
+                subset["Timestamp"]
+                - info["ActualStart"]
             ).dt.total_seconds()
         )
 
-        plotting_frames.append(
-            subset
-        )
+        plot_frames.append(subset)
 
-    if plotting_frames:
-
+    if plot_frames and signal_columns:
         plot_df = pd.concat(
-            plotting_frames,
+            plot_frames,
             ignore_index=True
         )
 
-        signal_groups = (
-            defaultdict(
-                list
-            )
-        )
+        flight_lookup = {
+            x["FlightStart"]: x
+            for x in flight_info
+        }
 
-        for column in (
-            plot_parameters
-        ):
-            channel, signal = (
-                split_channel(
-                    column
-                )
+        anomaly_markers = defaultdict(dict)
+
+        for _, row in anomaly_detail_df.iterrows():
+            signal = row["_Signal"]
+
+            if signal not in signal_columns:
+                continue
+
+            flight = pd.Timestamp(
+                row["FlightStart"]
             )
 
-            signal_groups[
-                signal
-            ].append(
+            phase = float(
+                row["FlightPhase"]
+            )
+
+            phase_rows = plot_df.loc[
                 (
-                    channel,
-                    column
+                    plot_df["StartDatetime"]
+                    == flight
                 )
-            )
-
-        if (
-            len(signal_groups)
-            > AD_MAX_PLOT_SIGNALS
-        ):
-            signal_groups = dict(
-                list(
-                    signal_groups.items()
-                )[
-                    :AD_MAX_PLOT_SIGNALS
-                ]
-            )
-
-        fig, axes = (
-            plt.subplots(
-                len(
-                    signal_groups
-                ),
-                1,
-                figsize=(
-                    20,
-                    max(
-                        5,
-                        3.2
-                        * len(
-                            signal_groups
-                        )
+                & (
+                    pd.to_numeric(
+                        plot_df["_AD_Phase"],
+                        errors="coerce"
                     )
-                ),
-                sharex=True,
-                squeeze=False
+                    == phase
+                )
+            ]
+
+            if phase_rows.empty:
+                if flight not in flight_lookup:
+                    continue
+                x = flight_lookup[flight]["PlotStart"]
+                timestamp = flight
+            else:
+                phase_rows = phase_rows.sort_values(
+                    "Timestamp",
+                    kind="stable"
+                )
+                middle = phase_rows.iloc[
+                    len(phase_rows) // 2
+                ]
+                x = float(
+                    middle["_AD_PlotX"]
+                )
+                timestamp = pd.Timestamp(
+                    middle["Timestamp"]
+                )
+
+            key = (
+                flight,
+                phase
             )
+
+            anomaly_markers[signal][key] = {
+                "x": x,
+                "timestamp": timestamp,
+                "flight": flight,
+                "phase": phase
+            }
+
+        fig, axes = plt.subplots(
+            len(signal_columns),
+            1,
+            figsize=(
+                22,
+                max(
+                    6,
+                    3.4 * len(signal_columns)
+                )
+            ),
+            sharex=True,
+            squeeze=False
         )
 
-        axes = axes[
-            :,
-            0
-        ]
+        axes = axes[:, 0]
 
-        for axis, (
-            signal,
-            members
-        ) in zip(
+        channel_colors = globals().get(
+            "CHANNEL_COLORS",
+            {
+                "AC": "#1f77b4",
+                "BC": "#ff7f0e"
+            }
+        )
+
+        for axis, (signal, members) in zip(
             axes,
-            signal_groups.items()
+            signal_columns.items()
         ):
+            for channel, column in members:
+                label_pending = True
 
-            for (
-                channel,
-                column
-            ) in members:
+                for info in flight_info:
+                    segment = plot_df.loc[
+                        plot_df["StartDatetime"]
+                        == info["FlightStart"],
+                        [
+                            "Timestamp",
+                            "_AD_PlotX",
+                            column
+                        ]
+                    ].copy()
 
-                first = True
-
-                for info in (
-                    flight_info
-                ):
+                    segment[column] = pd.to_numeric(
+                        segment[column],
+                        errors="coerce"
+                    )
 
                     segment = (
-                        plot_df.loc[
-                            plot_df[
-                                "StartDatetime"
-                            ]
-                            == info[
-                                "FlightStart"
-                            ],
-                            [
+                        segment
+                        .dropna(
+                            subset=[
                                 "_AD_PlotX",
                                 column
                             ]
-                        ]
-                        .copy()
-                    )
-
-                    segment[
-                        column
-                    ] = (
-                        pd.to_numeric(
-                            segment[
-                                column
-                            ],
-                            errors="coerce"
                         )
-                    )
-
-                    segment = (
-                        segment.dropna()
+                        .sort_values(
+                            "Timestamp",
+                            kind="stable"
+                        )
                     )
 
                     if segment.empty:
                         continue
 
-                    label = (
-                        channel
-                        if (
-                            channel
-                            and first
-                        )
-                        else (
-                            short_name(
-                                column
-                            )
-                            if first
-                            else "_nolegend_"
+                    unique_values = (
+                        segment[column]
+                        .dropna()
+                        .unique()
+                    )
+
+                    discrete = (
+                        len(unique_values) <= 12
+                        and np.allclose(
+                            unique_values,
+                            np.round(unique_values),
+                            equal_nan=True
                         )
                     )
 
-                    axis.plot(
-                        segment[
-                            "_AD_PlotX"
-                        ],
-                        segment[
-                            column
-                        ],
-                        linewidth=1.0,
-                        label=label
+                    positive_deltas = (
+                        segment["Timestamp"]
+                        .diff()
+                        .dt.total_seconds()
                     )
 
-                    first = False
-
-            for info in (
-                flight_info
-            ):
-
-                if (
-                    info[
-                        "FlightStart"
+                    cadence_values = positive_deltas[
+                        positive_deltas > 0
                     ]
-                    in confirmed_flights
-                ):
-                    axis.axvline(
-                        info[
-                            "PlotStart"
-                        ],
-                        color="white",
-                        linewidth=2.0,
-                        alpha=0.95,
-                        zorder=20
+
+                    cadence = (
+                        float(cadence_values.median())
+                        if not cadence_values.empty
+                        else 1.0
                     )
+
+                    gap_threshold = max(
+                        3.0 * cadence,
+                        5.0
+                    )
+
+                    chunk_ids = (
+                        positive_deltas
+                        .gt(gap_threshold)
+                        .cumsum()
+                    )
+
+                    for _, chunk in segment.groupby(
+                        chunk_ids,
+                        sort=True
+                    ):
+                        axis.plot(
+                            chunk["_AD_PlotX"],
+                            chunk[column],
+                            linewidth=1.15,
+                            color=channel_colors.get(
+                                channel,
+                                None
+                            ),
+                            drawstyle=(
+                                "steps-post"
+                                if discrete
+                                else "default"
+                            ),
+                            label=(
+                                channel or ad_short(column)
+                                if label_pending
+                                else "_nolegend_"
+                            ),
+                            zorder=4
+                        )
+
+                        label_pending = False
+
+            for marker in anomaly_markers.get(
+                signal,
+                {}
+            ).values():
+                axis.axvline(
+                    marker["x"],
+                    color="white",
+                    linewidth=2.0,
+                    alpha=0.95,
+                    zorder=20
+                )
+
+            signal_detections = anomaly_detail_df.loc[
+                anomaly_detail_df["_Signal"]
+                == signal
+            ]
+
+            gradual_count = int(
+                (
+                    signal_detections["Detection"]
+                    == "GRADUAL DEGRADATION"
+                ).sum()
+            )
+
+            shift_count = int(
+                (
+                    signal_detections["Detection"]
+                    == "PERSISTENT LEVEL SHIFT"
+                ).sum()
+            )
+
+            abrupt_count = int(
+                (
+                    signal_detections["Detection"]
+                    == "ABRUPT EXTREME"
+                ).sum()
+            )
+
+            axis.set_title(
+                f"{signal} | gradual={gradual_count}, "
+                f"shift={shift_count}, abrupt={abrupt_count}",
+                loc="left",
+                fontsize=10
+            )
 
             axis.set_ylabel(
-                signal
+                signal,
+                fontsize=9
             )
 
             axis.grid(
                 True,
                 alpha=0.20
+            )
+
+            axis.margins(
+                y=0.08
             )
 
             handles, labels = (
@@ -1805,6 +1150,8 @@ if plot_parameters:
 
             if handles:
                 axis.legend(
+                    handles,
+                    labels,
                     loc="upper right",
                     framealpha=0.85
                 )
@@ -1812,25 +1159,16 @@ if plot_parameters:
         tick_positions = []
         tick_labels = []
 
-        for info in (
-            flight_info
-        ):
+        for info in flight_info:
             tick_positions.append(
                 (
-                    info[
-                        "PlotStart"
-                    ]
-                    + info[
-                        "PlotEnd"
-                    ]
-                )
-                / 2.0
+                    info["PlotStart"]
+                    + info["PlotEnd"]
+                ) / 2.0
             )
 
             tick_labels.append(
-                info[
-                    "FlightStart"
-                ].strftime(
+                info["FlightStart"].strftime(
                     "%Y-%m-%d\n%H:%M"
                 )
             )
@@ -1847,59 +1185,66 @@ if plot_parameters:
         )
 
         axes[-1].set_xlabel(
-            "Flight timeline — "
-            "inter-flight calendar gaps compressed"
+            "Flight timeline - calendar gaps compressed"
         )
 
+        if flight_info:
+            axes[-1].set_xlim(
+                flight_info[0]["PlotStart"],
+                flight_info[-1]["PlotEnd"]
+            )
+
         fig.suptitle(
-            "High-Confidence "
-            "Phase-Conditioned "
-            "Anomaly Detection",
+            "Confirmed Phase-Conditioned Engine Anomalies",
             fontsize=15
+        )
+
+        fig.text(
+            0.5,
+            0.012,
+            "White line = centre of the FlightPhase interval in which the confirmed statistical anomaly was identified",
+            ha="center",
+            fontsize=9
         )
 
         fig.tight_layout(
             rect=[
                 0.02,
-                0.03,
+                0.035,
                 0.99,
-                0.96
+                0.965
             ]
         )
 
         plt.show()
-
-        plt.close(
-            fig
-        )
+        plt.close(fig)
 
 print()
-print("=" * 125)
-print("DETECTABILITY NOTES")
-print("=" * 125)
-
+print("=" * 130)
+print("DETECTOR STATUS")
+print("=" * 130)
 print(
-    "1. FlightPhase is a hard operating-mode condition. "
-    "Different phases never share a baseline."
+    "FlightPhase is treated as a hard operating regime. "
+    "No cross-phase baseline comparisons are made."
 )
-
 print(
-    "2. The baseline is frozen from the early comparable flights for each "
-    "parameter/phase/feature series. Slow degradation is therefore not "
-    "continuously absorbed into a moving definition of normal."
+    "Gradual degradation can be confirmed without any individual flight becoming an extreme outlier."
 )
-
 print(
-    "3. Gradual degradation does not need any individual flight to be an "
-    "extreme outlier. It can be detected through accumulated CUSUM, EWMA, "
-    "robust trend and directional persistence."
+    "Abrupt detections use a family-wise multiple-testing safeguard."
 )
-
 print(
-    "4. Abrupt events remain subject to a strict multiple-comparison safeguard."
+    "Gradual detections require agreement between robust trend, directional persistence, "
+    "EWMA, CUSUM, Page-Hinkley-like accumulation and Mann-Kendall trend evidence."
 )
-
 print(
-    "5. A detection demonstrates a statistically persistent telemetry change. "
-    "It does not establish the physical root cause."
+    "AC/BC differential features are analysed independently from the individual AC and BC signals."
+)
+print(
+    "The baseline is frozen rather than continuously adapting, preventing sufficiently slow degradation "
+    "from simply becoming the detector's new definition of normal."
+)
+print(
+    "A confirmed anomaly establishes unusual telemetry behaviour under this statistical model. "
+    "It does not by itself identify the physical root cause."
 )
