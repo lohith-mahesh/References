@@ -1,1141 +1,1939 @@
 import math
+from functools import reduce
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from collections import defaultdict
-from IPython.display import display as ipy_display
+from scipy.stats import kendalltau, norm, theilslopes
+from pyspark import StorageLevel
+from pyspark.sql import Window
 from pyspark.sql import functions as F
-from pyspark.sql.types import NumericType, BooleanType
+from pyspark.sql.types import BooleanType, NumericType
 
-AD_BATCH = 80
-AD_MIN_SAMPLES = 10
-AD_MIN_BASELINE = 12
-AD_BASELINE_TARGET = 20
-AD_WINDOW = 8
-AD_CONFIRM = 2
+ANOMALY_CONFIG = {
+    "transition_boundary_seconds": 2,
+    "maximum_rate_gap_seconds": 60,
+    "batch_size": 24,
+    "minimum_phase_samples": 200,
+    "tail_probability": 0.0001,
+    "quantile_accuracy": 50000,
+    "minimum_robust_z": 6.0,
+    "minimum_rate_z": 8.0,
+    "catastrophic_z": 20.0,
+    "episode_gap_seconds": 5,
+    "minimum_episode_seconds": 2,
+    "minimum_episode_samples": 3,
+    "minimum_trend_flights": 6,
+    "minimum_trend_effect_z": 4.5,
+    "minimum_trend_tau": 0.65,
+    "trend_fdr": 0.001,
+}
 
-AD_ABRUPT_Z = 6.0
-AD_FWER_ALPHA = 0.01
+for _ead_previous_name in (
+    "enterprise_anomaly_samples",
+    "enterprise_anomaly_episodes",
+    "enterprise_phase_issue_episodes",
+):
+    _ead_previous_frame = globals().get(_ead_previous_name)
+    if _ead_previous_frame is not None and hasattr(_ead_previous_frame, "unpersist"):
+        _ead_previous_frame.unpersist()
 
-AD_SHIFT_Z = 3.5
-AD_SHIFT_N = 3
 
-AD_EWMA_LAMBDA = 0.12
-AD_EWMA_WARN = 1.15
-AD_EWMA_STRONG = 1.75
+def _ead_col(name):
+    return F.col(f"`{name.replace('`', '``')}`")
 
-AD_CUSUM_K = 0.20
-AD_CUSUM_WARN = 7.0
-AD_CUSUM_STRONG = 10.0
 
-AD_PH_DELTA = 0.10
-AD_PH_WARN = 6.0
-AD_PH_STRONG = 9.0
+def _ead_clean_double(column):
+    value = column.cast("double")
+    return F.when(
+        value.isNull() | F.isnan(value),
+        F.lit(None).cast("double"),
+    ).otherwise(value)
 
-AD_DIRECTION_MIN = 0.75
-AD_NET_Z_MIN = 1.75
-AD_SLOPE_MIN = 0.10
-AD_MK_P_MAX = 0.05
 
-AD_MAX_REPORT = 1000
-AD_MAX_PLOTS = 30
-AD_GAP_SECONDS = 120.0
-AD_EPS = 1e-12
-
-if "cda" not in globals():
-    raise RuntimeError("cda is missing. Run the preceding notebook cells first.")
-
-if "PARAMETER_PREFIX" not in globals():
-    raise RuntimeError("PARAMETER_PREFIX is missing.")
-
-for c in ("Timestamp", "StartDatetime"):
-    if c not in cda.columns:
-        raise RuntimeError(f"Required cda column is missing: {c}")
-
-def qc(name):
-    return F.col(f"`{str(name).replace('`', '``')}`")
-
-def short(name):
-    name = str(name)
-    return name[len(PARAMETER_PREFIX):] if name.startswith(PARAMETER_PREFIX) else name
-
-def channel_signal(name):
-    name = short(name)
-    if name.startswith("AC_"):
-        return "AC", name[3:]
-    if name.startswith("BC_"):
-        return "BC", name[3:]
-    return "", name
-
-def finite_array(values):
-    x = np.asarray(values, dtype=float)
-    return x[np.isfinite(x)]
-
-def robust_reference(values):
-    x = finite_array(values)
-
-    if x.size == 0:
-        return np.nan, np.nan, False
-
-    center = float(np.median(x))
-    mad = float(np.median(np.abs(x - center)))
-    scale = 1.4826 * mad
-
-    if not np.isfinite(scale) or scale <= AD_EPS:
-        q25, q75 = np.percentile(x, [25, 75])
-        scale = float((q75 - q25) / 1.349)
-
-    if not np.isfinite(scale) or scale <= AD_EPS:
-        scale = float(np.std(x))
-
-    constant = not np.isfinite(scale) or scale <= AD_EPS
-
-    if constant:
-        scale = AD_EPS
-
-    return center, scale, constant
-
-def normal_p(z):
-    if not np.isfinite(z):
-        return 1.0
-    return float(math.erfc(abs(float(z)) / math.sqrt(2.0)))
-
-def pct(value, baseline):
-    if not np.isfinite(value) or not np.isfinite(baseline) or abs(baseline) <= AD_EPS:
-        return np.nan
-    return float(100.0 * (value - baseline) / abs(baseline))
-
-def theilsen(values):
-    y = finite_array(values)
-
-    if len(y) < 3:
-        return np.nan
-
-    slopes = [(y[j] - y[i]) / (j - i)
-              for i in range(len(y) - 1)
-              for j in range(i + 1, len(y))]
-
-    return float(np.median(slopes)) if slopes else np.nan
-
-def directionality(values):
-    y = finite_array(values)
-
-    if len(y) < 3:
-        return 0.0, 0
-
-    d = np.diff(y)
-    pos = int(np.sum(d > 0))
-    neg = int(np.sum(d < 0))
-    total = pos + neg
-
-    if total == 0:
-        return 0.0, 0
-
-    return (pos / total, 1) if pos >= neg else (neg / total, -1)
-
-def mann_kendall(values):
-    y = finite_array(values)
-    n = len(y)
-
-    if n < 5:
-        return 0.0, 1.0
-
-    s = sum(int(np.sum(np.sign(y[i + 1:] - y[i]))) for i in range(n - 1))
-    _, counts = np.unique(y, return_counts=True)
-
-    tie = float(np.sum(counts * (counts - 1) * (2 * counts + 5)))
-    var_s = (n * (n - 1) * (2 * n + 5) - tie) / 18.0
-
-    if var_s <= 0:
-        return 0.0, 1.0
-
-    z = (s - 1) / math.sqrt(var_s) if s > 0 else (
-        (s + 1) / math.sqrt(var_s) if s < 0 else 0.0
+def _ead_short(name):
+    return (
+        name[len(PARAMETER_PREFIX):]
+        if name.startswith(PARAMETER_PREFIX)
+        else name
     )
 
-    return float(z), float(math.erfc(abs(z) / math.sqrt(2.0)))
 
-schema = {f.name: f.dataType for f in cda.schema.fields}
+def _ead_channel_signal(name):
+    short = _ead_short(name)
+    for channel in CHANNELS:
+        prefix = f"{channel}_"
+        if short.startswith(prefix):
+            return channel, short[len(prefix):]
+    return "", short
 
-parameter_columns = [
-    name for name, dtype in schema.items()
-    if name.startswith(PARAMETER_PREFIX) and isinstance(dtype, (NumericType, BooleanType))
-]
 
-if not parameter_columns:
-    raise RuntimeError("No numeric/Boolean Parameter columns exist in cda.")
+def _ead_quantiles(value):
+    if (
+        value is None
+        or len(value) != 5
+        or any(item is None for item in value)
+    ):
+        return None
+    return tuple(float(item) for item in value)
 
-phase_candidates = [c for c in parameter_columns if "flightphase" in c.lower()]
-phase_cols = {}
 
-for ch in ("AC", "BC"):
-    lead = f"{PARAMETER_PREFIX}{ch}_".lower()
-    matches = [c for c in phase_candidates if c.lower().startswith(lead)]
+def _ead_scale(q25, median, q75):
+    return max(
+        (q75 - q25) / 1.349,
+        abs(median) * 1.0e-9,
+        1.0e-12,
+    )
 
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"Could not uniquely identify {ch} FlightPhase. "
-            f"Found {len(matches)} candidate(s): {matches}"
+
+def _ead_case(phase_expressions):
+    expression = F.lit(None).cast("double")
+    for phase, value in phase_expressions:
+        expression = F.when(
+            F.col("_phase") == F.lit(phase),
+            value,
+        ).otherwise(expression)
+    return expression
+
+
+def _ead_bh(values):
+    if not values:
+        return np.array([], dtype=float)
+    p_values = np.asarray(values, dtype=float)
+    order = np.argsort(p_values)
+    ranked = p_values[order]
+    adjusted = ranked * len(ranked) / np.arange(
+        1,
+        len(ranked) + 1,
+    )
+    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
+    result = np.empty_like(adjusted)
+    result[order] = np.minimum(adjusted, 1.0)
+    return result
+
+
+def _ead_prepare(columns, include_rates=True):
+    projections = [
+        _ead_col("Timestamp").alias("Timestamp"),
+        _ead_col("StartDatetime").alias("StartDatetime"),
+        _ead_clean_double(
+            _ead_col(FLIGHT_PHASE_COLUMNS["AC"])
+        ).alias("_phase_ac"),
+        _ead_clean_double(
+            _ead_col(FLIGHT_PHASE_COLUMNS["BC"])
+        ).alias("_phase_bc"),
+    ]
+
+    aliases = {}
+
+    for index, name in enumerate(columns):
+        alias = f"_v{index:03d}"
+        aliases[name] = alias
+        projections.append(
+            _ead_clean_double(_ead_col(name)).alias(alias)
         )
 
-    phase_cols[ch] = matches[0]
-
-ac_phase = qc(phase_cols["AC"]).cast("double")
-bc_phase = qc(phase_cols["BC"]).cast("double")
-
-resolved_phase = (
-    F.when(ac_phase.isNotNull() & bc_phase.isNotNull() & (ac_phase == bc_phase), ac_phase)
-     .when(ac_phase.isNotNull() & bc_phase.isNull(), ac_phase)
-     .when(ac_phase.isNull() & bc_phase.isNotNull(), bc_phase)
-     .otherwise(F.lit(None).cast("double"))
-)
-
-parameters = [c for c in parameter_columns if c not in set(phase_cols.values())]
-
-if not parameters:
-    raise RuntimeError("No analyzable parameters remain after excluding FlightPhase.")
-
-source = (
-    cda
-    .withColumn("_AD_Phase", resolved_phase)
-    .where(
+    frame = cda.select(*projections).where(
         F.col("Timestamp").isNotNull()
         & F.col("StartDatetime").isNotNull()
-        & F.col("_AD_Phase").isNotNull()
-    )
-)
-
-flight_rows = (
-    source
-    .select("StartDatetime")
-    .distinct()
-    .orderBy("StartDatetime")
-    .collect()
-)
-
-flights = [pd.Timestamp(r["StartDatetime"]) for r in flight_rows]
-flight_idx = {f: i for i, f in enumerate(flights)}
-
-if len(flights) < AD_MIN_BASELINE + AD_WINDOW:
-    raise RuntimeError(
-        f"Only {len(flights)} flights are available. "
-        f"At least {AD_MIN_BASELINE + AD_WINDOW} are required."
     )
 
-print("=" * 126)
-print("FULL-SCHEMA PHASE-CONDITIONED DEGRADATION DETECTOR")
-print("=" * 126)
-print(f"Flights found:             {len(flights):,}")
-print(f"Eligible parameters:       {len(parameters):,}")
-print(f"AC FlightPhase:            {phase_cols['AC']}")
-print(f"BC FlightPhase:            {phase_cols['BC']}")
-print(f"Parameters per batch:      {AD_BATCH}")
-print()
-
-feature_parts = []
-batch_total = math.ceil(len(parameters) / AD_BATCH)
-
-print("STAGE 1/4 - Spark full-schema phase-conditioned aggregation")
-
-for batch_no, start in enumerate(range(0, len(parameters), AD_BATCH), 1):
-    batch = parameters[start:start + AD_BATCH]
-
-    safe = source.select(
-        "StartDatetime",
-        "_AD_Phase",
-        *[
-            qc(p).cast("double").alias(f"_p{i}")
-            for i, p in enumerate(batch)
-        ]
-    )
-
-    aggs = []
-
-    for i in range(len(batch)):
-        x = F.col(f"_p{i}")
-
-        aggs += [
-            F.count(x).alias(f"_n{i}"),
-            F.percentile_approx(x, [0.10, 0.50, 0.90], 1000).alias(f"_q{i}"),
-            F.stddev_samp(x).alias(f"_sd{i}")
-        ]
-
-    try:
-        pdf = (
-            safe
-            .groupBy("StartDatetime", "_AD_Phase")
-            .agg(*aggs)
-            .toPandas()
+    frame = (
+        frame.withColumn(
+            "_phase_disagreement",
+            F.col("_phase_ac").isNotNull()
+            & F.col("_phase_bc").isNotNull()
+            & (F.col("_phase_ac") != F.col("_phase_bc")),
         )
-    except Exception as e:
-        raise RuntimeError(
-            f"Stage 1 failed in batch {batch_no}/{batch_total}, "
-            f"covering parameters {start + 1}-{start + len(batch)}. "
-            f"All batch inputs were explicitly cast to double. "
-            f"Original Spark error: {type(e).__name__}: {e}"
-        ) from e
-
-    rows = []
-
-    for _, r in pdf.iterrows():
-        fs = pd.Timestamp(r["StartDatetime"])
-
-        if fs not in flight_idx or pd.isna(r["_AD_Phase"]):
-            continue
-
-        phase = float(r["_AD_Phase"])
-        fi = flight_idx[fs]
-
-        for i, parameter in enumerate(batch):
-            n = r[f"_n{i}"]
-
-            if pd.isna(n) or int(n) < AD_MIN_SAMPLES:
-                continue
-
-            q = r[f"_q{i}"]
-
-            if q is None or len(q) != 3:
-                continue
-
-            try:
-                q10, q50, q90 = map(float, q)
-            except (TypeError, ValueError):
-                continue
-
-            if not all(np.isfinite([q10, q50, q90])):
-                continue
-
-            rows.append({
-                "FlightStart": fs,
-                "FlightIndex": fi,
-                "FlightPhase": phase,
-                "Parameter": parameter,
-                "Feature": "LEVEL",
-                "Value": q50,
-                "Samples": int(n)
-            })
-
-            rows.append({
-                "FlightStart": fs,
-                "FlightIndex": fi,
-                "FlightPhase": phase,
-                "Parameter": parameter,
-                "Feature": "SPREAD",
-                "Value": q90 - q10,
-                "Samples": int(n)
-            })
-
-            sd = r[f"_sd{i}"]
-
-            if pd.notna(sd) and np.isfinite(float(sd)):
-                rows.append({
-                    "FlightStart": fs,
-                    "FlightIndex": fi,
-                    "FlightPhase": phase,
-                    "Parameter": parameter,
-                    "Feature": "STD",
-                    "Value": float(sd),
-                    "Samples": int(n)
-                })
-
-    if rows:
-        feature_parts.append(pd.DataFrame(rows))
-
-    print(f"  Batch {batch_no}/{batch_total} complete ({len(batch)} parameters)")
-
-if not feature_parts:
-    raise RuntimeError("Stage 1 produced no valid parameter health features.")
-
-features = pd.concat(feature_parts, ignore_index=True)
-
-features = (
-    features
-    .replace([np.inf, -np.inf], np.nan)
-    .dropna(subset=["Value"])
-)
-
-print(f"  Health observations: {len(features):,}")
-print()
-
-print("STAGE 2/4 - AC/BC differential analysis")
-
-pairs = defaultdict(dict)
-
-for p in parameters:
-    ch, signal = channel_signal(p)
-
-    if ch in ("AC", "BC"):
-        pairs[signal][ch] = p
-
-pairs = {s: v for s, v in pairs.items() if "AC" in v and "BC" in v}
-pair_items = list(pairs.items())
-pair_parts = []
-pair_batch_total = max(1, math.ceil(len(pair_items) / AD_BATCH))
-
-for batch_no, start in enumerate(range(0, len(pair_items), AD_BATCH), 1):
-    batch = pair_items[start:start + AD_BATCH]
-
-    pair_exprs = []
-
-    for i, (_, channels) in enumerate(batch):
-        ac = qc(channels["AC"]).cast("double")
-        bc = qc(channels["BC"]).cast("double")
-        pair_exprs.append((ac - bc).alias(f"_d{i}"))
-
-    safe = source.select("StartDatetime", "_AD_Phase", *pair_exprs)
-    aggs = []
-
-    for i in range(len(batch)):
-        x = F.col(f"_d{i}")
-
-        aggs += [
-            F.count(x).alias(f"_n{i}"),
-            F.percentile_approx(x, [0.10, 0.50, 0.90], 1000).alias(f"_q{i}"),
-            F.stddev_samp(x).alias(f"_sd{i}")
-        ]
-
-    try:
-        pdf = safe.groupBy("StartDatetime", "_AD_Phase").agg(*aggs).toPandas()
-    except Exception as e:
-        raise RuntimeError(
-            f"Stage 2 failed in pair batch {batch_no}/{pair_batch_total}. "
-            f"Original Spark error: {type(e).__name__}: {e}"
-        ) from e
-
-    rows = []
-
-    for _, r in pdf.iterrows():
-        fs = pd.Timestamp(r["StartDatetime"])
-
-        if fs not in flight_idx or pd.isna(r["_AD_Phase"]):
-            continue
-
-        phase = float(r["_AD_Phase"])
-        fi = flight_idx[fs]
-
-        for i, (signal, _) in enumerate(batch):
-            n = r[f"_n{i}"]
-
-            if pd.isna(n) or int(n) < AD_MIN_SAMPLES:
-                continue
-
-            q = r[f"_q{i}"]
-
-            if q is None or len(q) != 3:
-                continue
-
-            try:
-                q10, q50, q90 = map(float, q)
-            except (TypeError, ValueError):
-                continue
-
-            if not all(np.isfinite([q10, q50, q90])):
-                continue
-
-            name = f"AC-BC::{signal}"
-
-            rows.append({
-                "FlightStart": fs,
-                "FlightIndex": fi,
-                "FlightPhase": phase,
-                "Parameter": name,
-                "Feature": "CHANNEL_OFFSET",
-                "Value": q50,
-                "Samples": int(n)
-            })
-
-            rows.append({
-                "FlightStart": fs,
-                "FlightIndex": fi,
-                "FlightPhase": phase,
-                "Parameter": name,
-                "Feature": "CHANNEL_SPREAD",
-                "Value": q90 - q10,
-                "Samples": int(n)
-            })
-
-            sd = r[f"_sd{i}"]
-
-            if pd.notna(sd) and np.isfinite(float(sd)):
-                rows.append({
-                    "FlightStart": fs,
-                    "FlightIndex": fi,
-                    "FlightPhase": phase,
-                    "Parameter": name,
-                    "Feature": "CHANNEL_STD",
-                    "Value": float(sd),
-                    "Samples": int(n)
-                })
-
-    if rows:
-        pair_parts.append(pd.DataFrame(rows))
-
-    print(f"  Pair batch {batch_no}/{pair_batch_total} complete")
-
-if pair_parts:
-    features = pd.concat([features, *pair_parts], ignore_index=True)
-
-features = (
-    features
-    .replace([np.inf, -np.inf], np.nan)
-    .dropna(subset=["Value"])
-    .sort_values(
-        ["Parameter", "FlightPhase", "Feature", "FlightIndex"],
-        kind="stable"
-    )
-    .reset_index(drop=True)
-)
-
-series_count = (
-    features[["Parameter", "FlightPhase", "Feature"]]
-    .drop_duplicates()
-    .shape[0]
-)
-
-abrupt_p_limit = AD_FWER_ALPHA / max(series_count, 1)
-
-print(f"  AC/BC pairs:             {len(pairs):,}")
-print(f"  Total health rows:       {len(features):,}")
-print(f"  Independent series:      {series_count:,}")
-print()
-
-print("STAGE 3/4 - Sequential consensus detection")
-
-detections = []
-
-for (parameter, phase, feature), series in features.groupby(
-    ["Parameter", "FlightPhase", "Feature"],
-    sort=False
-):
-    series = (
-        series
-        .sort_values("FlightIndex", kind="stable")
-        .reset_index(drop=True)
-    )
-
-    if len(series) < AD_MIN_BASELINE + AD_WINDOW:
-        continue
-
-    baseline_n = min(AD_BASELINE_TARGET, len(series) - AD_WINDOW)
-
-    if baseline_n < AD_MIN_BASELINE:
-        continue
-
-    baseline_values = series.iloc[:baseline_n]["Value"].to_numpy(dtype=float)
-    center, scale, constant_baseline = robust_reference(baseline_values)
-
-    if not np.isfinite(center) or not np.isfinite(scale):
-        continue
-
-    values = series["Value"].to_numpy(dtype=float)
-
-    if constant_baseline:
-        nonzero_changes = np.abs(values - center)
-        positive_changes = nonzero_changes[nonzero_changes > AD_EPS]
-
-        if positive_changes.size:
-            fallback_scale = float(np.median(positive_changes))
-            scale = max(fallback_scale, AD_EPS)
-        else:
-            continue
-
-    z_all = np.clip((values - center) / scale, -100.0, 100.0)
-
-    ewma = 0.0
-    cplus = 0.0
-    cminus = 0.0
-    phplus = 0.0
-    phminus = 0.0
-    gradual_streak = 0
-    prior_direction = 0
-
-    for i in range(baseline_n, len(series)):
-        row = series.iloc[i]
-        z = float(z_all[i])
-
-        ewma = AD_EWMA_LAMBDA * z + (1.0 - AD_EWMA_LAMBDA) * ewma
-
-        cplus = max(0.0, cplus + z - AD_CUSUM_K)
-        cminus = min(0.0, cminus + z + AD_CUSUM_K)
-
-        cusum = max(cplus, abs(cminus))
-        cusum_dir = 1 if cplus >= abs(cminus) else -1
-
-        phplus = max(0.0, phplus + z - AD_PH_DELTA)
-        phminus = max(0.0, phminus - z - AD_PH_DELTA)
-
-        ph = max(phplus, phminus)
-        ph_dir = 1 if phplus >= phminus else -1
-
-        raw_p = normal_p(z)
-
-        abrupt = (
-            abs(z) >= AD_ABRUPT_Z
-            and raw_p <= abrupt_p_limit
+        .withColumn(
+            "_phase",
+            F.when(
+                ~F.col("_phase_disagreement"),
+                F.coalesce("_phase_ac", "_phase_bc"),
+            ),
         )
-
-        shift = z_all[max(baseline_n, i - AD_SHIFT_N + 1):i + 1]
-
-        persistent_shift = (
-            len(shift) >= AD_SHIFT_N
-            and np.all(np.abs(shift) >= AD_SHIFT_Z)
-            and (np.all(shift > 0) or np.all(shift < 0))
-        )
-
-        gradual = False
-        slope = np.nan
-        dir_fraction = np.nan
-        direction = 0
-        net_z = np.nan
-        mk_z = np.nan
-        mk_p = np.nan
-        votes = 0
-
-        if i - baseline_n + 1 >= AD_WINDOW:
-            recent = z_all[i - AD_WINDOW + 1:i + 1]
-
-            slope = theilsen(recent)
-            dir_fraction, direction = directionality(recent)
-            net_z = float(recent[-1] - recent[0])
-            mk_z, mk_p = mann_kendall(recent)
-
-            direction_ok = (
-                direction != 0
-                and np.isfinite(slope)
-                and np.sign(slope) == direction
-                and np.sign(net_z) == direction
-                and np.sign(mk_z) == direction
-                and np.sign(ewma) == direction
-                and cusum_dir == direction
-                and ph_dir == direction
-            )
-
-            checks = [
-                dir_fraction >= AD_DIRECTION_MIN,
-                abs(net_z) >= AD_NET_Z_MIN,
-                abs(slope) >= AD_SLOPE_MIN,
-                mk_p <= AD_MK_P_MAX,
-                abs(ewma) >= AD_EWMA_WARN,
-                cusum >= AD_CUSUM_WARN,
-                ph >= AD_PH_WARN
-            ]
-
-            votes = sum(bool(x) for x in checks)
-
-            gradual = (
-                direction_ok
-                and votes >= 6
-                and (
-                    abs(ewma) >= AD_EWMA_STRONG
-                    or cusum >= AD_CUSUM_STRONG
-                    or ph >= AD_PH_STRONG
-                )
-            )
-
-        if gradual:
-            if direction == prior_direction:
-                gradual_streak += 1
-            else:
-                prior_direction = direction
-                gradual_streak = 1
-        else:
-            gradual_streak = 0
-            prior_direction = 0
-
-        confirmed_gradual = gradual_streak >= AD_CONFIRM
-
-        if abrupt:
-            kind = "ABRUPT EXTREME"
-        elif persistent_shift:
-            kind = "PERSISTENT LEVEL SHIFT"
-        elif confirmed_gradual:
-            kind = "GRADUAL DEGRADATION"
-        else:
-            continue
-
-        observed = float(row["Value"])
-        deviation = pct(observed, center)
-
-        reasons = [f"same-phase deviation {z:+.2f} robust sigma"]
-
-        if np.isfinite(deviation):
-            reasons.append(f"{deviation:+.3f}% versus frozen baseline")
-
-        if abrupt:
-            reasons.append(
-                f"abrupt p={raw_p:.2e}; corrected threshold={abrupt_p_limit:.2e}"
-            )
-
-        if persistent_shift:
-            reasons.append(
-                f"{AD_SHIFT_N} consecutive same-direction values >= {AD_SHIFT_Z:.1f} sigma"
-            )
-
-        if confirmed_gradual:
-            reasons += [
-                f"Theil-Sen={slope:+.3f} sigma/flight",
-                f"directional consistency={dir_fraction:.0%}",
-                f"net movement={net_z:+.2f} sigma",
-                f"Mann-Kendall p={mk_p:.3g}",
-                f"EWMA={ewma:+.2f}",
-                f"CUSUM={cusum:.2f}",
-                f"Page-Hinkley={ph:.2f}",
-                f"consensus={votes}/7",
-                f"confirmed across {gradual_streak} evaluations"
-            ]
-
-        strength = sum([
-            abs(z) >= 6.0,
-            abs(ewma) >= AD_EWMA_STRONG,
-            cusum >= AD_CUSUM_STRONG,
-            ph >= AD_PH_STRONG,
-            np.isfinite(mk_p) and mk_p <= 0.02,
-            np.isfinite(dir_fraction) and dir_fraction >= 0.85
-        ])
-
-        very_high = (
-            kind == "ABRUPT EXTREME"
-            or (kind == "PERSISTENT LEVEL SHIFT" and strength >= 2)
-            or (kind == "GRADUAL DEGRADATION" and strength >= 4)
-        )
-
-        detections.append({
-            "FlightStart": pd.Timestamp(row["FlightStart"]),
-            "FlightIndex": int(row["FlightIndex"]),
-            "FlightPhase": float(row["FlightPhase"]),
-            "Parameter": parameter,
-            "Feature": feature,
-            "Detection": kind,
-            "Confidence": "VERY HIGH" if very_high else "HIGH",
-            "Observed": observed,
-            "Baseline": center,
-            "DeviationPct": deviation,
-            "RobustZ": z,
-            "EWMA": ewma,
-            "CUSUM": cusum,
-            "PageHinkley": ph,
-            "Trend": slope,
-            "Directional": dir_fraction,
-            "MannKendallP": mk_p,
-            "Consensus": votes,
-            "Reason": "; ".join(reasons)
-        })
-
-anomaly_detail_df = pd.DataFrame(detections)
-
-if not anomaly_detail_df.empty:
-    anomaly_detail_df["_Signal"] = anomaly_detail_df["Parameter"].map(
-        lambda p: str(p).split("::", 1)[1]
-        if str(p).startswith("AC-BC::")
-        else channel_signal(p)[1]
-    )
-
-    anomaly_detail_df["_CR"] = anomaly_detail_df["Confidence"].map(
-        {"VERY HIGH": 2, "HIGH": 1}
-    ).fillna(0)
-
-    anomaly_detail_df["_DR"] = anomaly_detail_df["Detection"].map({
-        "GRADUAL DEGRADATION": 3,
-        "PERSISTENT LEVEL SHIFT": 2,
-        "ABRUPT EXTREME": 1
-    }).fillna(0)
-
-    anomaly_detail_df = (
-        anomaly_detail_df
-        .sort_values(
-            ["FlightStart", "_CR", "_DR", "Consensus", "CUSUM", "PageHinkley"],
-            ascending=[True, False, False, False, False, False],
-            kind="stable"
-        )
-        .reset_index(drop=True)
-    )
-
-    def pretty_parameter(p):
-        p = str(p)
-        return (
-            "AC/BC delta - " + p.split("::", 1)[1]
-            if p.startswith("AC-BC::")
-            else short(p)
-        )
-
-    report_df = pd.DataFrame({
-        "DATE / FLIGHT": pd.to_datetime(
-            anomaly_detail_df["FlightStart"]
-        ).dt.strftime("%Y-%m-%d %H:%M:%S"),
-
-        "PHASE": anomaly_detail_df["FlightPhase"].map(lambda x: f"{x:g}"),
-        "PARAMETER": anomaly_detail_df["Parameter"].map(pretty_parameter),
-        "FEATURE": anomaly_detail_df["Feature"],
-        "DETECTION": anomaly_detail_df["Detection"],
-        "CONFIDENCE": anomaly_detail_df["Confidence"],
-        "OBSERVED": anomaly_detail_df["Observed"].map(lambda x: f"{x:,.6g}"),
-        "BASELINE": anomaly_detail_df["Baseline"].map(lambda x: f"{x:,.6g}"),
-
-        "DEVIATION": anomaly_detail_df["DeviationPct"].map(
-            lambda x: f"{x:+.3f}%" if np.isfinite(x) else "N/A"
-        ),
-
-        "ROBUST SIGMA": anomaly_detail_df["RobustZ"].map(lambda x: f"{x:+.2f}"),
-        "EWMA": anomaly_detail_df["EWMA"].map(lambda x: f"{x:+.2f}"),
-        "CUSUM": anomaly_detail_df["CUSUM"].map(lambda x: f"{x:.2f}"),
-        "PAGE-HINKLEY": anomaly_detail_df["PageHinkley"].map(lambda x: f"{x:.2f}"),
-
-        "TREND SIGMA/FLIGHT": anomaly_detail_df["Trend"].map(
-            lambda x: f"{x:+.3f}" if np.isfinite(x) else "-"
-        ),
-
-        "DIRECTIONAL": anomaly_detail_df["Directional"].map(
-            lambda x: f"{x:.0%}" if np.isfinite(x) else "-"
-        ),
-
-        "MK p": anomaly_detail_df["MannKendallP"].map(
-            lambda x: f"{x:.3g}" if np.isfinite(x) else "-"
-        ),
-
-        "CONSENSUS": anomaly_detail_df["Consensus"].map(lambda x: f"{int(x)}/7"),
-        "REASON": anomaly_detail_df["Reason"]
-    })
-
-    print()
-    print("=" * 126)
-    print("CONFIRMED ANOMALIES")
-    print("=" * 126)
-    print(f"Detection rows:           {len(report_df):,}")
-    print(f"Affected flights:         {anomaly_detail_df['FlightStart'].nunique():,}")
-    print(f"Affected signals:         {anomaly_detail_df['_Signal'].nunique():,}")
-    print()
-
-    try:
-        ipy_display(
-            report_df.head(AD_MAX_REPORT).style
-            .set_properties(**{
-                "text-align": "left",
-                "vertical-align": "top",
-                "white-space": "normal"
-            })
-            .set_table_styles([{
-                "selector": "th",
-                "props": [
-                    ("text-align", "left"),
-                    ("font-weight", "bold"),
-                    ("background-color", "#222"),
-                    ("color", "white"),
-                    ("position", "sticky"),
-                    ("top", "0")
-                ]
-            }])
-        )
-    except Exception:
-        ipy_display(report_df.head(AD_MAX_REPORT))
-
-else:
-    report_df = pd.DataFrame()
-
-    print()
-    print("=" * 126)
-    print("CONFIRMED ANOMALIES")
-    print("=" * 126)
-    print("No series passed the final high-confidence consensus gate.")
-
-print()
-print("STAGE 4/4 - Raw telemetry visualization")
-
-if anomaly_detail_df.empty:
-    print("No confirmed anomaly signals to plot.")
-
-else:
-    priority = (
-        anomaly_detail_df
-        .groupby("_Signal")
-        .agg(
-            Count=("Detection", "size"),
-            VeryHigh=("Confidence", lambda x: int(np.sum(x == "VERY HIGH"))),
-            MaxCUSUM=("CUSUM", "max"),
-            MaxPH=("PageHinkley", "max"),
-            MaxZ=("RobustZ", lambda x: float(np.max(np.abs(np.asarray(x, dtype=float)))))
+        .withColumn(
+            "_time_us",
+            (
+                F.col("Timestamp").cast("double")
+                * F.lit(1_000_000)
+            ).cast("long"),
         )
     )
 
-    priority["Score"] = (
-        5.0 * priority["VeryHigh"]
-        + priority["Count"]
-        + priority["MaxCUSUM"] / 10.0
-        + priority["MaxPH"] / 10.0
-        + priority["MaxZ"] / 6.0
+    order_window = (
+        Window.partitionBy("StartDatetime")
+        .orderBy("_time_us")
     )
 
-    plotted_signals = (
-        priority
-        .sort_values("Score", ascending=False)
-        .head(AD_MAX_PLOTS)
-        .index
-        .tolist()
+    run_window = order_window.rowsBetween(
+        Window.unboundedPreceding,
+        Window.currentRow,
     )
 
-    signal_columns = {}
+    previous_phase = F.lag("_phase").over(order_window)
 
-    for signal in plotted_signals:
-        members = [
-            (channel_signal(p)[0], p)
-            for p in parameters
-            if channel_signal(p)[1] == signal
-        ]
-
-        members.sort(
-            key=lambda x: (
-                0 if x[0] == "AC" else 1 if x[0] == "BC" else 2,
-                x[1]
-            )
-        )
-
-        if members:
-            signal_columns[signal] = members
-
-    raw_columns = list(dict.fromkeys(
-        p
-        for members in signal_columns.values()
-        for _, p in members
-    ))
-
-    if not raw_columns:
-        print("No raw source columns correspond to the confirmed anomaly signals.")
-
-    else:
-        try:
-            raw = (
-                source
-                .select(
-                    "Timestamp",
-                    "StartDatetime",
-                    "_AD_Phase",
-                    *[qc(c).cast("double").alias(c) for c in raw_columns]
-                )
-                .orderBy("StartDatetime", "Timestamp")
-                .toPandas()
-            )
-        except Exception as e:
-            raise RuntimeError(
-                "Detection completed, but raw anomaly plotting retrieval failed. "
-                f"{type(e).__name__}: {e}"
-            ) from e
-
-        raw["Timestamp"] = pd.to_datetime(raw["Timestamp"], errors="coerce")
-        raw["StartDatetime"] = pd.to_datetime(raw["StartDatetime"], errors="coerce")
-
-        raw = (
-            raw
-            .dropna(subset=["Timestamp", "StartDatetime"])
-            .sort_values(["StartDatetime", "Timestamp"], kind="stable")
-            .reset_index(drop=True)
-        )
-
-        flight_info = []
-        cursor = 0.0
-
-        for flight in flights:
-            frame = raw.loc[raw["StartDatetime"] == flight]
-
-            if frame.empty:
-                continue
-
-            start = frame["Timestamp"].min()
-            end = frame["Timestamp"].max()
-            duration = max((end - start).total_seconds(), 1.0)
-
-            flight_info.append({
-                "FlightStart": flight,
-                "ActualStart": start,
-                "ActualEnd": end,
-                "PlotStart": cursor,
-                "PlotEnd": cursor + duration
-            })
-
-            cursor += duration + AD_GAP_SECONDS
-
-        transformed = []
-
-        for info in flight_info:
-            frame = raw.loc[
-                raw["StartDatetime"] == info["FlightStart"]
-            ].copy()
-
-            frame["_PlotX"] = (
-                info["PlotStart"]
-                + (frame["Timestamp"] - info["ActualStart"]).dt.total_seconds()
-            )
-
-            transformed.append(frame)
-
-        if transformed:
-            plot_df = pd.concat(transformed, ignore_index=True)
-            flight_lookup = {x["FlightStart"]: x for x in flight_info}
-            markers = defaultdict(dict)
-
-            for _, detection in anomaly_detail_df.iterrows():
-                signal = detection["_Signal"]
-
-                if signal not in signal_columns:
-                    continue
-
-                flight = pd.Timestamp(detection["FlightStart"])
-                phase = float(detection["FlightPhase"])
-
-                phase_rows = plot_df.loc[
-                    (plot_df["StartDatetime"] == flight)
-                    & (
-                        pd.to_numeric(plot_df["_AD_Phase"], errors="coerce")
-                        == phase
-                    )
-                ]
-
-                if phase_rows.empty:
-                    if flight not in flight_lookup:
-                        continue
-                    marker_x = flight_lookup[flight]["PlotStart"]
-
-                else:
-                    phase_rows = phase_rows.sort_values("Timestamp", kind="stable")
-                    marker_x = float(
-                        phase_rows.iloc[len(phase_rows) // 2]["_PlotX"]
-                    )
-
-                markers[signal][(flight, phase)] = marker_x
-
-            fig, axes = plt.subplots(
-                len(signal_columns),
+    frame = (
+        frame.withColumn(
+            "_phase_change",
+            F.when(
+                ~F.col("_phase").eqNullSafe(previous_phase),
                 1,
-                figsize=(22, max(6, 3.4 * len(signal_columns))),
-                sharex=True,
-                squeeze=False
+            ).otherwise(0),
+        )
+        .withColumn(
+            "_phase_run",
+            F.sum("_phase_change").over(run_window),
+        )
+    )
+
+    boundary_us = int(
+        ANOMALY_CONFIG["transition_boundary_seconds"]
+        * 1_000_000
+    )
+
+    boundary_window = (
+        Window.partitionBy("StartDatetime")
+        .orderBy("_time_us")
+        .rangeBetween(-boundary_us, boundary_us)
+    )
+
+    frame = (
+        frame.withColumn(
+            "_near_phase_boundary",
+            F.max("_phase_change").over(boundary_window) > 0,
+        )
+        .withColumn(
+            "_eligible",
+            F.col("_phase").isNotNull()
+            & ~F.col("_phase_disagreement")
+            & ~F.col("_near_phase_boundary"),
+        )
+    )
+
+    if include_rates:
+        rate_window = (
+            Window.partitionBy(
+                "StartDatetime",
+                "_phase_run",
             )
+            .orderBy("_time_us")
+        )
 
-            axes = axes[:, 0]
-
-            colors = globals().get(
-                "CHANNEL_COLORS",
-                {"AC": "#1f77b4", "BC": "#ff7f0e"}
+        frame = frame.withColumn(
+            "_dt",
+            (
+                F.col("_time_us")
+                - F.lag("_time_us").over(rate_window)
             )
+            / F.lit(1_000_000.0),
+        )
 
-            for ax, (signal, members) in zip(axes, signal_columns.items()):
-                for channel, column in members:
-                    first = True
-
-                    for info in flight_info:
-                        seg = plot_df.loc[
-                            plot_df["StartDatetime"] == info["FlightStart"],
-                            ["Timestamp", "_PlotX", column]
-                        ].copy()
-
-                        seg[column] = pd.to_numeric(seg[column], errors="coerce")
-                        seg = seg.dropna(subset=["_PlotX", column]).sort_values("Timestamp")
-
-                        if seg.empty:
-                            continue
-
-                        values = seg[column].dropna().unique()
-
-                        discrete = (
-                            len(values) <= 12
-                            and np.allclose(values, np.round(values), equal_nan=True)
-                        )
-
-                        dt = seg["Timestamp"].diff().dt.total_seconds()
-                        positive = dt[dt > 0]
-                        cadence = float(positive.median()) if not positive.empty else 1.0
-                        chunk = dt.gt(max(3.0 * cadence, 5.0)).cumsum()
-
-                        for _, piece in seg.groupby(chunk, sort=True):
-                            ax.plot(
-                                piece["_PlotX"],
-                                piece[column],
-                                linewidth=1.1,
-                                color=colors.get(channel),
-                                drawstyle="steps-post" if discrete else "default",
-                                label=(channel or short(column)) if first else "_nolegend_",
-                                zorder=4
-                            )
-                            first = False
-
-                for marker_x in markers.get(signal, {}).values():
-                    ax.axvline(
-                        marker_x,
-                        color="white",
-                        linewidth=2.0,
-                        alpha=0.95,
-                        zorder=20
+        for alias in aliases.values():
+            frame = frame.withColumn(
+                f"{alias}_rate",
+                F.when(
+                    (F.col("_dt") > 0)
+                    & (
+                        F.col("_dt")
+                        <= ANOMALY_CONFIG[
+                            "maximum_rate_gap_seconds"
+                        ]
+                    ),
+                    (
+                        F.col(alias)
+                        - F.lag(alias).over(rate_window)
                     )
+                    / F.col("_dt"),
+                ),
+            )
 
-                sd = anomaly_detail_df.loc[
-                    anomaly_detail_df["_Signal"] == signal
+    return frame, aliases
+
+
+def _ead_stats(frame, aliases):
+    tail = ANOMALY_CONFIG["tail_probability"]
+    probabilities = [
+        tail,
+        0.25,
+        0.5,
+        0.75,
+        1.0 - tail,
+    ]
+
+    expressions = []
+
+    for index, alias in enumerate(aliases.values()):
+        expressions.extend(
+            [
+                F.count(alias).alias(f"_n{index:03d}"),
+                F.approx_count_distinct(alias).alias(
+                    f"_d{index:03d}"
+                ),
+                F.percentile_approx(
+                    alias,
+                    probabilities,
+                    ANOMALY_CONFIG["quantile_accuracy"],
+                ).alias(f"_q{index:03d}"),
+                F.count(f"{alias}_rate").alias(
+                    f"_rn{index:03d}"
+                ),
+                F.approx_count_distinct(
+                    f"{alias}_rate"
+                ).alias(f"_rd{index:03d}"),
+                F.percentile_approx(
+                    f"{alias}_rate",
+                    probabilities,
+                    ANOMALY_CONFIG["quantile_accuracy"],
+                ).alias(f"_rq{index:03d}"),
+            ]
+        )
+
+    rows = (
+        frame.where("_eligible")
+        .groupBy("_phase")
+        .agg(*expressions)
+        .collect()
+    )
+
+    lookup = {name: {} for name in aliases}
+
+    for row in rows:
+        values = row.asDict(recursive=True)
+        phase = float(values["_phase"])
+
+        for index, name in enumerate(aliases):
+            value_q = _ead_quantiles(
+                values.get(f"_q{index:03d}")
+            )
+            rate_q = _ead_quantiles(
+                values.get(f"_rq{index:03d}")
+            )
+
+            lookup[name][phase] = {
+                "count": int(
+                    values.get(f"_n{index:03d}") or 0
+                ),
+                "distinct": int(
+                    values.get(f"_d{index:03d}") or 0
+                ),
+                "q": value_q,
+                "rate_count": int(
+                    values.get(f"_rn{index:03d}") or 0
+                ),
+                "rate_distinct": int(
+                    values.get(f"_rd{index:03d}") or 0
+                ),
+                "rate_q": rate_q,
+            }
+
+    return lookup
+
+
+def _ead_metric_expressions(alias, parameter_stats):
+    amplitude_z_cases = []
+    rate_z_cases = []
+    amplitude_tail_cases = []
+    rate_tail_cases = []
+    amplitude_continuous_cases = []
+    rate_continuous_cases = []
+
+    value = F.col(alias)
+    rate = F.col(f"{alias}_rate")
+
+    for phase, stats in parameter_stats.items():
+        if (
+            stats["count"]
+            >= ANOMALY_CONFIG["minimum_phase_samples"]
+            and stats["q"] is not None
+        ):
+            lower, q25, median, q75, upper = stats["q"]
+            scale = _ead_scale(q25, median, q75)
+
+            amplitude_z_cases.append(
+                (
+                    phase,
+                    F.abs(value - F.lit(median))
+                    / F.lit(scale),
+                )
+            )
+
+            amplitude_tail_cases.append(
+                (
+                    phase,
+                    F.when(
+                        (value < F.lit(lower))
+                        | (value > F.lit(upper)),
+                        1.0,
+                    ).otherwise(0.0),
+                )
+            )
+
+            amplitude_continuous_cases.append(
+                (
+                    phase,
+                    F.lit(
+                        1.0
+                        if stats["distinct"] > 20
+                        else 0.0
+                    ),
+                )
+            )
+
+        if (
+            stats["rate_count"]
+            >= ANOMALY_CONFIG["minimum_phase_samples"]
+            and stats["rate_q"] is not None
+        ):
+            lower, q25, median, q75, upper = (
+                stats["rate_q"]
+            )
+            scale = _ead_scale(q25, median, q75)
+
+            rate_z_cases.append(
+                (
+                    phase,
+                    F.abs(rate - F.lit(median))
+                    / F.lit(scale),
+                )
+            )
+
+            rate_tail_cases.append(
+                (
+                    phase,
+                    F.when(
+                        (rate < F.lit(lower))
+                        | (rate > F.lit(upper)),
+                        1.0,
+                    ).otherwise(0.0),
+                )
+            )
+
+            rate_continuous_cases.append(
+                (
+                    phase,
+                    F.lit(
+                        1.0
+                        if stats["rate_distinct"] > 20
+                        else 0.0
+                    ),
+                )
+            )
+
+    amplitude_z = F.coalesce(
+        _ead_case(amplitude_z_cases),
+        F.lit(0.0),
+    )
+
+    rate_z = F.coalesce(
+        _ead_case(rate_z_cases),
+        F.lit(0.0),
+    )
+
+    amplitude_tail = (
+        F.coalesce(
+            _ead_case(amplitude_tail_cases),
+            F.lit(0.0),
+        )
+        > 0
+    )
+
+    rate_tail = (
+        F.coalesce(
+            _ead_case(rate_tail_cases),
+            F.lit(0.0),
+        )
+        > 0
+    )
+
+    amplitude_continuous = (
+        F.coalesce(
+            _ead_case(amplitude_continuous_cases),
+            F.lit(0.0),
+        )
+        > 0
+    )
+
+    rate_continuous = (
+        F.coalesce(
+            _ead_case(rate_continuous_cases),
+            F.lit(0.0),
+        )
+        > 0
+    )
+
+    amplitude_flag = (
+        amplitude_tail
+        & (
+            amplitude_z
+            >= ANOMALY_CONFIG["minimum_robust_z"]
+        )
+    )
+
+    rate_flag = (
+        rate_tail
+        & (
+            rate_z
+            >= ANOMALY_CONFIG["minimum_rate_z"]
+        )
+    )
+
+    catastrophic = (
+        amplitude_continuous
+        & (
+            amplitude_z
+            >= ANOMALY_CONFIG["catastrophic_z"]
+        )
+    ) | (
+        rate_continuous
+        & (
+            rate_z
+            >= ANOMALY_CONFIG["catastrophic_z"]
+        )
+    )
+
+    flag = (
+        value.isNotNull()
+        & (
+            amplitude_flag
+            | rate_flag
+            | catastrophic
+        )
+    )
+
+    anomaly_type = F.concat_ws(
+        "+",
+        F.when(
+            amplitude_flag,
+            F.lit("PHASE_CONDITIONAL_TAIL"),
+        ),
+        F.when(
+            rate_flag,
+            F.lit("TEMPORAL_JUMP"),
+        ),
+        F.when(
+            catastrophic,
+            F.lit("EXTREME_ROBUST_DEVIATION"),
+        ),
+    )
+
+    score = F.least(
+        F.greatest(amplitude_z, rate_z),
+        F.lit(100.0),
+    )
+
+    return flag, score, anomaly_type, amplitude_z
+
+
+def _ead_score_batch(frame, aliases, batch_stats):
+    events = []
+
+    for name, alias in aliases.items():
+        channel, signal = _ead_channel_signal(name)
+
+        flag, score, anomaly_type, _ = (
+            _ead_metric_expressions(
+                alias,
+                batch_stats[name],
+            )
+        )
+
+        events.append(
+            F.when(
+                F.col("_eligible") & flag,
+                F.struct(
+                    F.lit(name).alias("Parameter"),
+                    F.lit(signal).alias("Signal"),
+                    F.lit(channel).alias("Channel"),
+                    F.col(alias).alias("Value"),
+                    F.lit(None)
+                    .cast("string")
+                    .alias("PeerParameter"),
+                    F.lit(None)
+                    .cast("double")
+                    .alias("PeerValue"),
+                    score.alias("Score"),
+                    anomaly_type.alias("AnomalyType"),
+                    F.lit(1.0).alias(
+                        "AttributionConfidence"
+                    ),
+                ),
+            )
+        )
+
+    return (
+        frame.select(
+            "Timestamp",
+            "StartDatetime",
+            F.col("_phase").alias("FlightPhase"),
+            F.explode(
+                F.array(*events)
+            ).alias("_event"),
+        )
+        .where(F.col("_event").isNotNull())
+        .select(
+            "Timestamp",
+            "StartDatetime",
+            "FlightPhase",
+            "_event.*",
+        )
+    )
+
+
+def _ead_trends(frame, aliases):
+    expressions = [
+        F.percentile_approx(
+            alias,
+            0.5,
+            ANOMALY_CONFIG["quantile_accuracy"],
+        ).alias(alias)
+        for alias in aliases.values()
+    ]
+
+    rows = (
+        frame.where("_eligible")
+        .groupBy("StartDatetime", "_phase")
+        .agg(*expressions)
+        .orderBy("StartDatetime")
+        .collect()
+    )
+
+    if not rows:
+        return []
+
+    wide = pd.DataFrame(
+        [row.asDict(recursive=True) for row in rows]
+    )
+
+    wide["StartDatetime"] = pd.to_datetime(
+        wide["StartDatetime"],
+        errors="coerce",
+    )
+
+    findings = []
+
+    for name, alias in aliases.items():
+        usable = wide[
+            ["StartDatetime", "_phase", alias]
+        ].dropna()
+
+        for phase, group in usable.groupby("_phase"):
+            group = (
+                group.sort_values("StartDatetime")
+                .drop_duplicates("StartDatetime")
+            )
+
+            if (
+                len(group)
+                < ANOMALY_CONFIG["minimum_trend_flights"]
+            ):
+                continue
+
+            times = group["StartDatetime"]
+
+            x = (
+                times - times.iloc[0]
+            ).dt.total_seconds().to_numpy(
+                dtype=float
+            ) / 86400.0
+
+            y = group[alias].to_numpy(dtype=float)
+
+            if (
+                not np.isfinite(y).all()
+                or x[-1] <= x[0]
+            ):
+                continue
+
+            median = float(np.median(y))
+
+            mad = (
+                float(
+                    np.median(
+                        np.abs(y - median)
+                    )
+                )
+                * 1.4826
+            )
+
+            q25, q75 = np.quantile(
+                y,
+                [0.25, 0.75],
+            )
+
+            scale = max(
+                mad,
+                float(q75 - q25) / 1.349,
+                abs(median) * 1.0e-9,
+                1.0e-12,
+            )
+
+            slope, _, _, _ = theilslopes(
+                y,
+                x,
+                0.99,
+            )
+
+            tau_result = kendalltau(
+                x,
+                y,
+                nan_policy="omit",
+            )
+
+            tau_value = getattr(
+                tau_result,
+                "statistic",
+                tau_result[0],
+            )
+
+            tau = (
+                float(tau_value)
+                if np.isfinite(tau_value)
+                else 0.0
+            )
+
+            trend_p = (
+                float(tau_result.pvalue)
+                if np.isfinite(tau_result.pvalue)
+                else 1.0
+            )
+
+            total_change = float(
+                slope * (x[-1] - x[0])
+            )
+
+            trend_effect_z = (
+                abs(total_change) / scale
+            )
+
+            best_change_z = 0.0
+            best_split = None
+
+            for split in range(
+                3,
+                len(y) - 2,
+            ):
+                change_z = (
+                    abs(
+                        float(
+                            np.median(y[split:])
+                            - np.median(y[:split])
+                        )
+                    )
+                    / scale
+                )
+
+                if change_z > best_change_z:
+                    best_change_z = change_z
+                    best_split = split
+
+            change_p = min(
+                1.0,
+                2.0
+                * norm.sf(best_change_z)
+                * max(1, len(y) - 5),
+            )
+
+            combined_p = min(
+                1.0,
+                min(trend_p, change_p) * 2.0,
+            )
+
+            effect_qualified = (
+                (
+                    trend_effect_z
+                    >= ANOMALY_CONFIG[
+                        "minimum_trend_effect_z"
+                    ]
+                    and abs(tau)
+                    >= ANOMALY_CONFIG[
+                        "minimum_trend_tau"
+                    ]
+                )
+                or best_change_z
+                >= ANOMALY_CONFIG[
+                    "minimum_trend_effect_z"
                 ]
-
-                gradual = int(np.sum(sd["Detection"] == "GRADUAL DEGRADATION"))
-                shift = int(np.sum(sd["Detection"] == "PERSISTENT LEVEL SHIFT"))
-                abrupt = int(np.sum(sd["Detection"] == "ABRUPT EXTREME"))
-
-                ax.set_title(
-                    f"{signal} | gradual={gradual}, shift={shift}, abrupt={abrupt}",
-                    loc="left",
-                    fontsize=10
-                )
-
-                ax.set_ylabel(signal, fontsize=9)
-                ax.grid(True, alpha=0.20)
-                ax.margins(y=0.08)
-
-                handles, labels = ax.get_legend_handles_labels()
-
-                if handles:
-                    ax.legend(handles, labels, loc="upper right", framealpha=0.85)
-
-            ticks = [
-                (x["PlotStart"] + x["PlotEnd"]) / 2.0
-                for x in flight_info
-            ]
-
-            labels = [
-                x["FlightStart"].strftime("%Y-%m-%d\n%H:%M")
-                for x in flight_info
-            ]
-
-            axes[-1].set_xticks(ticks)
-            axes[-1].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
-            axes[-1].set_xlabel("Flight timeline - calendar gaps compressed")
-
-            if flight_info:
-                axes[-1].set_xlim(
-                    flight_info[0]["PlotStart"],
-                    flight_info[-1]["PlotEnd"]
-                )
-
-            fig.suptitle(
-                "Confirmed Full-Schema Phase-Conditioned Engine Anomalies",
-                fontsize=15
+                * 1.5
             )
 
-            fig.text(
-                0.5,
-                0.012,
-                "White line = centre of the affected FlightPhase interval",
-                ha="center",
-                fontsize=9
+            channel, signal = (
+                _ead_channel_signal(name)
             )
 
-            fig.tight_layout(rect=[0.02, 0.035, 0.99, 0.965])
-            plt.show()
-            plt.close(fig)
+            findings.append(
+                {
+                    "Parameter": name,
+                    "Signal": signal,
+                    "Channel": channel,
+                    "FlightPhase": float(phase),
+                    "Flights": int(len(group)),
+                    "FirstFlight": times.iloc[0],
+                    "LastFlight": times.iloc[-1],
+                    "ChangePointFlight": (
+                        times.iloc[best_split]
+                        if best_split is not None
+                        else pd.NaT
+                    ),
+                    "TheilSenSlopePerDay": float(
+                        slope
+                    ),
+                    "EstimatedWindowChange": (
+                        total_change
+                    ),
+                    "TrendEffectZ": float(
+                        trend_effect_z
+                    ),
+                    "KendallTau": tau,
+                    "ChangePointZ": float(
+                        best_change_z
+                    ),
+                    "PValue": combined_p,
+                    "EffectQualified": bool(
+                        effect_qualified
+                    ),
+                }
+            )
 
-print()
-print("=" * 126)
-print("DETECTOR NOTES")
-print("=" * 126)
-print("• Detection searches cda directly; selected_parameters does not restrict discovery.")
-print("• AC and BC FlightPhase must agree when both are populated; disagreement is excluded.")
-print("• Every analyzed Spark parameter is explicitly converted to double before statistics.")
-print("• FlightPhase is a hard operating regime; cross-phase comparisons are prohibited.")
-print("• Early same-phase flights form a frozen reference so slow drift cannot be learned away.")
-print("• Abrupt events use family-wise multiple-testing control.")
-print("• Slow degradation uses Theil-Sen + Mann-Kendall + directionality + EWMA + CUSUM + Page-Hinkley.")
-print("• Gradual detection requires multi-method consensus and repeated confirmation.")
-print("• AC/BC differences are separately monitored wherever both channel columns exist.")
-print("• Statistical detection establishes telemetry change, not the physical root cause.")
+    return findings
+
+
+numeric_parameters = [
+    field.name
+    for field in cda.schema.fields
+    if field.name.startswith(PARAMETER_PREFIX)
+    and isinstance(
+        field.dataType,
+        (NumericType, BooleanType),
+    )
+    and field.name
+    not in set(FLIGHT_PHASE_COLUMNS.values())
+]
+
+if not numeric_parameters:
+    raise RuntimeError(
+        "No eligible numeric or Boolean engine "
+        "parameters were found in cda."
+    )
+
+cadence_window = (
+    Window.partitionBy("StartDatetime")
+    .orderBy("Timestamp")
+)
+
+cadence_row = (
+    cda.select(
+        (
+            _ead_col("Timestamp").cast("double")
+            - F.lag(
+                _ead_col("Timestamp").cast("double")
+            ).over(cadence_window)
+        ).alias("_sample_interval")
+    )
+    .where(
+        (F.col("_sample_interval") > 0)
+        & (F.col("_sample_interval") <= 60)
+    )
+    .agg(
+        F.percentile_approx(
+            "_sample_interval",
+            0.5,
+            10000,
+        ).alias("_median_interval")
+    )
+    .first()
+)
+
+observed_cadence_seconds = float(
+    cadence_row._median_interval or 1.0
+)
+
+ANOMALY_CONFIG[
+    "observed_cadence_seconds"
+] = observed_cadence_seconds
+
+ANOMALY_CONFIG["episode_gap_seconds"] = min(
+    60,
+    max(
+        5,
+        int(
+            math.ceil(
+                3.0 * observed_cadence_seconds
+            )
+        ),
+    ),
+)
+
+print(
+    f"Enterprise anomaly analysis: "
+    f"{len(numeric_parameters):,} parameters | "
+    f"median cadence: "
+    f"{observed_cadence_seconds:.6g}s | "
+    f"episode gap: "
+    f"{ANOMALY_CONFIG['episode_gap_seconds']}s"
+)
+
+event_frames = []
+trend_records = []
+parameter_stats = {}
+
+for batch_start in range(
+    0,
+    len(numeric_parameters),
+    ANOMALY_CONFIG["batch_size"],
+):
+    batch_columns = numeric_parameters[
+        batch_start:
+        batch_start
+        + ANOMALY_CONFIG["batch_size"]
+    ]
+
+    batch_frame, batch_aliases = (
+        _ead_prepare(
+            batch_columns,
+            include_rates=True,
+        )
+    )
+
+    batch_frame = batch_frame.persist(
+        StorageLevel.MEMORY_AND_DISK
+    )
+
+    batch_stats = _ead_stats(
+        batch_frame,
+        batch_aliases,
+    )
+
+    parameter_stats.update(batch_stats)
+
+    event_frame = _ead_score_batch(
+        batch_frame,
+        batch_aliases,
+        batch_stats,
+    ).persist(StorageLevel.DISK_ONLY)
+
+    event_frame.count()
+    event_frames.append(event_frame)
+
+    trend_records.extend(
+        _ead_trends(
+            batch_frame,
+            batch_aliases,
+        )
+    )
+
+    batch_frame.unpersist()
+
+    completed = min(
+        batch_start
+        + ANOMALY_CONFIG["batch_size"],
+        len(numeric_parameters),
+    )
+
+    print(
+        f"Profiled and scored "
+        f"{completed:,} of "
+        f"{len(numeric_parameters):,} parameters"
+    )
+
+event_schema = (
+    "Timestamp timestamp, "
+    "StartDatetime timestamp, "
+    "FlightPhase double, "
+    "Parameter string, "
+    "Signal string, "
+    "Channel string, "
+    "Value double, "
+    "PeerParameter string, "
+    "PeerValue double, "
+    "Score double, "
+    "AnomalyType string, "
+    "AttributionConfidence double"
+)
+
+univariate_events = (
+    reduce(
+        lambda left, right: left.unionByName(
+            right
+        ),
+        event_frames,
+    )
+    if event_frames
+    else spark.createDataFrame(
+        [],
+        event_schema,
+    )
+)
+
+channel_pairs = {}
+
+for name in numeric_parameters:
+    channel, signal = _ead_channel_signal(name)
+
+    if channel in CHANNELS:
+        channel_pairs.setdefault(
+            signal,
+            {},
+        )[channel] = name
+
+channel_pairs = {
+    signal: members
+    for signal, members in channel_pairs.items()
+    if all(
+        channel in members
+        for channel in CHANNELS
+    )
+}
+
+pair_events = []
+pair_items = list(channel_pairs.items())
+
+pair_batch_size = max(
+    1,
+    ANOMALY_CONFIG["batch_size"] // 2,
+)
+
+for pair_start in range(
+    0,
+    len(pair_items),
+    pair_batch_size,
+):
+    selected_pairs = pair_items[
+        pair_start:
+        pair_start + pair_batch_size
+    ]
+
+    pair_columns = list(
+        dict.fromkeys(
+            name
+            for _, members in selected_pairs
+            for name in members.values()
+        )
+    )
+
+    pair_frame, pair_aliases = _ead_prepare(
+        pair_columns,
+        include_rates=False,
+    )
+
+    difference_aliases = {}
+
+    for index, (signal, members) in enumerate(
+        selected_pairs
+    ):
+        difference_alias = (
+            f"_pair{index:03d}"
+        )
+
+        difference_aliases[
+            signal
+        ] = difference_alias
+
+        pair_frame = pair_frame.withColumn(
+            difference_alias,
+            F.col(
+                pair_aliases[members["AC"]]
+            )
+            - F.col(
+                pair_aliases[members["BC"]]
+            ),
+        )
+
+    tail = ANOMALY_CONFIG[
+        "tail_probability"
+    ]
+
+    probabilities = [
+        tail,
+        0.25,
+        0.5,
+        0.75,
+        1.0 - tail,
+    ]
+
+    aggregate_expressions = []
+
+    for index, alias in enumerate(
+        difference_aliases.values()
+    ):
+        aggregate_expressions.extend(
+            [
+                F.count(alias).alias(
+                    f"_pn{index:03d}"
+                ),
+                F.percentile_approx(
+                    alias,
+                    probabilities,
+                    ANOMALY_CONFIG[
+                        "quantile_accuracy"
+                    ],
+                ).alias(
+                    f"_pq{index:03d}"
+                ),
+            ]
+        )
+
+    pair_rows = (
+        pair_frame.where("_eligible")
+        .groupBy("_phase")
+        .agg(*aggregate_expressions)
+        .collect()
+    )
+
+    pair_stats = {
+        signal: {}
+        for signal in difference_aliases
+    }
+
+    for row in pair_rows:
+        values = row.asDict(recursive=True)
+        phase = float(values["_phase"])
+
+        for index, signal in enumerate(
+            difference_aliases
+        ):
+            pair_stats[signal][phase] = {
+                "count": int(
+                    values.get(
+                        f"_pn{index:03d}"
+                    )
+                    or 0
+                ),
+                "q": _ead_quantiles(
+                    values.get(
+                        f"_pq{index:03d}"
+                    )
+                ),
+            }
+
+    pair_structs = []
+
+    for signal, members in selected_pairs:
+        difference_alias = (
+            difference_aliases[signal]
+        )
+
+        pair_z_cases = []
+        pair_tail_cases = []
+
+        for phase, stats in (
+            pair_stats[signal].items()
+        ):
+            if (
+                stats["count"]
+                < ANOMALY_CONFIG[
+                    "minimum_phase_samples"
+                ]
+                or stats["q"] is None
+            ):
+                continue
+
+            lower, q25, median, q75, upper = (
+                stats["q"]
+            )
+
+            scale = _ead_scale(
+                q25,
+                median,
+                q75,
+            )
+
+            pair_z_cases.append(
+                (
+                    phase,
+                    F.abs(
+                        F.col(difference_alias)
+                        - F.lit(median)
+                    )
+                    / F.lit(scale),
+                )
+            )
+
+            pair_tail_cases.append(
+                (
+                    phase,
+                    F.when(
+                        (
+                            F.col(
+                                difference_alias
+                            )
+                            < F.lit(lower)
+                        )
+                        | (
+                            F.col(
+                                difference_alias
+                            )
+                            > F.lit(upper)
+                        ),
+                        1.0,
+                    ).otherwise(0.0),
+                )
+            )
+
+        pair_z = F.coalesce(
+            _ead_case(pair_z_cases),
+            F.lit(0.0),
+        )
+
+        pair_tail = (
+            F.coalesce(
+                _ead_case(pair_tail_cases),
+                F.lit(0.0),
+            )
+            > 0
+        )
+
+        ac_alias = pair_aliases[
+            members["AC"]
+        ]
+
+        bc_alias = pair_aliases[
+            members["BC"]
+        ]
+
+        _, _, _, ac_z = (
+            _ead_metric_expressions(
+                ac_alias,
+                parameter_stats[
+                    members["AC"]
+                ],
+            )
+        )
+
+        _, _, _, bc_z = (
+            _ead_metric_expressions(
+                bc_alias,
+                parameter_stats[
+                    members["BC"]
+                ],
+            )
+        )
+
+        ac_wins = (
+            ac_z
+            >= F.greatest(
+                bc_z * F.lit(1.5),
+                F.lit(
+                    ANOMALY_CONFIG[
+                        "minimum_robust_z"
+                    ]
+                ),
+            )
+        )
+
+        bc_wins = (
+            bc_z
+            >= F.greatest(
+                ac_z * F.lit(1.5),
+                F.lit(
+                    ANOMALY_CONFIG[
+                        "minimum_robust_z"
+                    ]
+                ),
+            )
+        )
+
+        attributed_parameter = (
+            F.when(
+                ac_wins,
+                F.lit(members["AC"]),
+            )
+            .when(
+                bc_wins,
+                F.lit(members["BC"]),
+            )
+            .otherwise(
+                F.lit(
+                    f"{members['AC']} | "
+                    f"{members['BC']}"
+                )
+            )
+        )
+
+        attributed_channel = (
+            F.when(
+                ac_wins,
+                F.lit("AC"),
+            )
+            .when(
+                bc_wins,
+                F.lit("BC"),
+            )
+            .otherwise(
+                F.lit("AC|BC")
+            )
+        )
+
+        attributed_value = (
+            F.when(
+                ac_wins,
+                F.col(ac_alias),
+            )
+            .when(
+                bc_wins,
+                F.col(bc_alias),
+            )
+        )
+
+        peer_parameter = (
+            F.when(
+                ac_wins,
+                F.lit(members["BC"]),
+            )
+            .when(
+                bc_wins,
+                F.lit(members["AC"]),
+            )
+        )
+
+        peer_value = (
+            F.when(
+                ac_wins,
+                F.col(bc_alias),
+            )
+            .when(
+                bc_wins,
+                F.col(ac_alias),
+            )
+        )
+
+        confidence = (
+            F.when(
+                ac_wins | bc_wins,
+                F.greatest(ac_z, bc_z)
+                / (
+                    ac_z
+                    + bc_z
+                    + F.lit(1.0e-12)
+                ),
+            )
+            .otherwise(F.lit(0.5))
+        )
+
+        pair_flag = (
+            F.col(
+                difference_alias
+            ).isNotNull()
+            & (
+                (
+                    pair_tail
+                    & (
+                        pair_z
+                        >= ANOMALY_CONFIG[
+                            "minimum_robust_z"
+                        ]
+                    )
+                )
+                | (
+                    pair_z
+                    >= ANOMALY_CONFIG[
+                        "catastrophic_z"
+                    ]
+                )
+            )
+        )
+
+        pair_structs.append(
+            F.when(
+                F.col("_eligible")
+                & pair_flag,
+                F.struct(
+                    attributed_parameter.alias(
+                        "Parameter"
+                    ),
+                    F.lit(signal).alias(
+                        "Signal"
+                    ),
+                    attributed_channel.alias(
+                        "Channel"
+                    ),
+                    attributed_value.cast(
+                        "double"
+                    ).alias("Value"),
+                    peer_parameter.alias(
+                        "PeerParameter"
+                    ),
+                    peer_value.cast(
+                        "double"
+                    ).alias("PeerValue"),
+                    F.least(
+                        pair_z,
+                        F.lit(100.0),
+                    ).alias("Score"),
+                    F.lit(
+                        "AC_BC_CHANNEL_DIVERGENCE"
+                    ).alias("AnomalyType"),
+                    confidence.alias(
+                        "AttributionConfidence"
+                    ),
+                ),
+            )
+        )
+
+    if pair_structs:
+        pair_event_frame = (
+            pair_frame.select(
+                "Timestamp",
+                "StartDatetime",
+                F.col("_phase").alias(
+                    "FlightPhase"
+                ),
+                F.explode(
+                    F.array(*pair_structs)
+                ).alias("_event"),
+            )
+            .where(
+                F.col("_event").isNotNull()
+            )
+            .select(
+                "Timestamp",
+                "StartDatetime",
+                "FlightPhase",
+                "_event.*",
+            )
+            .persist(
+                StorageLevel.DISK_ONLY
+            )
+        )
+
+        pair_event_frame.count()
+        pair_events.append(
+            pair_event_frame
+        )
+
+paired_events = (
+    reduce(
+        lambda left, right: left.unionByName(
+            right
+        ),
+        pair_events,
+    )
+    if pair_events
+    else spark.createDataFrame(
+        [],
+        event_schema,
+    )
+)
+
+raw_events = (
+    univariate_events
+    .unionByName(paired_events)
+)
+
+raw_events = (
+    raw_events.groupBy(
+        "Timestamp",
+        "StartDatetime",
+        "FlightPhase",
+        "Parameter",
+        "Signal",
+        "Channel",
+    )
+    .agg(
+        F.first(
+            "Value",
+            ignorenulls=True,
+        ).alias("Value"),
+        F.first(
+            "PeerParameter",
+            ignorenulls=True,
+        ).alias("PeerParameter"),
+        F.first(
+            "PeerValue",
+            ignorenulls=True,
+        ).alias("PeerValue"),
+        F.max("Score").alias("Score"),
+        F.concat_ws(
+            "+",
+            F.sort_array(
+                F.collect_set(
+                    "AnomalyType"
+                )
+            ),
+        ).alias("AnomalyType"),
+        F.max(
+            "AttributionConfidence"
+        ).alias(
+            "AttributionConfidence"
+        ),
+    )
+)
+
+event_window = (
+    Window.partitionBy(
+        "StartDatetime",
+        "FlightPhase",
+        "Parameter",
+    )
+    .orderBy("Timestamp")
+)
+
+event_run_window = (
+    event_window.rowsBetween(
+        Window.unboundedPreceding,
+        Window.currentRow,
+    )
+)
+
+events_with_runs = (
+    raw_events.withColumn(
+        "_new_episode",
+        F.when(
+            F.lag("Timestamp")
+            .over(event_window)
+            .isNull()
+            | (
+                F.col("Timestamp")
+                .cast("long")
+                - F.lag("Timestamp")
+                .over(event_window)
+                .cast("long")
+                > ANOMALY_CONFIG[
+                    "episode_gap_seconds"
+                ]
+            ),
+            1,
+        ).otherwise(0),
+    )
+    .withColumn(
+        "EpisodeId",
+        F.sum("_new_episode").over(
+            event_run_window
+        ),
+    )
+)
+
+enterprise_anomaly_episodes = (
+    events_with_runs.groupBy(
+        "StartDatetime",
+        "FlightPhase",
+        "Parameter",
+        "Signal",
+        "Channel",
+        "EpisodeId",
+    )
+    .agg(
+        F.min("Timestamp").alias(
+            "EpisodeStart"
+        ),
+        F.max("Timestamp").alias(
+            "EpisodeEnd"
+        ),
+        F.count("*").alias(
+            "AnomalousSamples"
+        ),
+        F.max("Score").alias(
+            "MaxScore"
+        ),
+        F.avg("Score").alias(
+            "MeanScore"
+        ),
+        F.concat_ws(
+            "+",
+            F.sort_array(
+                F.collect_set(
+                    "AnomalyType"
+                )
+            ),
+        ).alias("AnomalyType"),
+        F.max(
+            "AttributionConfidence"
+        ).alias(
+            "AttributionConfidence"
+        ),
+    )
+    .withColumn(
+        "DurationSeconds",
+        F.col("EpisodeEnd").cast(
+            "double"
+        )
+        - F.col("EpisodeStart").cast(
+            "double"
+        ),
+    )
+    .where(
+        (
+            F.col("AnomalousSamples")
+            >= ANOMALY_CONFIG[
+                "minimum_episode_samples"
+            ]
+        )
+        | (
+            F.col("DurationSeconds")
+            >= ANOMALY_CONFIG[
+                "minimum_episode_seconds"
+            ]
+        )
+        | (
+            F.col("MaxScore")
+            >= ANOMALY_CONFIG[
+                "catastrophic_z"
+            ]
+        )
+    )
+    .withColumn(
+        "AircraftIdentifier",
+        F.lit(str(selected_acid)),
+    )
+    .withColumn(
+        "EngineSerialNumber",
+        F.lit(str(selected_esn)),
+    )
+    .persist(StorageLevel.DISK_ONLY)
+)
+
+confirmed_episode_keys = (
+    enterprise_anomaly_episodes.select(
+        "StartDatetime",
+        "FlightPhase",
+        "Parameter",
+        "EpisodeId",
+    )
+)
+
+enterprise_anomaly_samples = (
+    events_with_runs.join(
+        confirmed_episode_keys,
+        [
+            "StartDatetime",
+            "FlightPhase",
+            "Parameter",
+            "EpisodeId",
+        ],
+        "inner",
+    )
+    .drop("_new_episode")
+    .withColumn(
+        "AircraftIdentifier",
+        F.lit(str(selected_acid)),
+    )
+    .withColumn(
+        "EngineSerialNumber",
+        F.lit(str(selected_esn)),
+    )
+    .persist(StorageLevel.DISK_ONLY)
+)
+
+phase_frame, _ = _ead_prepare(
+    [],
+    include_rates=False,
+)
+
+enterprise_phase_issue_samples = (
+    phase_frame.where(
+        F.col("_phase_disagreement")
+    )
+    .select(
+        "Timestamp",
+        "StartDatetime",
+        F.col("_phase_ac").alias(
+            "ACFlightPhase"
+        ),
+        F.col("_phase_bc").alias(
+            "BCFlightPhase"
+        ),
+        F.lit(
+            "FLIGHT_PHASE_DISAGREEMENT"
+        ).alias("AnomalyType"),
+    )
+)
+
+phase_issue_window = (
+    Window.partitionBy(
+        "StartDatetime",
+        "AnomalyType",
+    )
+    .orderBy("Timestamp")
+)
+
+phase_issue_run_window = (
+    phase_issue_window.rowsBetween(
+        Window.unboundedPreceding,
+        Window.currentRow,
+    )
+)
+
+enterprise_phase_issue_samples = (
+    enterprise_phase_issue_samples
+    .withColumn(
+        "_new_episode",
+        F.when(
+            F.lag("Timestamp")
+            .over(phase_issue_window)
+            .isNull()
+            | (
+                F.col("Timestamp")
+                .cast("long")
+                - F.lag("Timestamp")
+                .over(phase_issue_window)
+                .cast("long")
+                > ANOMALY_CONFIG[
+                    "episode_gap_seconds"
+                ]
+            ),
+            1,
+        ).otherwise(0),
+    )
+    .withColumn(
+        "EpisodeId",
+        F.sum("_new_episode").over(
+            phase_issue_run_window
+        ),
+    )
+    .drop("_new_episode")
+)
+
+enterprise_phase_issue_episodes = (
+    enterprise_phase_issue_samples
+    .groupBy(
+        "StartDatetime",
+        "AnomalyType",
+        "EpisodeId",
+    )
+    .agg(
+        F.min("Timestamp").alias(
+            "EpisodeStart"
+        ),
+        F.max("Timestamp").alias(
+            "EpisodeEnd"
+        ),
+        F.count("*").alias(
+            "Samples"
+        ),
+        F.collect_set(
+            "ACFlightPhase"
+        ).alias(
+            "ACFlightPhases"
+        ),
+        F.collect_set(
+            "BCFlightPhase"
+        ).alias(
+            "BCFlightPhases"
+        ),
+    )
+    .withColumn(
+        "DurationSeconds",
+        F.col("EpisodeEnd").cast(
+            "double"
+        )
+        - F.col("EpisodeStart").cast(
+            "double"
+        ),
+    )
+    .persist(StorageLevel.DISK_ONLY)
+)
+
+enterprise_anomaly_flights = (
+    enterprise_anomaly_episodes
+    .groupBy("StartDatetime")
+    .agg(
+        F.count("*").alias(
+            "ConfirmedEpisodes"
+        ),
+        F.countDistinct(
+            "Parameter"
+        ).alias(
+            "AnomalousParameters"
+        ),
+        F.collect_set(
+            "Parameter"
+        ).alias("Parameters"),
+        F.collect_set(
+            "FlightPhase"
+        ).alias("FlightPhases"),
+        F.min(
+            "EpisodeStart"
+        ).alias("FirstAnomaly"),
+        F.max(
+            "EpisodeEnd"
+        ).alias("LastAnomaly"),
+        F.max(
+            "MaxScore"
+        ).alias("MaximumScore"),
+        F.sum(
+            "AnomalousSamples"
+        ).alias("AnomalousSamples"),
+    )
+    .join(
+        enterprise_phase_issue_episodes
+        .groupBy("StartDatetime")
+        .agg(
+            F.count("*").alias(
+                "FlightPhaseIssueEpisodes"
+            )
+        ),
+        "StartDatetime",
+        "full",
+    )
+    .fillna(
+        {
+            "ConfirmedEpisodes": 0,
+            "AnomalousParameters": 0,
+            "AnomalousSamples": 0,
+            "FlightPhaseIssueEpisodes": 0,
+        }
+    )
+    .withColumn(
+        "AircraftIdentifier",
+        F.lit(str(selected_acid)),
+    )
+    .withColumn(
+        "EngineSerialNumber",
+        F.lit(str(selected_esn)),
+    )
+)
+
+enterprise_parameter_summary = (
+    enterprise_anomaly_episodes
+    .groupBy(
+        "Parameter",
+        "Signal",
+        "Channel",
+    )
+    .agg(
+        F.count("*").alias(
+            "ConfirmedEpisodes"
+        ),
+        F.countDistinct(
+            "StartDatetime"
+        ).alias("AffectedFlights"),
+        F.sum(
+            "AnomalousSamples"
+        ).alias("AnomalousSamples"),
+        F.max(
+            "MaxScore"
+        ).alias("MaximumScore"),
+        F.collect_set(
+            "FlightPhase"
+        ).alias(
+            "AffectedFlightPhases"
+        ),
+        F.min(
+            "EpisodeStart"
+        ).alias("FirstObserved"),
+        F.max(
+            "EpisodeEnd"
+        ).alias("LastObserved"),
+    )
+    .orderBy(
+        F.desc("MaximumScore"),
+        F.desc("AffectedFlights"),
+        F.desc("ConfirmedEpisodes"),
+    )
+)
+
+enterprise_degradation = pd.DataFrame(
+    trend_records
+)
+
+if not enterprise_degradation.empty:
+    enterprise_degradation[
+        "AdjustedPValue"
+    ] = _ead_bh(
+        enterprise_degradation[
+            "PValue"
+        ].to_numpy()
+    )
+
+    enterprise_degradation = (
+        enterprise_degradation.loc[
+            enterprise_degradation[
+                "EffectQualified"
+            ]
+            & (
+                enterprise_degradation[
+                    "AdjustedPValue"
+                ]
+                <= ANOMALY_CONFIG[
+                    "trend_fdr"
+                ]
+            )
+        ]
+        .sort_values(
+            [
+                "TrendEffectZ",
+                "ChangePointZ",
+                "AdjustedPValue",
+            ],
+            ascending=[
+                False,
+                False,
+                True,
+            ],
+            kind="stable",
+        )
+        .reset_index(drop=True)
+        .drop(
+            columns=[
+                "EffectQualified"
+            ]
+        )
+    )
+
+sample_count = (
+    enterprise_anomaly_samples.count()
+)
+
+episode_count = (
+    enterprise_anomaly_episodes.count()
+)
+
+flight_count = (
+    enterprise_anomaly_flights.count()
+)
+
+phase_issue_count = (
+    enterprise_phase_issue_episodes.count()
+)
+
+print(
+    f"Confirmed anomalous samples: "
+    f"{sample_count:,} | "
+    f"episodes: {episode_count:,} | "
+    f"affected flights: {flight_count:,} | "
+    f"FlightPhase issue episodes: "
+    f"{phase_issue_count:,} | "
+    f"degradation findings: "
+    f"{len(enterprise_degradation):,}"
+)
+
+print(
+    "Full outputs: "
+    "enterprise_anomaly_samples, "
+    "enterprise_anomaly_episodes, "
+    "enterprise_anomaly_flights, "
+    "enterprise_parameter_summary, "
+    "enterprise_phase_issue_samples, "
+    "enterprise_phase_issue_episodes, "
+    "enterprise_degradation"
+)
+
+display(
+    enterprise_anomaly_flights.orderBy(
+        F.desc("MaximumScore"),
+        F.desc("ConfirmedEpisodes"),
+    )
+)
+
+display(
+    enterprise_parameter_summary
+)
+
+display(
+    enterprise_anomaly_episodes.orderBy(
+        F.desc("MaxScore"),
+        "EpisodeStart",
+    )
+)
+
+display(
+    enterprise_phase_issue_episodes.orderBy(
+        "EpisodeStart"
+    )
+)
+
+ipy_display(
+    enterprise_degradation.head(200)
+)
+
+for frame in event_frames + pair_events:
+    frame.unpersist()
