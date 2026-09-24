@@ -953,8 +953,12 @@ def _tee_build_range_controls(state, signal_widget):
             table_output,
         ]
     )
-    load_window(default_start, default_end)
-    return controls
+    initial_start, initial_end = set_controls(default_start, default_end)
+
+    def load_initial_window():
+        load_window(initial_start, initial_end)
+
+    return controls, load_initial_window
 
 
 _tee_asset_rows = (
@@ -1071,10 +1075,15 @@ def _tee_load(_=None, raise_errors=False):
                 "two_engine_event_state": state,
             }
         )
+        range_controls, load_initial_window = _tee_build_range_controls(
+            state,
+            _tee_signal_widget,
+        )
         with _tee_output:
             clear_output(wait=True)
             ipy_display(HTML(_tee_summary_html(state, aircraft_identifier, start_date, end_date)))
-            ipy_display(_tee_build_range_controls(state, _tee_signal_widget))
+            ipy_display(range_controls)
+        load_initial_window()
     except Exception as exc:
         with _tee_output:
             clear_output(wait=True)
