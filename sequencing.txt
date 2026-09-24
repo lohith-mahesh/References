@@ -1037,9 +1037,12 @@ _tee_output = widgets.Output()
 
 
 def _tee_on_aircraft_change(change):
+    if change.get("new") == change.get("old"):
+        return
     latest_date = _tee_latest_calendar_date(change["new"])
     _tee_end_widget.value = latest_date
     _tee_start_widget.value = latest_date - timedelta(days=182)
+    _tee_load()
 
 
 def _tee_load(_=None, raise_errors=False):
