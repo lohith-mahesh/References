@@ -1,0 +1,911 @@
+from datetime import date, datetime, timedelta
+import html
+import re
+
+import pandas as pd
+import ipywidgets as widgets
+from IPython.display import HTML, clear_output, display as ipy_display
+from pyspark.sql import Window
+from pyspark.sql import functions as F
+from pyspark.sql.types import BooleanType, NumericType
+
+_TEE_ASSET_TABLE = "ehm_fleetstore_prd1eun82719_internal.assetmanagement.aircraftengine"
+_TEE_MASTER_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousmaster-aircraftengine-cda`"
+_TEE_SCAN_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousscan-cda`"
+_TEE_ENGINE_TYPE = "Pearl 700"
+_TEE_PREFIX = "Parameter:EVHMU_EEC_"
+_TEE_BREAK_SECONDS = 3600.0
+_TEE_MAX_EVENTS = 200000
+_TEE_SIGNALS = [
+    {
+        "key": "lvt_position",
+        "suffix": "IThrustReverser_trLVTPosVCtrl_data",
+        "label": "LVTPosVCntrl",
+        "style": "numeric",
+        "color": "#ead5e6",
+        "text": "#202124",
+    },
+    {
+        "key": "lower_raw",
+        "suffix": "IThrustReverser_loOwnTRLVTRaw_data",
+        "label": "Low TRLVT Raw",
+        "style": "numeric",
+        "color": "#d6b900",
+        "text": "#111111",
+    },
+    {
+        "key": "upper_raw",
+        "suffix": "IThrustReverser_upOwnTRLVTRaw_data",
+        "label": "Up TRLVT Raw",
+        "style": "numeric",
+        "color": "#3f51b5",
+        "text": "#ffffff",
+    },
+    {
+        "key": "door_deployment",
+        "suffix": "IThrustReverser_trDoorDeplStatus_data",
+        "label": "DoorDep Status",
+        "style": "numeric",
+        "color": "#f5e6a9",
+        "text": "#202124",
+    },
+    {
+        "key": "armed",
+        "suffix": "IThrustReverser_trArmed_data",
+        "label": "TR Armed",
+        "style": "armed",
+        "color": "#159b21",
+        "text": "#ffffff",
+    },
+    {
+        "key": "in_transit",
+        "suffix": "IThrustReverser_trInTransit_data",
+        "label": "In Transit",
+        "style": "on_off",
+        "color": "#69dbe5",
+        "text": "#102124",
+    },
+    {
+        "key": "unlocked",
+        "suffix": "IThrustReverser_trIsUnlocked_data",
+        "label": "Is Unlocked",
+        "style": "on_off",
+        "color": "#d7d7d7",
+        "text": "#202124",
+    },
+    {
+        "key": "door_stow",
+        "suffix": "IThrustReverser_trDoorStowStatus_data",
+        "label": "Door Stow",
+        "style": "door_stow",
+        "color": "#f4a000",
+        "text": "#202124",
+    },
+    {
+        "key": "deployed",
+        "suffix": "IThrustReverser_trIsDeployed_data",
+        "label": "IsDeployed",
+        "style": "numeric",
+        "color": "#5bbbbb",
+        "text": "#102124",
+    },
+]
+_TEE_SIGNAL_BY_KEY = {item["key"]: item for item in _TEE_SIGNALS}
+_TEE_SIGNAL_ORDER = {item["key"]: index for index, item in enumerate(_TEE_SIGNALS)}
+
+
+def _tee_qc(name):
+    return F.col(f"`{name.replace('`', '``')}`")
+
+
+def _tee_timestamp_label(value):
+    timestamp = pd.Timestamp(value)
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def _tee_duration_label(seconds):
+    milliseconds = max(0, int(round(float(seconds) * 1000.0)))
+    days, milliseconds = divmod(milliseconds, 86400000)
+    hours, milliseconds = divmod(milliseconds, 3600000)
+    minutes, milliseconds = divmod(milliseconds, 60000)
+    whole_seconds, milliseconds = divmod(milliseconds, 1000)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
+
+
+def _tee_scalar_text(value):
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
+
+
+def _tee_binary_token(value, true_text, false_text):
+    text = _tee_scalar_text(value)
+    lowered = text.lower()
+    if lowered in {"1", "true", "t"}:
+        return true_text
+    if lowered in {"0", "false", "f"}:
+        return false_text
+    return text
+
+
+def _tee_single_event_text(signal_key, value):
+    spec = _TEE_SIGNAL_BY_KEY[signal_key]
+    if spec["style"] == "on_off":
+        return f"{spec['label']} {_tee_binary_token(value, 'ON', 'OFF')}"
+    if spec["style"] == "armed":
+        state = _tee_binary_token(value, "Armed", "Not Armed")
+        return "TR Armed" if state == "Armed" else f"TR {state}"
+    if spec["style"] == "door_stow":
+        return f"Door Stow {_tee_binary_token(value, 'Open', 'Close')}"
+    return f"{spec['label']} = {_tee_scalar_text(value)}"
+
+
+def _tee_channel_value_text(signal_key, value):
+    spec = _TEE_SIGNAL_BY_KEY[signal_key]
+    if spec["style"] == "on_off":
+        return _tee_binary_token(value, "ON", "OFF")
+    if spec["style"] == "armed":
+        return _tee_binary_token(value, "Armed", "Not Armed")
+    if spec["style"] == "door_stow":
+        return _tee_binary_token(value, "Open", "Close")
+    return _tee_scalar_text(value)
+
+
+def _tee_event_text(signal_key, ac_value, bc_value, disagreement):
+    if bool(disagreement):
+        label = _TEE_SIGNAL_BY_KEY[signal_key]["label"]
+        ac_text = _tee_channel_value_text(signal_key, ac_value)
+        bc_text = _tee_channel_value_text(signal_key, bc_value)
+        return f"{label} AC={ac_text} | BC={bc_text}", True
+    resolved = ac_value if _tee_scalar_text(ac_value) else bc_value
+    return _tee_single_event_text(signal_key, resolved), False
+
+
+def _tee_position_sort_key(value):
+    if value is None or pd.isna(value):
+        return (9, "")
+    text = str(value).strip().lower()
+    if text in {"1", "01", "left", "l", "port"}:
+        return (0, text)
+    if text in {"2", "02", "right", "r", "starboard"}:
+        return (1, text)
+    match = re.search(r"\d+", text)
+    return (2, int(match.group(0))) if match else (3, text)
+
+
+def _tee_months_between(start_value, end_value):
+    current = date(start_value.year, start_value.month, 1)
+    final = date(end_value.year, end_value.month, 1)
+    values = []
+    while current <= final:
+        values.append((current.year, current.month))
+        current = date(current.year + 1, 1, 1) if current.month == 12 else date(current.year, current.month + 1, 1)
+    return values
+
+
+def _tee_merge_intervals(window_rows):
+    intervals = sorted(
+        (
+            pd.Timestamp(row.StartDatetime),
+            pd.Timestamp(row.EndDatetime),
+        )
+        for row in window_rows
+        if row.StartDatetime is not None and row.EndDatetime is not None
+    )
+    merged = []
+    for start_value, end_value in intervals:
+        if end_value < start_value:
+            continue
+        if not merged or start_value > merged[-1][1]:
+            merged.append([start_value, end_value])
+        elif end_value > merged[-1][1]:
+            merged[-1][1] = end_value
+    return [(start_value, end_value) for start_value, end_value in merged]
+
+
+def _tee_breaks_from_intervals(intervals):
+    breaks = []
+    for previous, current in zip(intervals, intervals[1:]):
+        gap_seconds = float((current[0] - previous[1]).total_seconds())
+        if gap_seconds > _TEE_BREAK_SECONDS:
+            breaks.append(
+                {
+                    "start": previous[1],
+                    "end": current[0],
+                    "seconds": gap_seconds,
+                }
+            )
+    return breaks
+
+
+def _tee_match_timezone(value, reference):
+    timestamp = pd.Timestamp(value)
+    reference = pd.Timestamp(reference)
+    if reference.tzinfo is None and timestamp.tzinfo is not None:
+        return timestamp.tz_localize(None)
+    if reference.tzinfo is not None and timestamp.tzinfo is None:
+        return timestamp.tz_localize(reference.tzinfo)
+    if reference.tzinfo is not None and timestamp.tzinfo is not None:
+        return timestamp.tz_convert(reference.tzinfo)
+    return timestamp
+
+
+def _tee_normalized_spark_value(column_name, schema_by_name):
+    if column_name not in schema_by_name:
+        return F.lit(None).cast("string")
+    raw = _tee_qc(column_name)
+    data_type = schema_by_name[column_name]
+    if isinstance(data_type, BooleanType):
+        return F.when(raw.isNull(), F.lit(None).cast("string")).otherwise(raw.cast("string"))
+    if isinstance(data_type, NumericType):
+        numeric = raw.cast("double")
+        return (
+            F.when(raw.isNull() | F.isnan(numeric), F.lit(None).cast("string"))
+            .when(numeric == F.lit(0.0), F.lit("0"))
+            .otherwise(raw.cast("string"))
+        )
+    return F.when(raw.isNull(), F.lit(None).cast("string")).otherwise(raw.cast("string"))
+
+
+def _tee_load_event_data(aircraft_identifier, start_date, end_date, selected_signal_keys, asset_esns):
+    start_calendar_id = int(start_date.strftime("%Y%m%d"))
+    end_calendar_id = int(end_date.strftime("%Y%m%d"))
+    master_source = spark.table(_TEE_MASTER_TABLE)
+    master_columns = set(master_source.columns)
+    required_master = {
+        "AircraftIdentifier",
+        "EngineSerialNumber",
+        "AircraftId",
+        "StartDatetime",
+        "EndDatetime",
+        "CalendarId",
+    }
+    missing_master = sorted(required_master - master_columns)
+    if missing_master:
+        raise ValueError(f"The master table is missing required columns: {missing_master}")
+    position_expression = F.col("EnginePosition") if "EnginePosition" in master_columns else F.lit(None)
+    master_filtered = (
+        master_source.where(
+            (F.col("AircraftIdentifier").cast("string") == aircraft_identifier)
+            & F.col("CalendarId").between(start_calendar_id, end_calendar_id)
+        )
+        .select(
+            F.col("AircraftId").alias("AircraftId"),
+            F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
+            F.col("StartDatetime").alias("StartDatetime"),
+            F.col("EndDatetime").alias("EndDatetime"),
+            position_expression.cast("string").alias("EnginePosition"),
+        )
+        .where(
+            F.col("AircraftId").isNotNull()
+            & F.col("EngineSerialNumber").isNotNull()
+            & F.col("StartDatetime").isNotNull()
+            & F.col("EndDatetime").isNotNull()
+            & (F.col("EndDatetime") >= F.col("StartDatetime"))
+        )
+    )
+    master_windows = (
+        master_filtered.groupBy("AircraftId", "EngineSerialNumber", "StartDatetime")
+        .agg(
+            F.max("EndDatetime").alias("EndDatetime"),
+            F.first("EnginePosition", ignorenulls=True).alias("EnginePosition"),
+        )
+    )
+    window_rows = master_windows.orderBy("StartDatetime", "EnginePosition", "EngineSerialNumber").collect()
+    if not window_rows:
+        raise RuntimeError("No flight windows were found for the selected aircraft and date range.")
+    merged_intervals = _tee_merge_intervals(window_rows)
+    break_rows = _tee_breaks_from_intervals(merged_intervals)
+    range_start = min(start_value for start_value, _ in merged_intervals)
+    range_end = max(end_value for _, end_value in merged_intervals)
+    position_by_esn = {}
+    for row in window_rows:
+        esn = str(row.EngineSerialNumber)
+        if esn not in position_by_esn or position_by_esn[esn] is None:
+            position_by_esn[esn] = row.EnginePosition
+    master_esns = set(position_by_esn)
+    display_esns = set(master_esns)
+    if len(display_esns) < 2:
+        display_esns.update(str(value) for value in asset_esns)
+    ordered_esns = sorted(
+        display_esns,
+        key=lambda esn: (_tee_position_sort_key(position_by_esn.get(esn)), str(esn)),
+    )
+    scan_source = spark.table(_TEE_SCAN_TABLE)
+    scan_columns = set(scan_source.columns)
+    required_scan = {"AircraftId", "AssetIdentifier", "StartDatetime", "Timestamp"}
+    missing_scan = sorted(required_scan - scan_columns)
+    if missing_scan:
+        raise ValueError(f"The scan table is missing required columns: {missing_scan}")
+    schema_by_name = {field.name: field.dataType for field in scan_source.schema.fields}
+    availability = []
+    usable_signal_keys = []
+    parameter_columns = []
+    for signal_key in selected_signal_keys:
+        spec = _TEE_SIGNAL_BY_KEY[signal_key]
+        ac_name = f"{_TEE_PREFIX}AC_{spec['suffix']}"
+        bc_name = f"{_TEE_PREFIX}BC_{spec['suffix']}"
+        ac_available = ac_name in scan_columns
+        bc_available = bc_name in scan_columns
+        availability.append(
+            {
+                "signal": spec["label"],
+                "AC": ac_available,
+                "BC": bc_available,
+            }
+        )
+        if ac_available or bc_available:
+            usable_signal_keys.append(signal_key)
+        if ac_available:
+            parameter_columns.append(ac_name)
+        if bc_available:
+            parameter_columns.append(bc_name)
+    if not usable_signal_keys:
+        raise RuntimeError("None of the selected signals exists in the scan-table schema.")
+    parameter_columns = list(dict.fromkeys(parameter_columns))
+    partition_filter = None
+    if "year" in scan_columns and "Month" in scan_columns:
+        partition_filter = F.lit(False)
+        for partition_year, partition_month in _tee_months_between(range_start.date(), range_end.date()):
+            partition_filter = partition_filter | (
+                (F.col("year") == partition_year)
+                & (F.col("Month") == partition_month)
+            )
+    scan_filtered = scan_source.where(partition_filter) if partition_filter is not None else scan_source
+    scan_alias = scan_filtered.alias("scan")
+    window_alias = F.broadcast(master_windows).alias("window")
+    join_condition = (
+        (scan_alias["AircraftId"] == window_alias["AircraftId"])
+        & (scan_alias["AssetIdentifier"].cast("string") == window_alias["EngineSerialNumber"])
+        & (scan_alias["StartDatetime"] == window_alias["StartDatetime"])
+        & scan_alias["Timestamp"].between(window_alias["StartDatetime"], window_alias["EndDatetime"])
+    )
+    selected_expressions = [
+        scan_alias["Timestamp"].alias("Timestamp"),
+        window_alias["StartDatetime"].alias("StartDatetime"),
+        window_alias["EngineSerialNumber"].alias("EngineSerialNumber"),
+    ]
+    selected_expressions.extend(scan_alias[name].alias(name) for name in parameter_columns)
+    scan_base = scan_alias.join(window_alias, join_condition, "inner").select(*selected_expressions)
+    state_frame = scan_base
+    state_specs = []
+    for signal_key in usable_signal_keys:
+        spec = _TEE_SIGNAL_BY_KEY[signal_key]
+        ac_name = f"{_TEE_PREFIX}AC_{spec['suffix']}"
+        bc_name = f"{_TEE_PREFIX}BC_{spec['suffix']}"
+        ac_value = _tee_normalized_spark_value(ac_name, schema_by_name)
+        bc_value = _tee_normalized_spark_value(bc_name, schema_by_name)
+        disagreement = ac_value.isNotNull() & bc_value.isNotNull() & (ac_value != bc_value)
+        resolved = F.coalesce(ac_value, bc_value)
+        state = (
+            F.when(ac_value.isNull() & bc_value.isNull(), F.lit(None).cast("string"))
+            .when(disagreement, F.concat(F.lit("D|"), ac_value, F.lit("|"), bc_value))
+            .otherwise(F.concat(F.lit("V|"), resolved))
+        )
+        order_value = _TEE_SIGNAL_ORDER[signal_key]
+        state_column = f"_TEEState{order_value}"
+        ac_column = f"_TEEAC{order_value}"
+        bc_column = f"_TEEBC{order_value}"
+        disagreement_column = f"_TEEDisagreement{order_value}"
+        state_frame = (
+            state_frame.withColumn(state_column, state)
+            .withColumn(ac_column, ac_value)
+            .withColumn(bc_column, bc_value)
+            .withColumn(disagreement_column, disagreement)
+        )
+        state_specs.append(
+            {
+                "key": signal_key,
+                "order": order_value,
+                "state": state_column,
+                "ac": ac_column,
+                "bc": bc_column,
+                "disagreement": disagreement_column,
+            }
+        )
+    history_window = (
+        Window.partitionBy("EngineSerialNumber")
+        .orderBy("Timestamp", "StartDatetime")
+        .rowsBetween(Window.unboundedPreceding, -1)
+    )
+    event_frame = state_frame
+    for state_spec in state_specs:
+        current_state = F.col(state_spec["state"])
+        previous_state_column = f"_TEEPreviousState{state_spec['order']}"
+        previous_timestamp_column = f"_TEEPreviousTimestamp{state_spec['order']}"
+        event_frame = (
+            event_frame.withColumn(
+                previous_state_column,
+                F.last(current_state, ignorenulls=True).over(history_window),
+            )
+            .withColumn(
+                previous_timestamp_column,
+                F.last(
+                    F.when(current_state.isNotNull(), F.col("Timestamp")),
+                    ignorenulls=True,
+                ).over(history_window),
+            )
+        )
+        state_spec["previous_state"] = previous_state_column
+        state_spec["previous_timestamp"] = previous_timestamp_column
+    changed_structs = []
+    for state_spec in state_specs:
+        current_state = F.col(state_spec["state"])
+        previous_state = F.col(state_spec["previous_state"])
+        previous_timestamp = F.col(state_spec["previous_timestamp"])
+        changed = current_state.isNotNull() & (
+            previous_state.isNull()
+            | (current_state != previous_state)
+            | ((F.col("Timestamp").cast("double") - previous_timestamp.cast("double")) > _TEE_BREAK_SECONDS)
+        )
+        changed_structs.append(
+            F.when(
+                changed,
+                F.struct(
+                    F.lit(state_spec["order"]).alias("SignalOrder"),
+                    F.lit(state_spec["key"]).alias("Signal"),
+                    F.col(state_spec["ac"]).alias("ACValue"),
+                    F.col(state_spec["bc"]).alias("BCValue"),
+                    F.col(state_spec["disagreement"]).alias("Disagreement"),
+                ),
+            )
+        )
+    changed_array = F.filter(F.array(*changed_structs), lambda item: item.isNotNull())
+    state_changes = (
+        event_frame.select(
+            "Timestamp",
+            "StartDatetime",
+            "EngineSerialNumber",
+            F.explode(changed_array).alias("Event"),
+        )
+        .select(
+            "Timestamp",
+            "StartDatetime",
+            "EngineSerialNumber",
+            F.col("Event.SignalOrder").alias("SignalOrder"),
+            F.col("Event.Signal").alias("Signal"),
+            F.col("Event.ACValue").alias("ACValue"),
+            F.col("Event.BCValue").alias("BCValue"),
+            F.col("Event.Disagreement").alias("Disagreement"),
+        )
+        .orderBy("Timestamp", "SignalOrder", "EngineSerialNumber")
+    )
+    event_data = state_changes.limit(_TEE_MAX_EVENTS + 1).toPandas()
+    if len(event_data) > _TEE_MAX_EVENTS:
+        raise RuntimeError(
+            f"More than {_TEE_MAX_EVENTS:,} state-change events were produced. Reduce the date range."
+        )
+    if not event_data.empty:
+        event_data["Timestamp"] = pd.to_datetime(event_data["Timestamp"], errors="coerce")
+        event_data["StartDatetime"] = pd.to_datetime(event_data["StartDatetime"], errors="coerce")
+        event_data["EngineSerialNumber"] = event_data["EngineSerialNumber"].astype("string")
+        event_data = event_data.dropna(subset=["Timestamp", "EngineSerialNumber", "Signal"])
+        event_data = event_data.sort_values(
+            ["Timestamp", "SignalOrder", "EngineSerialNumber"],
+            kind="stable",
+        ).reset_index(drop=True)
+    return {
+        "events": event_data,
+        "breaks": break_rows,
+        "intervals": merged_intervals,
+        "window_rows": window_rows,
+        "range_start": range_start,
+        "range_end": range_end,
+        "ordered_esns": ordered_esns,
+        "positions": position_by_esn,
+        "availability": availability,
+        "usable_signals": usable_signal_keys,
+    }
+
+
+def _tee_rows_for_range(state, start_time, end_time):
+    events = state["events"]
+    visible_events = events.loc[
+        events["Timestamp"].between(start_time, end_time, inclusive="both")
+    ] if not events.empty else events
+    rows = []
+    if not visible_events.empty:
+        grouped = visible_events.groupby(["Timestamp", "Signal"], sort=False, dropna=False)
+        for (timestamp, signal_key), group in grouped:
+            cells = {}
+            disagreements = {}
+            for record in group.itertuples(index=False):
+                esn = str(record.EngineSerialNumber)
+                event_text, disagreement = _tee_event_text(
+                    signal_key,
+                    record.ACValue,
+                    record.BCValue,
+                    record.Disagreement,
+                )
+                cells.setdefault(esn, []).append(event_text)
+                disagreements[esn] = disagreements.get(esn, False) or disagreement
+            rows.append(
+                {
+                    "kind": "event",
+                    "sort": (pd.Timestamp(timestamp).value, _TEE_SIGNAL_ORDER[signal_key]),
+                    "timestamp": pd.Timestamp(timestamp),
+                    "signal": signal_key,
+                    "cells": cells,
+                    "disagreements": disagreements,
+                }
+            )
+    for gap in state["breaks"]:
+        if gap["start"] <= end_time and gap["end"] >= start_time:
+            rows.append(
+                {
+                    "kind": "break",
+                    "sort": (pd.Timestamp(gap["start"]).value, len(_TEE_SIGNALS) + 1),
+                    "gap": gap,
+                }
+            )
+    return sorted(rows, key=lambda row: row["sort"])
+
+
+def _tee_table_html(state, start_time, end_time):
+    rows = _tee_rows_for_range(state, start_time, end_time)
+    engine_headers = []
+    for esn in state["ordered_esns"]:
+        position = state["positions"].get(esn)
+        position_html = "" if position is None else f"<span>Position {html.escape(str(position))}</span>"
+        engine_headers.append(
+            f"<th><strong>{html.escape(str(esn))}</strong>{position_html}</th>"
+        )
+    body = []
+    for row in rows:
+        if row["kind"] == "break":
+            gap = row["gap"]
+            body.append(
+                f'<tr class="tee-break"><td colspan="{len(state["ordered_esns"]) + 1}">'
+                f'BREAK · {_tee_duration_label(gap["seconds"])} · '
+                f'{html.escape(_tee_timestamp_label(gap["start"]))} → '
+                f'{html.escape(_tee_timestamp_label(gap["end"]))}</td></tr>'
+            )
+            continue
+        spec = _TEE_SIGNAL_BY_KEY[row["signal"]]
+        cells = []
+        for esn in state["ordered_esns"]:
+            values = row["cells"].get(esn, [])
+            if not values:
+                cells.append('<td class="tee-empty"></td>')
+                continue
+            cell_text = "<br>".join(html.escape(value) for value in values)
+            if row["disagreements"].get(esn, False):
+                cells.append(f'<td class="tee-disagreement">{cell_text}</td>')
+            else:
+                cells.append(
+                    f'<td style="background:{spec["color"]};color:{spec["text"]}">{cell_text}</td>'
+                )
+        body.append(
+            "<tr>"
+            f'<td class="tee-time">{html.escape(_tee_timestamp_label(row["timestamp"]))}</td>'
+            + "".join(cells)
+            + "</tr>"
+        )
+    if not body:
+        body.append(
+            f'<tr><td class="tee-none" colspan="{len(state["ordered_esns"]) + 1}">'
+            "No selected-signal state changes fall inside this range.</td></tr>"
+        )
+    return f"""
+    <style>
+      .tee-summary {{ margin: 4px 0 10px; color: #303134; font-size: 13px; }}
+      .tee-scroll {{ width: 100%; max-height: 760px; overflow: auto; border: 1px solid #8a8a8a; background: #fff; }}
+      .tee-table {{ width: 100%; min-width: {360 + 390 * max(1, len(state['ordered_esns']))}px; table-layout: fixed; border-collapse: separate; border-spacing: 0; font: 13px/1.25 Arial, sans-serif; }}
+      .tee-table th {{ position: sticky; top: 0; z-index: 4; height: 42px; padding: 6px 10px; background: #f2f2f2; border-right: 1px solid #555; border-bottom: 2px solid #333; text-align: center; }}
+      .tee-table th:first-child {{ left: 0; z-index: 6; width: 250px; text-align: left; }}
+      .tee-table th span {{ display: block; margin-top: 2px; color: #5f6368; font-size: 11px; font-weight: normal; }}
+      .tee-table td {{ min-height: 25px; padding: 5px 8px; border-right: 1px solid #666; border-bottom: 1px solid #777; vertical-align: middle; overflow-wrap: anywhere; }}
+      .tee-time {{ position: sticky; left: 0; z-index: 2; width: 250px; white-space: nowrap; background: #fff; color: #202124; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+      .tee-empty {{ background: #fff; }}
+      .tee-disagreement {{ background: #ffd6d6; color: #8b0000; box-shadow: inset 0 0 0 2px #c62828; font-weight: 700; }}
+      .tee-break td {{ position: static; padding: 8px 12px; background: repeating-linear-gradient(135deg,#555 0,#555 8px,#666 8px,#666 16px); color: #fff; text-align: center; font-weight: 800; letter-spacing: .08em; border-bottom: 2px solid #222; }}
+      .tee-none {{ padding: 28px !important; color: #666; text-align: center; font-style: italic; }}
+    </style>
+    <div class="tee-summary">Showing {len(rows):,} event/BREAK rows from {html.escape(_tee_timestamp_label(start_time))} through {html.escape(_tee_timestamp_label(end_time))}.</div>
+    <div class="tee-scroll">
+      <table class="tee-table">
+        <thead><tr><th>Time</th>{''.join(engine_headers)}</tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def _tee_summary_html(state, aircraft_identifier, start_date, end_date):
+    event_count = len(state["events"])
+    disagreement_count = int(state["events"]["Disagreement"].fillna(False).astype(bool).sum()) if event_count else 0
+    engine_items = []
+    for esn in state["ordered_esns"]:
+        position = state["positions"].get(esn)
+        suffix = "" if position is None else f" (position {html.escape(str(position))})"
+        engine_items.append(f"{html.escape(str(esn))}{suffix}")
+    unavailable = []
+    for item in state["availability"]:
+        missing = [channel for channel in ("AC", "BC") if not item[channel]]
+        if missing:
+            unavailable.append(f"{html.escape(item['signal'])}: missing {'/'.join(missing)}")
+    availability_html = ""
+    if unavailable:
+        availability_html = '<div class="tee-warning">' + " · ".join(unavailable) + "</div>"
+    engine_warning = ""
+    if len(state["ordered_esns"]) != 2:
+        engine_warning = (
+            f'<div class="tee-warning">The selected range resolves to {len(state["ordered_esns"])} engine serial columns. '
+            "No engine record has been discarded.</div>"
+        )
+    return f"""
+    <style>
+      .tee-load-summary {{ padding: 10px 12px; margin: 4px 0 10px; border: 1px solid #c8c8c8; border-radius: 4px; background: #fafafa; font-size: 13px; line-height: 1.55; }}
+      .tee-load-summary strong {{ color: #202124; }}
+      .tee-warning {{ margin-top: 6px; padding: 6px 8px; background: #fff4ce; border-left: 4px solid #d89b00; color: #5f4300; }}
+    </style>
+    <div class="tee-load-summary">
+      <div><strong>Aircraft:</strong> {html.escape(str(aircraft_identifier))} · <strong>Calendar selection:</strong> {start_date} through {end_date}</div>
+      <div><strong>Engines:</strong> {' · '.join(engine_items)} · <strong>Master windows:</strong> {len(state['window_rows']):,} · <strong>Combined flight periods:</strong> {len(state['intervals']):,}</div>
+      <div><strong>State-change events:</strong> {event_count:,} · <strong>BREAK rows:</strong> {len(state['breaks']):,} · <strong>AC/BC disagreement transitions:</strong> {disagreement_count:,}</div>
+      {engine_warning}{availability_html}
+    </div>
+    """
+
+
+def _tee_build_range_controls(state):
+    full_start = pd.Timestamp(state["range_start"])
+    full_end = pd.Timestamp(state["range_end"])
+    total_milliseconds = max(0, int(round((full_end - full_start).total_seconds() * 1000.0)))
+    slider_max = max(1, total_milliseconds)
+    slider = widgets.IntRangeSlider(
+        value=(0, total_milliseconds),
+        min=0,
+        max=slider_max,
+        step=1,
+        description="Time range:",
+        readout=False,
+        continuous_update=False,
+        layout=widgets.Layout(width="1200px"),
+        style={"description_width": "90px"},
+    )
+    start_text = widgets.Text(
+        value=_tee_timestamp_label(full_start),
+        description="Start:",
+        layout=widgets.Layout(width="500px"),
+    )
+    end_text = widgets.Text(
+        value=_tee_timestamp_label(full_end),
+        description="End:",
+        layout=widgets.Layout(width="500px"),
+    )
+    apply_button = widgets.Button(
+        description="Apply exact range",
+        button_style="success",
+        layout=widgets.Layout(width="180px"),
+    )
+    reset_button = widgets.Button(
+        description="Reset full range",
+        layout=widgets.Layout(width="170px"),
+    )
+    range_label = widgets.HTML()
+    table_output = widgets.Output()
+    guard = {"active": False}
+
+    def timestamp_from_offset(offset):
+        return full_start + pd.to_timedelta(int(offset), unit="ms")
+
+    def offset_from_timestamp(timestamp):
+        value = int(round((timestamp - full_start).total_seconds() * 1000.0))
+        return min(total_milliseconds, max(0, value))
+
+    def render(start_time, end_time):
+        range_label.value = (
+            "<b>Visible start:</b> "
+            + html.escape(_tee_timestamp_label(start_time))
+            + " &nbsp;&nbsp; <b>Visible end:</b> "
+            + html.escape(_tee_timestamp_label(end_time))
+        )
+        with table_output:
+            clear_output(wait=True)
+            ipy_display(HTML(_tee_table_html(state, start_time, end_time)))
+
+    def on_slider(change):
+        if guard["active"]:
+            return
+        start_time = timestamp_from_offset(change["new"][0])
+        end_time = timestamp_from_offset(change["new"][1])
+        guard["active"] = True
+        start_text.value = _tee_timestamp_label(start_time)
+        end_text.value = _tee_timestamp_label(end_time)
+        guard["active"] = False
+        render(start_time, end_time)
+
+    def on_apply(_):
+        try:
+            start_time = _tee_match_timezone(start_text.value, full_start)
+            end_time = _tee_match_timezone(end_text.value, full_start)
+            if start_time > end_time:
+                start_time, end_time = end_time, start_time
+            start_time = min(full_end, max(full_start, start_time))
+            end_time = min(full_end, max(full_start, end_time))
+            offsets = (offset_from_timestamp(start_time), offset_from_timestamp(end_time))
+            guard["active"] = True
+            slider.value = offsets
+            start_time = timestamp_from_offset(offsets[0])
+            end_time = timestamp_from_offset(offsets[1])
+            start_text.value = _tee_timestamp_label(start_time)
+            end_text.value = _tee_timestamp_label(end_time)
+            guard["active"] = False
+            render(start_time, end_time)
+        except Exception as exc:
+            with table_output:
+                clear_output(wait=True)
+                print(f"Start and end must be valid date-time values: {exc}")
+
+    def on_reset(_):
+        guard["active"] = True
+        slider.value = (0, total_milliseconds)
+        start_text.value = _tee_timestamp_label(full_start)
+        end_text.value = _tee_timestamp_label(full_end)
+        guard["active"] = False
+        render(full_start, full_end)
+
+    slider.observe(on_slider, names="value")
+    apply_button.on_click(on_apply)
+    reset_button.on_click(on_reset)
+    controls = widgets.VBox(
+        [
+            widgets.HBox([start_text, end_text]),
+            slider,
+            range_label,
+            widgets.HBox([apply_button, reset_button]),
+            table_output,
+        ]
+    )
+    render(full_start, full_end)
+    return controls
+
+
+_tee_asset_rows = (
+    spark.table(_TEE_ASSET_TABLE)
+    .where(F.col("EngineTypeCode") == _TEE_ENGINE_TYPE)
+    .select(
+        F.col("LatestAircraftLatestIdentifier").cast("string").alias("AircraftIdentifier"),
+        F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
+    )
+    .where(F.col("AircraftIdentifier").isNotNull() & F.col("EngineSerialNumber").isNotNull())
+    .dropDuplicates()
+    .collect()
+)
+_tee_asset_esns_by_aircraft = {}
+for _tee_row in _tee_asset_rows:
+    _tee_asset_esns_by_aircraft.setdefault(_tee_row.AircraftIdentifier, set()).add(str(_tee_row.EngineSerialNumber))
+_tee_aircraft_options = sorted(_tee_asset_esns_by_aircraft)
+if not _tee_aircraft_options:
+    raise RuntimeError(f"No aircraft were found for engine type {_TEE_ENGINE_TYPE}.")
+
+
+def _tee_latest_calendar_date(aircraft_identifier):
+    row = (
+        spark.table(_TEE_MASTER_TABLE)
+        .where(F.col("AircraftIdentifier").cast("string") == aircraft_identifier)
+        .agg(F.max("CalendarId").alias("LatestCalendarId"))
+        .first()
+    )
+    value = row.LatestCalendarId if row else None
+    return datetime.strptime(str(int(value)), "%Y%m%d").date() if value is not None else date.today()
+
+
+_tee_previous_aircraft_widget = globals().get("_tee_aircraft_widget")
+_tee_previous_start_widget = globals().get("_tee_start_widget")
+_tee_previous_end_widget = globals().get("_tee_end_widget")
+_tee_previous_signal_widget = globals().get("_tee_signal_widget")
+_tee_previous_aircraft = getattr(_tee_previous_aircraft_widget, "value", None)
+_tee_default_aircraft = _tee_previous_aircraft if _tee_previous_aircraft in _tee_aircraft_options else _tee_aircraft_options[0]
+_tee_previous_start = getattr(_tee_previous_start_widget, "value", None)
+_tee_previous_end = getattr(_tee_previous_end_widget, "value", None)
+if _tee_previous_start is None or _tee_previous_end is None:
+    _tee_previous_end = _tee_latest_calendar_date(_tee_default_aircraft)
+    _tee_previous_start = _tee_previous_end - timedelta(days=6)
+_tee_signal_keys = tuple(item["key"] for item in _TEE_SIGNALS)
+_tee_previous_signals = tuple(getattr(_tee_previous_signal_widget, "value", ()))
+_tee_default_signals = tuple(value for value in _tee_previous_signals if value in _tee_signal_keys) or _tee_signal_keys
+
+_tee_aircraft_widget = widgets.Dropdown(
+    options=_tee_aircraft_options,
+    value=_tee_default_aircraft,
+    description="Aircraft:",
+    layout=widgets.Layout(width="420px"),
+)
+_tee_start_widget = widgets.DatePicker(
+    value=_tee_previous_start,
+    description="Start date:",
+    layout=widgets.Layout(width="300px"),
+)
+_tee_end_widget = widgets.DatePicker(
+    value=_tee_previous_end,
+    description="End date:",
+    layout=widgets.Layout(width="300px"),
+)
+_tee_signal_widget = widgets.SelectMultiple(
+    options=[(item["label"], item["key"]) for item in _TEE_SIGNALS],
+    value=_tee_default_signals,
+    description="Signals:",
+    layout=widgets.Layout(width="520px", height="210px"),
+)
+_tee_load_button = widgets.Button(
+    description="Load both engines",
+    button_style="primary",
+    layout=widgets.Layout(width="210px"),
+)
+_tee_output = widgets.Output()
+
+
+def _tee_on_aircraft_change(change):
+    latest_date = _tee_latest_calendar_date(change["new"])
+    _tee_end_widget.value = latest_date
+    _tee_start_widget.value = latest_date - timedelta(days=6)
+
+
+def _tee_load(_=None, raise_errors=False):
+    _tee_load_button.disabled = True
+    try:
+        aircraft_identifier = _tee_aircraft_widget.value
+        start_date = _tee_start_widget.value
+        end_date = _tee_end_widget.value
+        selected_signal_keys = list(_tee_signal_widget.value)
+        if start_date is None or end_date is None:
+            raise ValueError("Both start and end dates are required.")
+        if start_date > end_date:
+            raise ValueError("Start date must not be later than end date.")
+        if not selected_signal_keys:
+            raise ValueError("Select at least one signal.")
+        with _tee_output:
+            clear_output(wait=True)
+            print("Loading both engines and extracting state changes...")
+        state = _tee_load_event_data(
+            aircraft_identifier,
+            start_date,
+            end_date,
+            selected_signal_keys,
+            _tee_asset_esns_by_aircraft.get(aircraft_identifier, set()),
+        )
+        globals().update(
+            {
+                "two_engine_event_data": state["events"],
+                "two_engine_breaks": pd.DataFrame(state["breaks"]),
+                "two_engine_master_windows": pd.DataFrame(
+                    [row.asDict(recursive=True) for row in state["window_rows"]]
+                ),
+                "two_engine_selected_esns": list(state["ordered_esns"]),
+                "two_engine_event_state": state,
+            }
+        )
+        with _tee_output:
+            clear_output(wait=True)
+            ipy_display(HTML(_tee_summary_html(state, aircraft_identifier, start_date, end_date)))
+            ipy_display(_tee_build_range_controls(state))
+    except Exception as exc:
+        with _tee_output:
+            clear_output(wait=True)
+            print(f"Unable to build the two-engine event table: {exc}")
+        if raise_errors:
+            raise
+    finally:
+        _tee_load_button.disabled = False
+
+
+_tee_aircraft_widget.observe(_tee_on_aircraft_change, names="value")
+_tee_load_button.on_click(_tee_load)
+_tee_root = widgets.VBox(
+    [
+        widgets.HBox([_tee_aircraft_widget, _tee_start_widget, _tee_end_widget]),
+        widgets.HBox([_tee_signal_widget, _tee_load_button]),
+        _tee_output,
+    ]
+)
+ipy_display(_tee_root)
+_tee_load(raise_errors=True)
