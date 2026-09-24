@@ -15,6 +15,7 @@ _TEE_SCAN_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucont
 _TEE_ENGINE_TYPE = "Pearl 700"
 _TEE_PREFIX = "Parameter:EVHMU_EEC_"
 _TEE_BREAK_SECONDS = 3600.0
+_TEE_CHANNEL_DISAGREEMENT_THRESHOLD = 0.2
 _TEE_MAX_VIEW_SECONDS = 7 * 24 * 60 * 60
 _TEE_MAX_WINDOW_EVENTS = 50000
 _TEE_SIGNALS = [
@@ -93,6 +94,12 @@ _TEE_SIGNALS = [
 ]
 _TEE_SIGNAL_BY_KEY = {item["key"]: item for item in _TEE_SIGNALS}
 _TEE_SIGNAL_ORDER = {item["key"]: index for index, item in enumerate(_TEE_SIGNALS)}
+_TEE_ENDPOINTS = {
+    "lvt_position": (0.0, 100.0),
+    "lower_raw": (0.0, 100.0),
+    "upper_raw": (0.0, 100.0),
+    "deployed": (0.0, 1.0),
+}
 
 
 def _tee_qc(name):
@@ -253,6 +260,23 @@ def _tee_normalized_spark_value(column_name, schema_by_name):
             .otherwise(raw.cast("string"))
         )
     return F.when(raw.isNull(), F.lit(None).cast("string")).otherwise(raw.cast("string"))
+
+
+def _tee_numeric_spark_value(column_name, schema_by_name):
+    if column_name not in schema_by_name:
+        return F.lit(None).cast("double")
+    raw = _tee_qc(column_name)
+    data_type = schema_by_name[column_name]
+    if isinstance(data_type, BooleanType):
+        return (
+            F.when(raw.isNull(), F.lit(None).cast("double"))
+            .when(raw, F.lit(1.0))
+            .otherwise(F.lit(0.0))
+        )
+    if isinstance(data_type, NumericType):
+        numeric = raw.cast("double")
+        return F.when(raw.isNull() | F.isnan(numeric), F.lit(None).cast("double")).otherwise(numeric)
+    return F.lit(None).cast("double")
 
 
 def _tee_empty_events():
@@ -454,11 +478,41 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
         bc_name = f"{_TEE_PREFIX}BC_{spec['suffix']}"
         ac_value = _tee_normalized_spark_value(ac_name, schema_by_name)
         bc_value = _tee_normalized_spark_value(bc_name, schema_by_name)
-        disagreement = ac_value.isNotNull() & bc_value.isNotNull() & (ac_value != bc_value)
-        resolved = F.coalesce(ac_value, bc_value)
+        ac_numeric = _tee_numeric_spark_value(ac_name, schema_by_name)
+        bc_numeric = _tee_numeric_spark_value(bc_name, schema_by_name)
+        both_present = ac_value.isNotNull() & bc_value.isNotNull()
+        both_numeric = ac_numeric.isNotNull() & bc_numeric.isNotNull()
+        disagreement = both_present & F.when(
+            both_numeric,
+            F.abs(ac_numeric - bc_numeric) > F.lit(_TEE_CHANNEL_DISAGREEMENT_THRESHOLD),
+        ).otherwise(ac_value != bc_value)
+        canonical_endpoint = F.lit(None).cast("string")
+        if signal_key in _TEE_ENDPOINTS:
+            for endpoint in _TEE_ENDPOINTS[signal_key]:
+                endpoint_text = str(int(endpoint)) if float(endpoint).is_integer() else str(endpoint)
+                canonical_endpoint = F.coalesce(
+                    canonical_endpoint,
+                    F.when(ac_numeric == F.lit(endpoint), F.lit(endpoint_text)),
+                    F.when(bc_numeric == F.lit(endpoint), F.lit(endpoint_text)),
+                )
+            event_allowed = disagreement | canonical_endpoint.isNotNull()
+        else:
+            event_allowed = F.lit(True)
+        resolved = F.when(
+            canonical_endpoint.isNotNull() & ~disagreement,
+            canonical_endpoint,
+        ).otherwise(F.coalesce(ac_value, bc_value))
+        display_ac_value = F.when(
+            canonical_endpoint.isNotNull() & ~disagreement & ac_value.isNotNull(),
+            canonical_endpoint,
+        ).otherwise(ac_value)
+        display_bc_value = F.when(
+            canonical_endpoint.isNotNull() & ~disagreement & bc_value.isNotNull(),
+            canonical_endpoint,
+        ).otherwise(bc_value)
         state = (
             F.when(ac_value.isNull() & bc_value.isNull(), F.lit(None).cast("string"))
-            .when(disagreement, F.concat(F.lit("D|"), ac_value, F.lit("|"), bc_value))
+            .when(disagreement, F.lit("D"))
             .otherwise(F.concat(F.lit("V|"), resolved))
         )
         order_value = _TEE_SIGNAL_ORDER[signal_key]
@@ -466,11 +520,13 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
         ac_column = f"_TEEAC{order_value}"
         bc_column = f"_TEEBC{order_value}"
         disagreement_column = f"_TEEDisagreement{order_value}"
+        allowed_column = f"_TEEAllowed{order_value}"
         state_frame = (
             state_frame.withColumn(state_column, state)
-            .withColumn(ac_column, ac_value)
-            .withColumn(bc_column, bc_value)
+            .withColumn(ac_column, display_ac_value)
+            .withColumn(bc_column, display_bc_value)
             .withColumn(disagreement_column, disagreement)
+            .withColumn(allowed_column, event_allowed)
         )
         state_specs.append(
             {
@@ -480,6 +536,7 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
                 "ac": ac_column,
                 "bc": bc_column,
                 "disagreement": disagreement_column,
+                "allowed": allowed_column,
             }
         )
     history_window = (
@@ -512,7 +569,7 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
         current_state = F.col(state_spec["state"])
         previous_state = F.col(state_spec["previous_state"])
         previous_timestamp = F.col(state_spec["previous_timestamp"])
-        changed = current_state.isNotNull() & (
+        changed = current_state.isNotNull() & F.col(state_spec["allowed"]) & (
             previous_state.isNull()
             | (current_state != previous_state)
             | ((F.col("Timestamp").cast("double") - previous_timestamp.cast("double")) > _TEE_BREAK_SECONDS)
