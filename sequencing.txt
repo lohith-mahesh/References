@@ -460,7 +460,6 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
     join_condition = (
         (scan_alias["AircraftId"] == window_alias["AircraftId"])
         & (scan_alias["AssetIdentifier"].cast("string") == window_alias["EngineSerialNumber"])
-        & (scan_alias["StartDatetime"] == window_alias["StartDatetime"])
         & scan_alias["Timestamp"].between(window_alias["StartDatetime"], window_alias["EndDatetime"])
     )
     selected_expressions = [
@@ -480,6 +479,8 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
         bc_value = _tee_normalized_spark_value(bc_name, schema_by_name)
         ac_numeric = _tee_numeric_spark_value(ac_name, schema_by_name)
         bc_numeric = _tee_numeric_spark_value(bc_name, schema_by_name)
+        ac_rounded = F.round(ac_numeric, 0)
+        bc_rounded = F.round(bc_numeric, 0)
         both_present = ac_value.isNotNull() & bc_value.isNotNull()
         both_numeric = ac_numeric.isNotNull() & bc_numeric.isNotNull()
         disagreement = both_present & F.when(
@@ -492,8 +493,8 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
                 endpoint_text = str(int(endpoint)) if float(endpoint).is_integer() else str(endpoint)
                 canonical_endpoint = F.coalesce(
                     canonical_endpoint,
-                    F.when(ac_numeric == F.lit(endpoint), F.lit(endpoint_text)),
-                    F.when(bc_numeric == F.lit(endpoint), F.lit(endpoint_text)),
+                    F.when(ac_rounded == F.lit(endpoint), F.lit(endpoint_text)),
+                    F.when(bc_rounded == F.lit(endpoint), F.lit(endpoint_text)),
                 )
             event_allowed = disagreement | canonical_endpoint.isNotNull()
         else:
@@ -539,16 +540,27 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
                 "allowed": allowed_column,
             }
         )
+    visible_condition = F.col("Timestamp").between(
+        F.lit(view_start.to_pydatetime()),
+        F.lit(view_end.to_pydatetime()),
+    )
     history_window = (
         Window.partitionBy("EngineSerialNumber")
         .orderBy("Timestamp", "StartDatetime")
         .rowsBetween(Window.unboundedPreceding, -1)
     )
+    boundary_partition = Window.partitionBy("EngineSerialNumber")
     event_frame = state_frame
     for state_spec in state_specs:
         current_state = F.col(state_spec["state"])
         previous_state_column = f"_TEEPreviousState{state_spec['order']}"
         previous_timestamp_column = f"_TEEPreviousTimestamp{state_spec['order']}"
+        boundary_timestamp_column = f"_TEEBoundaryTimestamp{state_spec['order']}"
+        visible_eligible = (
+            current_state.isNotNull()
+            & F.col(state_spec["allowed"])
+            & visible_condition
+        )
         event_frame = (
             event_frame.withColumn(
                 previous_state_column,
@@ -561,33 +573,55 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
                     ignorenulls=True,
                 ).over(history_window),
             )
+            .withColumn(
+                boundary_timestamp_column,
+                F.min(
+                    F.when(visible_eligible, F.col("Timestamp"))
+                ).over(boundary_partition),
+            )
         )
         state_spec["previous_state"] = previous_state_column
         state_spec["previous_timestamp"] = previous_timestamp_column
+        state_spec["boundary_timestamp"] = boundary_timestamp_column
     changed_structs = []
+    eligible_structs = []
     for state_spec in state_specs:
         current_state = F.col(state_spec["state"])
         previous_state = F.col(state_spec["previous_state"])
         previous_timestamp = F.col(state_spec["previous_timestamp"])
-        changed = current_state.isNotNull() & F.col(state_spec["allowed"]) & (
+        eligible = current_state.isNotNull() & F.col(state_spec["allowed"])
+        changed = eligible & (
             previous_state.isNull()
             | (current_state != previous_state)
             | ((F.col("Timestamp").cast("double") - previous_timestamp.cast("double")) > _TEE_BREAK_SECONDS)
         )
-        changed_structs.append(
-            F.when(
-                changed,
-                F.struct(
-                    F.lit(state_spec["order"]).alias("SignalOrder"),
-                    F.lit(state_spec["key"]).alias("Signal"),
-                    F.col(state_spec["ac"]).alias("ACValue"),
-                    F.col(state_spec["bc"]).alias("BCValue"),
-                    F.col(state_spec["disagreement"]).alias("Disagreement"),
-                ),
-            )
+        event_struct = F.struct(
+            F.lit(state_spec["order"]).alias("SignalOrder"),
+            F.lit(state_spec["key"]).alias("Signal"),
+            F.col(state_spec["ac"]).alias("ACValue"),
+            F.col(state_spec["bc"]).alias("BCValue"),
+            F.col(state_spec["disagreement"]).alias("Disagreement"),
         )
+        changed_structs.append(F.when(changed, event_struct))
+        boundary = (
+            eligible
+            & visible_condition
+            & (F.col("Timestamp") == F.col(state_spec["boundary_timestamp"]))
+        )
+        eligible_structs.append(F.when(boundary, event_struct))
     changed_array = F.filter(F.array(*changed_structs), lambda item: item.isNotNull())
-    state_changes = (
+    eligible_array = F.filter(F.array(*eligible_structs), lambda item: item.isNotNull())
+    event_columns = [
+        "Timestamp",
+        "StartDatetime",
+        "EngineSerialNumber",
+        "SignalOrder",
+        "Signal",
+        "ACValue",
+        "BCValue",
+        "Disagreement",
+    ]
+    transition_events = (
         event_frame.select(
             "Timestamp",
             "StartDatetime",
@@ -604,7 +638,29 @@ def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
             F.col("Event.BCValue").alias("BCValue"),
             F.col("Event.Disagreement").alias("Disagreement"),
         )
-        .where(F.col("Timestamp").between(F.lit(view_start.to_pydatetime()), F.lit(view_end.to_pydatetime())))
+        .where(visible_condition)
+    )
+    boundary_events = (
+        event_frame.select(
+            "Timestamp",
+            "StartDatetime",
+            "EngineSerialNumber",
+            F.explode(eligible_array).alias("Event"),
+        )
+        .select(
+            "Timestamp",
+            "StartDatetime",
+            "EngineSerialNumber",
+            F.col("Event.SignalOrder").alias("SignalOrder"),
+            F.col("Event.Signal").alias("Signal"),
+            F.col("Event.ACValue").alias("ACValue"),
+            F.col("Event.BCValue").alias("BCValue"),
+            F.col("Event.Disagreement").alias("Disagreement"),
+        )
+    )
+    state_changes = (
+        transition_events.unionByName(boundary_events)
+        .dropDuplicates(event_columns)
         .orderBy("Timestamp", "SignalOrder", "EngineSerialNumber")
     )
     event_data = state_changes.limit(_TEE_MAX_WINDOW_EVENTS + 1).toPandas()
