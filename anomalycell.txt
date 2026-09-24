@@ -1,3 +1,4 @@
+import gc
 import math
 
 import numpy as np
@@ -27,6 +28,12 @@ FAST_ANOMALY_CONFIG = {
     "contextual_minimum_flights": 8,
     "contextual_minimum_z": 7.0,
     "contextual_minimum_raw_z": 4.0,
+    "screen_rows_per_phase": 500,
+    "screen_minimum_phase_samples": 30,
+    "screen_domain_budget": 24,
+    "deep_parameter_limit_small": 80,
+    "deep_parameter_limit_medium": 64,
+    "deep_parameter_limit_large": 48,
 }
 
 
@@ -46,62 +53,121 @@ def _fad_channel_signal(name):
 def _fad_scale(values, center=None):
     finite = np.asarray(values, dtype=float)
     finite = finite[np.isfinite(finite)]
-
     if finite.size == 0:
         return np.nan, np.nan
-
     if center is None:
         center = float(np.median(finite))
-
     mad = float(np.median(np.abs(finite - center))) * 1.4826
     q25, q75 = np.quantile(finite, [0.25, 0.75])
-
-    scale = max(
-        mad,
-        float(q75 - q25) / 1.349,
-        abs(center) * 1.0e-9,
-        1.0e-12,
-    )
-
+    scale = max(mad, float(q75 - q25) / 1.349, abs(center) * 1.0e-9, 1.0e-12)
     return float(center), float(scale)
 
 
 def _fad_bh(values):
     p_values = np.asarray(values, dtype=float)
-
     if p_values.size == 0:
         return np.array([], dtype=float)
-
     order = np.argsort(p_values)
     ranked = p_values[order]
-
-    adjusted = (
-        ranked
-        * len(ranked)
-        / np.arange(1, len(ranked) + 1)
-    )
-
-    adjusted = np.minimum.accumulate(
-        adjusted[::-1]
-    )[::-1]
-
+    adjusted = ranked * len(ranked) / np.arange(1, len(ranked) + 1)
+    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
     result = np.empty_like(adjusted)
     result[order] = np.minimum(adjusted, 1.0)
-
     return result
 
 
-def _fad_episode_table(
-    events,
-    gap_seconds,
-    minimum_samples,
-    minimum_seconds,
-    catastrophic_z,
-):
+def _fad_rank(values):
+    values = np.asarray(values, dtype=float)
+    order = np.argsort(values, kind="stable")
+    ranks = np.empty(len(values), dtype=float)
+    ranks[order] = np.arange(len(values), dtype=float)
+    return ranks
+
+
+def _fad_screen_parameter(values, phases, starts):
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    coverage = float(finite.mean())
+    if finite.sum() < FAST_ANOMALY_CONFIG["screen_minimum_phase_samples"]:
+        return {
+            "Score": -np.inf,
+            "Coverage": coverage,
+            "Distinct": int(np.unique(values[finite]).size),
+            "ExtremeZ": 0.0,
+            "RareStateScore": 0.0,
+            "DriftScore": 0.0,
+            "PhaseContrast": 0.0,
+        }
+    distinct = int(np.unique(values[finite]).size)
+    extreme_z = 0.0
+    rare_score = 0.0
+    drift_score = 0.0
+    phase_centers = []
+    phase_scales = []
+    for phase in np.unique(phases[np.isfinite(phases)]):
+        mask = (phases == phase) & finite
+        phase_values = values[mask]
+        if phase_values.size < FAST_ANOMALY_CONFIG["screen_minimum_phase_samples"]:
+            continue
+        center, scale = _fad_scale(phase_values)
+        unique_values, counts = np.unique(phase_values, return_counts=True)
+        phase_centers.append(center)
+        phase_scales.append(scale)
+        if len(unique_values) <= FAST_ANOMALY_CONFIG["maximum_discrete_values"]:
+            frequencies = counts / counts.sum()
+            minimum_frequency = float(frequencies.min())
+            if minimum_frequency <= 0.02:
+                rare_score = max(rare_score, min(12.0, -math.log10(max(minimum_frequency, 1.0e-12)) * 2.0))
+        else:
+            z = np.abs(phase_values - center) / scale
+            extreme_z = max(extreme_z, float(np.quantile(z, 0.999)))
+        phase_frame = pd.DataFrame(
+            {
+                "StartDatetime": starts[mask],
+                "Value": phase_values,
+            }
+        )
+        flight_values = (
+            phase_frame.groupby("StartDatetime", sort=True)["Value"]
+            .median()
+            .dropna()
+        )
+        if len(flight_values) >= FAST_ANOMALY_CONFIG["minimum_trend_flights"]:
+            x = np.arange(len(flight_values), dtype=float)
+            y = flight_values.to_numpy(dtype=float)
+            rho = float(np.corrcoef(_fad_rank(x), _fad_rank(y))[0, 1])
+            if np.isfinite(rho):
+                effect = abs(float(y[-1] - y[0])) / scale
+                drift_score = max(drift_score, min(12.0, abs(rho) * effect))
+    phase_contrast = 0.0
+    if len(phase_centers) >= 2:
+        phase_contrast = min(
+            6.0,
+            float(np.ptp(phase_centers)) / max(float(np.median(phase_scales)), 1.0e-12),
+        )
+    variability_score = min(4.0, math.log1p(distinct) / 2.0)
+    score = (
+        min(extreme_z, 20.0)
+        + rare_score
+        + drift_score
+        + 0.25 * phase_contrast
+        + variability_score
+    ) * min(1.0, coverage / 0.20)
+    return {
+        "Score": float(score),
+        "Coverage": coverage,
+        "Distinct": distinct,
+        "ExtremeZ": float(extreme_z),
+        "RareStateScore": float(rare_score),
+        "DriftScore": float(drift_score),
+        "PhaseContrast": float(phase_contrast),
+    }
+
+
+def _fad_episode_table(events, gap_seconds, minimum_samples, minimum_seconds, catastrophic_z):
     if events.empty:
         empty = events.copy()
         empty["EpisodeId"] = pd.Series(dtype="int64")
-
         return empty, pd.DataFrame(
             columns=[
                 "StartDatetime",
@@ -120,61 +186,17 @@ def _fad_episode_table(
                 "AttributionConfidence",
             ]
         )
-
-    key_columns = [
-        "StartDatetime",
-        "FlightPhase",
-        "Parameter",
-    ]
-
-    events = (
-        events.sort_values(
-            key_columns + ["Timestamp"],
-            kind="stable",
-        )
-        .reset_index(drop=True)
-    )
-
-    same_key = np.ones(
-        len(events),
-        dtype=bool,
-    )
-
+    key_columns = ["StartDatetime", "FlightPhase", "Parameter"]
+    events = events.sort_values(key_columns + ["Timestamp"], kind="stable").reset_index(drop=True)
+    same_key = np.ones(len(events), dtype=bool)
     for column in key_columns:
-        same_key &= (
-            events[column]
-            .eq(events[column].shift())
-            .to_numpy()
-        )
-
-    time_gap = (
-        events["Timestamp"]
-        .diff()
-        .dt.total_seconds()
-        .to_numpy()
-    )
-
-    new_episode = (
-        ~same_key
-        | ~np.isfinite(time_gap)
-        | (time_gap > gap_seconds)
-    )
-
-    events["EpisodeId"] = (
-        np.cumsum(new_episode)
-        .astype(np.int64)
-    )
-
+        same_key &= events[column].eq(events[column].shift()).to_numpy()
+    time_gap = events["Timestamp"].diff().dt.total_seconds().to_numpy()
+    new_episode = ~same_key | ~np.isfinite(time_gap) | (time_gap > gap_seconds)
+    events["EpisodeId"] = np.cumsum(new_episode).astype(np.int64)
     episodes = (
         events.groupby(
-            [
-                "StartDatetime",
-                "FlightPhase",
-                "Parameter",
-                "Signal",
-                "Channel",
-                "EpisodeId",
-            ],
+            ["StartDatetime", "FlightPhase", "Parameter", "Signal", "Channel", "EpisodeId"],
             dropna=False,
             sort=False,
         )
@@ -184,815 +206,559 @@ def _fad_episode_table(
             AnomalousSamples=("Timestamp", "size"),
             MaxScore=("Score", "max"),
             MeanScore=("Score", "mean"),
-            AnomalyType=(
-                "AnomalyType",
-                lambda values: "+".join(
-                    sorted(set(values))
-                ),
-            ),
-            AttributionConfidence=(
-                "AttributionConfidence",
-                "max",
-            ),
+            AnomalyType=("AnomalyType", lambda values: "+".join(sorted(set(values)))),
+            AttributionConfidence=("AttributionConfidence", "max"),
         )
         .reset_index()
     )
-
     episodes["DurationSeconds"] = (
-        episodes["EpisodeEnd"]
-        - episodes["EpisodeStart"]
+        episodes["EpisodeEnd"] - episodes["EpisodeStart"]
     ).dt.total_seconds()
-
     episodes = episodes.loc[
-        (
-            episodes["AnomalousSamples"]
-            >= minimum_samples
-        )
-        | (
-            episodes["DurationSeconds"]
-            >= minimum_seconds
-        )
-        | (
-            episodes["MaxScore"]
-            >= catastrophic_z
-        )
+        (episodes["AnomalousSamples"] >= minimum_samples)
+        | (episodes["DurationSeconds"] >= minimum_seconds)
+        | (episodes["MaxScore"] >= catastrophic_z)
     ].reset_index(drop=True)
-
-    confirmed_ids = set(
-        episodes["EpisodeId"].tolist()
-    )
-
-    samples = events.loc[
-        events["EpisodeId"].isin(
-            confirmed_ids
-        )
-    ].reset_index(drop=True)
-
+    confirmed_ids = set(episodes["EpisodeId"].tolist())
+    samples = events.loc[events["EpisodeId"].isin(confirmed_ids)].reset_index(drop=True)
     return samples, episodes
 
 
-if (
-    "_data_df" not in globals()
-    or not isinstance(_data_df, pd.DataFrame)
-):
-    raise RuntimeError(
-        "Run the notebook through the Pandas "
-        "materialization cell before this cell."
-    )
+if "_data_df" not in globals() or not isinstance(_data_df, pd.DataFrame):
+    raise RuntimeError("Run the notebook through the Pandas materialization cell before this cell.")
 
-required_metadata = [
-    "Timestamp",
-    "StartDatetime",
-] + list(
-    FLIGHT_PHASE_COLUMNS.values()
-)
-
-missing_metadata = [
-    column
-    for column in required_metadata
-    if column not in _data_df.columns
-]
-
+required_metadata = ["Timestamp", "StartDatetime"] + list(FLIGHT_PHASE_COLUMNS.values())
+missing_metadata = [column for column in required_metadata if column not in _data_df.columns]
 if missing_metadata:
-    raise RuntimeError(
-        f"Required anomaly-analysis columns "
-        f"are missing: {missing_metadata}"
+    raise RuntimeError(f"Required anomaly-analysis columns are missing: {missing_metadata}")
+
+if "cda" in globals() and hasattr(cda, "schema"):
+    from pyspark.sql.types import BooleanType, NumericType
+
+    def _fad_qcol(name):
+        return F.col(f"`{name.replace('`', '``')}`")
+
+    all_candidate_parameters = [
+        field.name
+        for field in cda.schema.fields
+        if field.name.startswith(PARAMETER_PREFIX)
+        and isinstance(field.dataType, (NumericType, BooleanType))
+        and field.name not in set(FLIGHT_PHASE_COLUMNS.values())
+    ]
+
+    if not all_candidate_parameters:
+        raise RuntimeError("No numeric or Boolean engine parameters were found in cda.")
+
+    phase_ac_expression = _fad_qcol(FLIGHT_PHASE_COLUMNS["AC"]).cast("double")
+    phase_bc_expression = _fad_qcol(FLIGHT_PHASE_COLUMNS["BC"]).cast("double")
+    phase_disagreement_expression = (
+        phase_ac_expression.isNotNull()
+        & phase_bc_expression.isNotNull()
+        & (phase_ac_expression != phase_bc_expression)
+    )
+    screen_phase_expression = F.when(
+        ~phase_disagreement_expression,
+        F.coalesce(phase_ac_expression, phase_bc_expression),
     )
 
-analysis_parameters = [
-    column
-    for column in PARAMETER_COLUMNS
-    if column in _data_df.columns
-    and column
-    not in set(
-        FLIGHT_PHASE_COLUMNS.values()
+    phase_counts = (
+        cda.select(screen_phase_expression.alias("_ScreenPhase"))
+        .where(F.col("_ScreenPhase").isNotNull())
+        .groupBy("_ScreenPhase")
+        .count()
+        .collect()
     )
-]
+
+    if not phase_counts:
+        raise RuntimeError("No usable FlightPhase values are available for parameter screening.")
+
+    screen_fractions = {
+        float(row._ScreenPhase): min(
+            1.0,
+            1.25
+            * FAST_ANOMALY_CONFIG["screen_rows_per_phase"]
+            / max(int(row["count"]), 1),
+        )
+        for row in phase_counts
+    }
+
+    screen_projection = [
+        _fad_qcol("Timestamp").alias("Timestamp"),
+        _fad_qcol("StartDatetime").alias("StartDatetime"),
+        screen_phase_expression.alias("_ScreenPhase"),
+    ] + [
+        _fad_qcol(column).alias(column)
+        for column in all_candidate_parameters
+    ]
+
+    screen_pdf = (
+        cda.select(*screen_projection)
+        .where(F.col("_ScreenPhase").isNotNull())
+        .sampleBy("_ScreenPhase", fractions=screen_fractions, seed=1701)
+        .toPandas()
+    )
+
+    if screen_pdf.empty:
+        raise RuntimeError("The stratified parameter-screening sample is empty.")
+
+    screen_pdf["Timestamp"] = pd.to_datetime(screen_pdf["Timestamp"], errors="coerce")
+    screen_pdf["StartDatetime"] = pd.to_datetime(
+        screen_pdf["StartDatetime"], errors="coerce"
+    )
+    screen_phases = pd.to_numeric(
+        screen_pdf["_ScreenPhase"], errors="coerce"
+    ).to_numpy(dtype=float)
+    screen_starts = screen_pdf["StartDatetime"].to_numpy()
+    screening_records = []
+
+    print(
+        f"Screening {len(all_candidate_parameters):,} parameters using "
+        f"{len(screen_pdf):,} phase-stratified samples"
+    )
+
+    for parameter_index, parameter in enumerate(all_candidate_parameters, start=1):
+        screen_values = pd.to_numeric(
+            screen_pdf[parameter], errors="coerce"
+        ).to_numpy(dtype=float)
+        metrics = _fad_screen_parameter(
+            screen_values,
+            screen_phases,
+            screen_starts,
+        )
+        channel, signal = _fad_channel_signal(parameter)
+        screening_records.append(
+            {
+                "Parameter": parameter,
+                "Signal": signal,
+                "Channel": channel,
+                "PairScore": 0.0,
+                **metrics,
+            }
+        )
+        if parameter_index % 500 == 0 or parameter_index == len(all_candidate_parameters):
+            print(
+                f"Screened {parameter_index:,} of "
+                f"{len(all_candidate_parameters):,} parameters"
+            )
+
+    screening_lookup = {
+        record["Parameter"]: record
+        for record in screening_records
+    }
+    screening_pairs = {}
+    for parameter in all_candidate_parameters:
+        channel, signal = _fad_channel_signal(parameter)
+        if channel in CHANNELS:
+            screening_pairs.setdefault(signal, {})[channel] = parameter
+
+    for signal, members in screening_pairs.items():
+        if not all(channel in members for channel in CHANNELS):
+            continue
+        ac_parameter = members["AC"]
+        bc_parameter = members["BC"]
+        ac_values = pd.to_numeric(
+            screen_pdf[ac_parameter], errors="coerce"
+        ).to_numpy(dtype=float)
+        bc_values = pd.to_numeric(
+            screen_pdf[bc_parameter], errors="coerce"
+        ).to_numpy(dtype=float)
+        pair_metrics = _fad_screen_parameter(
+            ac_values - bc_values,
+            screen_phases,
+            screen_starts,
+        )
+        pair_score = max(
+            0.0,
+            pair_metrics["ExtremeZ"]
+            + pair_metrics["RareStateScore"]
+            + pair_metrics["DriftScore"],
+        )
+        for parameter in (ac_parameter, bc_parameter):
+            screening_lookup[parameter]["PairScore"] = pair_score
+            screening_lookup[parameter]["Score"] += pair_score
+
+    parameter_reduction_df = pd.DataFrame(screening_records)
+    parameter_reduction_df = parameter_reduction_df.replace(
+        [np.inf, -np.inf], np.nan
+    )
+    parameter_reduction_df["Score"] = parameter_reduction_df["Score"].fillna(-1.0e12)
+    parameter_reduction_df = parameter_reduction_df.sort_values(
+        ["Score", "Coverage", "Distinct"],
+        ascending=[False, False, False],
+        kind="stable",
+    ).reset_index(drop=True)
+    parameter_reduction_df["ScreenRank"] = np.arange(
+        1, len(parameter_reduction_df) + 1
+    )
+
+    materialized_row_count = len(_data_df)
+    if materialized_row_count > 750_000:
+        deep_parameter_limit = FAST_ANOMALY_CONFIG["deep_parameter_limit_large"]
+    elif materialized_row_count > 300_000:
+        deep_parameter_limit = FAST_ANOMALY_CONFIG["deep_parameter_limit_medium"]
+    else:
+        deep_parameter_limit = FAST_ANOMALY_CONFIG["deep_parameter_limit_small"]
+
+    selected_short_names = globals().get("selected_parameters", [])
+    forced_parameters = []
+    for short_name in selected_short_names:
+        full_name = (
+            short_name
+            if str(short_name).startswith(PARAMETER_PREFIX)
+            else PARAMETER_PREFIX + str(short_name)
+        )
+        if full_name in screening_lookup and full_name not in forced_parameters:
+            forced_parameters.append(full_name)
+
+    for column in globals().get("CONTEXT_COLUMNS", []):
+        if column in screening_lookup and column not in forced_parameters:
+            forced_parameters.append(column)
+
+    domain_ranked = [
+        parameter
+        for parameter in parameter_reduction_df["Parameter"]
+        if parameter in set(PARAMETER_COLUMNS)
+        and parameter not in forced_parameters
+    ]
+    global_ranked = parameter_reduction_df["Parameter"].tolist()
+    deep_parameters = []
+    selection_reasons = {}
+
+    def _fad_add_parameter(parameter, reason):
+        if (
+            parameter in screening_lookup
+            and parameter not in deep_parameters
+            and len(deep_parameters) < deep_parameter_limit
+        ):
+            deep_parameters.append(parameter)
+            selection_reasons[parameter] = reason
+
+    for parameter in forced_parameters:
+        _fad_add_parameter(parameter, "FORCED_INPUT")
+
+    for parameter in domain_ranked[: FAST_ANOMALY_CONFIG["screen_domain_budget"]]:
+        _fad_add_parameter(parameter, "DOMAIN_BUDGET")
+
+    for parameter in list(deep_parameters):
+        channel, signal = _fad_channel_signal(parameter)
+        if channel in CHANNELS:
+            members = screening_pairs.get(signal, {})
+            peer_channel = "BC" if channel == "AC" else "AC"
+            peer_parameter = members.get(peer_channel)
+            if peer_parameter is not None:
+                _fad_add_parameter(peer_parameter, "PAIRED_CHANNEL")
+
+    for parameter in global_ranked:
+        before_count = len(deep_parameters)
+        _fad_add_parameter(parameter, "GLOBAL_SCREEN")
+        if len(deep_parameters) > before_count:
+            channel, signal = _fad_channel_signal(parameter)
+            if channel in CHANNELS:
+                members = screening_pairs.get(signal, {})
+                peer_channel = "BC" if channel == "AC" else "AC"
+                peer_parameter = members.get(peer_channel)
+                if peer_parameter is not None:
+                    _fad_add_parameter(peer_parameter, "PAIRED_CHANNEL")
+        if len(deep_parameters) >= deep_parameter_limit:
+            break
+
+    if not deep_parameters:
+        raise RuntimeError("Parameter reduction did not select any deep-analysis parameters.")
+
+    parameter_reduction_df["Selected"] = parameter_reduction_df["Parameter"].isin(
+        deep_parameters
+    )
+    parameter_reduction_df["SelectionReason"] = parameter_reduction_df["Parameter"].map(
+        selection_reasons
+    )
+
+    deep_columns = list(
+        dict.fromkeys(required_metadata + deep_parameters)
+    )
+    if all(column in _data_df.columns for column in deep_columns):
+        deep_data_df = _data_df[deep_columns].copy()
+    else:
+        deep_data_df = cda.select(
+            *[_fad_qcol(column).alias(column) for column in deep_columns]
+        ).toPandas()
+
+    print(
+        f"Parameter reduction selected {len(deep_parameters):,} of "
+        f"{len(all_candidate_parameters):,} parameters for full-resolution analysis"
+    )
+    del screen_pdf
+    gc.collect()
+else:
+    deep_parameters = [
+        column
+        for column in PARAMETER_COLUMNS
+        if column in _data_df.columns
+        and column not in set(FLIGHT_PHASE_COLUMNS.values())
+    ]
+    deep_data_df = _data_df
+    parameter_reduction_df = pd.DataFrame(
+        {
+            "Parameter": deep_parameters,
+            "Selected": True,
+            "SelectionReason": "PREMATERIALIZED_TEST",
+        }
+    )
+
+analysis_parameters = list(deep_parameters)
 
 if not analysis_parameters:
-    raise RuntimeError(
-        "No materialized numeric or Boolean "
-        "parameters are available for analysis."
-    )
+    raise RuntimeError("No parameters are available for full-resolution anomaly analysis.")
 
 metadata = pd.DataFrame(
     {
-        "Timestamp": pd.to_datetime(
-            _data_df["Timestamp"],
-            errors="coerce",
-        ),
-        "StartDatetime": pd.to_datetime(
-            _data_df["StartDatetime"],
-            errors="coerce",
-        ),
+        "Timestamp": pd.to_datetime(deep_data_df["Timestamp"], errors="coerce"),
+        "StartDatetime": pd.to_datetime(deep_data_df["StartDatetime"], errors="coerce"),
         "ACFlightPhase": pd.to_numeric(
-            _data_df[
-                FLIGHT_PHASE_COLUMNS["AC"]
-            ],
-            errors="coerce",
+            deep_data_df[FLIGHT_PHASE_COLUMNS["AC"]], errors="coerce"
         ),
         "BCFlightPhase": pd.to_numeric(
-            _data_df[
-                FLIGHT_PHASE_COLUMNS["BC"]
-            ],
-            errors="coerce",
+            deep_data_df[FLIGHT_PHASE_COLUMNS["BC"]], errors="coerce"
         ),
-        "_source_position": np.arange(
-            len(_data_df),
-            dtype=np.int64,
-        ),
+        "_source_position": np.arange(len(deep_data_df), dtype=np.int64),
     }
 )
 
-metadata = metadata.dropna(
-    subset=[
-        "Timestamp",
-        "StartDatetime",
-    ]
-)
-
-metadata = (
-    metadata.sort_values(
-        [
-            "StartDatetime",
-            "Timestamp",
-        ],
-        kind="stable",
-    )
-    .reset_index(drop=True)
-)
-
-source_positions = metadata[
-    "_source_position"
-].to_numpy(dtype=np.int64)
+metadata = metadata.dropna(subset=["Timestamp", "StartDatetime"])
+metadata = metadata.sort_values(["StartDatetime", "Timestamp"], kind="stable").reset_index(drop=True)
+source_positions = metadata["_source_position"].to_numpy(dtype=np.int64)
 
 phase_disagreement = (
     metadata["ACFlightPhase"].notna()
     & metadata["BCFlightPhase"].notna()
-    & metadata["ACFlightPhase"].ne(
-        metadata["BCFlightPhase"]
-    )
+    & metadata["ACFlightPhase"].ne(metadata["BCFlightPhase"])
 ).to_numpy()
 
-metadata["FlightPhase"] = (
-    metadata["ACFlightPhase"]
-    .combine_first(
-        metadata["BCFlightPhase"]
-    )
-)
+metadata["FlightPhase"] = metadata["ACFlightPhase"].combine_first(metadata["BCFlightPhase"])
+metadata.loc[phase_disagreement, "FlightPhase"] = np.nan
 
-metadata.loc[
-    phase_disagreement,
-    "FlightPhase",
-] = np.nan
+same_flight = metadata["StartDatetime"].eq(metadata["StartDatetime"].shift()).to_numpy()
+phase_values = metadata["FlightPhase"].to_numpy(dtype=float)
+previous_phase = np.roll(phase_values, 1)
+phase_equal = np.isclose(phase_values, previous_phase, equal_nan=True)
+phase_change = ~same_flight | ~phase_equal
+phase_run = np.cumsum(phase_change).astype(np.int64)
 
-same_flight = (
-    metadata["StartDatetime"]
-    .eq(
-        metadata[
-            "StartDatetime"
-        ].shift()
-    )
-    .to_numpy()
-)
+timestamp_ns = metadata["Timestamp"].astype("int64").to_numpy()
+boundary_ns = int(FAST_ANOMALY_CONFIG["transition_boundary_seconds"] * 1_000_000_000)
+near_boundary = np.zeros(len(metadata), dtype=bool)
 
-phase_values = metadata[
-    "FlightPhase"
-].to_numpy(dtype=float)
-
-previous_phase = np.roll(
-    phase_values,
-    1,
-)
-
-phase_equal = np.isclose(
-    phase_values,
-    previous_phase,
-    equal_nan=True,
-)
-
-phase_change = (
-    ~same_flight
-    | ~phase_equal
-)
-
-phase_run = np.cumsum(
-    phase_change
-).astype(np.int64)
-
-timestamp_ns = (
-    metadata["Timestamp"]
-    .astype("int64")
-    .to_numpy()
-)
-
-boundary_ns = int(
-    FAST_ANOMALY_CONFIG[
-        "transition_boundary_seconds"
-    ]
-    * 1_000_000_000
-)
-
-near_boundary = np.zeros(
-    len(metadata),
-    dtype=bool,
-)
-
-for _, positions in (
-    metadata.groupby(
-        "StartDatetime",
-        sort=False,
-    ).indices.items()
-):
-    positions = np.asarray(
-        positions,
-        dtype=np.int64,
-    )
-
-    change_positions = positions[
-        phase_change[positions]
-    ]
-
+for _, positions in metadata.groupby("StartDatetime", sort=False).indices.items():
+    positions = np.asarray(positions, dtype=np.int64)
+    change_positions = positions[phase_change[positions]]
     if change_positions.size == 0:
         continue
-
-    change_times = timestamp_ns[
-        change_positions
-    ]
-
-    insertion = np.searchsorted(
-        change_times,
-        timestamp_ns[positions],
-    )
-
-    left = np.clip(
-        insertion - 1,
-        0,
-        len(change_times) - 1,
-    )
-
-    right = np.clip(
-        insertion,
-        0,
-        len(change_times) - 1,
-    )
-
+    change_times = timestamp_ns[change_positions]
+    insertion = np.searchsorted(change_times, timestamp_ns[positions])
+    left = np.clip(insertion - 1, 0, len(change_times) - 1)
+    right = np.clip(insertion, 0, len(change_times) - 1)
     distance = np.minimum(
-        np.abs(
-            timestamp_ns[positions]
-            - change_times[left]
-        ),
-        np.abs(
-            timestamp_ns[positions]
-            - change_times[right]
-        ),
+        np.abs(timestamp_ns[positions] - change_times[left]),
+        np.abs(timestamp_ns[positions] - change_times[right]),
+    )
+    near_boundary[positions] = distance <= boundary_ns
+
+base_eligible = np.isfinite(phase_values) & ~phase_disagreement
+eligible = base_eligible & ~near_boundary
+boundary_fallback_phases = []
+
+for phase in np.unique(phase_values[base_eligible]):
+    phase_base = base_eligible & (phase_values == phase)
+    phase_retained = eligible & (phase_values == phase)
+    if (
+        phase_retained.sum() < FAST_ANOMALY_CONFIG["minimum_phase_samples"]
+        and phase_base.sum() >= FAST_ANOMALY_CONFIG["minimum_phase_samples"]
+    ):
+        eligible[phase_base] = True
+        boundary_fallback_phases.append(float(phase))
+
+if not eligible.any():
+    ac_populated = int(metadata["ACFlightPhase"].notna().sum())
+    bc_populated = int(metadata["BCFlightPhase"].notna().sum())
+    disagreement_count = int(phase_disagreement.sum())
+    raise RuntimeError(
+        "No usable FlightPhase samples remain for anomaly analysis. "
+        f"AC populated={ac_populated:,}, BC populated={bc_populated:,}, "
+        f"AC/BC disagreements={disagreement_count:,}."
     )
 
-    near_boundary[positions] = (
-        distance <= boundary_ns
-    )
-
-eligible = (
-    np.isfinite(phase_values)
-    & ~phase_disagreement
-    & ~near_boundary
-)
-
-previous_timestamp_ns = np.roll(
-    timestamp_ns,
-    1,
-)
-
-sample_interval = (
-    timestamp_ns
-    - previous_timestamp_ns
-) / 1_000_000_000.0
-
-valid_interval = (
-    same_flight
-    & (sample_interval > 0)
-    & (sample_interval <= 60)
-)
-
+previous_timestamp_ns = np.roll(timestamp_ns, 1)
+sample_interval = (timestamp_ns - previous_timestamp_ns) / 1_000_000_000.0
+valid_interval = same_flight & (sample_interval > 0) & (sample_interval <= 60)
 observed_cadence_seconds = (
-    float(
-        np.median(
-            sample_interval[
-                valid_interval
-            ]
-        )
-    )
+    float(np.median(sample_interval[valid_interval]))
     if valid_interval.any()
     else 1.0
 )
-
-episode_gap_seconds = min(
-    60.0,
-    max(
-        5.0,
-        3.0
-        * observed_cadence_seconds,
-    ),
-)
+episode_gap_seconds = min(60.0, max(5.0, 3.0 * observed_cadence_seconds))
 
 phase_indices = {
-    float(phase): np.flatnonzero(
-        eligible
-        & (
-            phase_values
-            == phase
-        )
-    )
-    for phase in np.unique(
-        phase_values[eligible]
-    )
+    float(phase): np.flatnonzero(eligible & (phase_values == phase))
+    for phase in np.unique(phase_values[eligible])
 }
 
-group_frame = metadata.loc[
-    eligible,
-    [
-        "StartDatetime",
-        "FlightPhase",
-    ],
-]
-
-group_index = pd.MultiIndex.from_frame(
-    group_frame
-)
-
-group_codes, group_keys = (
-    pd.factorize(
-        group_index,
-        sort=True,
-    )
-)
+group_frame = metadata.loc[eligible, ["StartDatetime", "FlightPhase"]]
+group_index = pd.MultiIndex.from_frame(group_frame)
+group_codes, group_keys = pd.factorize(group_index, sort=True)
 
 raw_event_frames = []
 flight_phase_median_records = []
 parameter_baselines = {}
 
 print(
-    f"Fast anomaly analysis: "
-    f"{len(metadata):,} samples | "
+    f"Fast anomaly analysis: {len(metadata):,} samples | "
     f"{len(analysis_parameters):,} parameters | "
     f"{len(phase_indices):,} FlightPhase modes | "
-    f"median cadence "
-    f"{observed_cadence_seconds:.6g}s"
+    f"median cadence {observed_cadence_seconds:.6g}s"
 )
 
-for parameter_index, parameter in enumerate(
-    analysis_parameters,
-    start=1,
-):
-    values = (
-        pd.to_numeric(
-            _data_df[parameter],
-            errors="coerce",
-        )
-        .to_numpy(dtype=float)[
-            source_positions
-        ]
+if boundary_fallback_phases:
+    print(
+        "Transition-boundary suppression was relaxed for under-populated phases: "
+        + ", ".join(f"{phase:g}" for phase in boundary_fallback_phases)
     )
 
-    amplitude_z = np.zeros(
-        len(metadata),
-        dtype=np.float32,
-    )
-
-    rate_z = np.zeros(
-        len(metadata),
-        dtype=np.float32,
-    )
-
-    amplitude_flag = np.zeros(
-        len(metadata),
-        dtype=bool,
-    )
-
-    rate_flag = np.zeros(
-        len(metadata),
-        dtype=bool,
-    )
-
-    dropout_flag = np.zeros(
-        len(metadata),
-        dtype=bool,
-    )
-
+for parameter_index, parameter in enumerate(analysis_parameters, start=1):
+    values = pd.to_numeric(deep_data_df[parameter], errors="coerce").to_numpy(dtype=float)[source_positions]
+    amplitude_z = np.zeros(len(metadata), dtype=np.float32)
+    rate_z = np.zeros(len(metadata), dtype=np.float32)
+    amplitude_flag = np.zeros(len(metadata), dtype=bool)
+    rate_flag = np.zeros(len(metadata), dtype=bool)
+    dropout_flag = np.zeros(len(metadata), dtype=bool)
     baselines = {}
 
-    previous_values = np.roll(
-        values,
-        1,
-    )
-
-    same_run = (
-        same_flight
-        & (
-            phase_run
-            == np.roll(
-                phase_run,
-                1,
-            )
-        )
-    )
-
+    previous_values = np.roll(values, 1)
+    same_run = same_flight & (phase_run == np.roll(phase_run, 1))
     rate_valid = (
         eligible
         & same_run
         & np.isfinite(values)
-        & np.isfinite(
-            previous_values
-        )
+        & np.isfinite(previous_values)
         & (sample_interval > 0)
-        & (
-            sample_interval
-            <= FAST_ANOMALY_CONFIG[
-                "maximum_rate_gap_seconds"
-            ]
-        )
+        & (sample_interval <= FAST_ANOMALY_CONFIG["maximum_rate_gap_seconds"])
     )
-
-    rates = np.full(
-        len(metadata),
-        np.nan,
-        dtype=float,
-    )
-
+    rates = np.full(len(metadata), np.nan, dtype=float)
     rates[rate_valid] = (
-        values[rate_valid]
-        - previous_values[rate_valid]
+        values[rate_valid] - previous_values[rate_valid]
     ) / sample_interval[rate_valid]
 
-    for phase, indices in (
-        phase_indices.items()
-    ):
+    for phase, indices in phase_indices.items():
         phase_data = values[indices]
-
-        finite_mask = np.isfinite(
-            phase_data
-        )
-
-        finite_values = phase_data[
-            finite_mask
-        ]
-
-        if (
-            finite_values.size
-            < FAST_ANOMALY_CONFIG[
-                "minimum_phase_samples"
-            ]
-        ):
+        finite_mask = np.isfinite(phase_data)
+        finite_values = phase_data[finite_mask]
+        if finite_values.size < FAST_ANOMALY_CONFIG["minimum_phase_samples"]:
             continue
 
-        center, scale = _fad_scale(
-            finite_values
-        )
-
-        distinct_values, distinct_counts = (
-            np.unique(
-                finite_values,
-                return_counts=True,
-            )
-        )
-
-        is_discrete = (
-            len(distinct_values)
-            <= FAST_ANOMALY_CONFIG[
-                "maximum_discrete_values"
-            ]
-        )
-
+        center, scale = _fad_scale(finite_values)
+        distinct_values, distinct_counts = np.unique(finite_values, return_counts=True)
+        is_discrete = len(distinct_values) <= FAST_ANOMALY_CONFIG["maximum_discrete_values"]
         baselines[phase] = {
             "center": center,
             "scale": scale,
             "discrete": is_discrete,
-            "coverage": float(
-                finite_values.size
-                / len(indices)
-            ),
+            "coverage": float(finite_values.size / len(indices)),
         }
 
-        local_z = np.zeros(
-            len(indices),
-            dtype=float,
-        )
-
-        local_z[finite_mask] = (
-            np.abs(
-                finite_values
-                - center
-            )
-            / scale
-        )
-
-        amplitude_z[indices] = (
-            np.minimum(
-                local_z,
-                100.0,
-            )
-            .astype(np.float32)
-        )
+        local_z = np.zeros(len(indices), dtype=float)
+        local_z[finite_mask] = np.abs(finite_values - center) / scale
+        amplitude_z[indices] = np.minimum(local_z, 100.0).astype(np.float32)
 
         if is_discrete:
-            frequencies = (
-                distinct_counts
-                / distinct_counts.sum()
-            )
-
-            rare_values = (
-                distinct_values[
-                    frequencies
-                    <= FAST_ANOMALY_CONFIG[
-                        "rare_discrete_fraction"
-                    ]
-                ]
-            )
-
-            local_flag = (
-                finite_mask
-                & np.isin(
-                    phase_data,
-                    rare_values,
-                )
-            )
+            frequencies = distinct_counts / distinct_counts.sum()
+            rare_values = distinct_values[
+                frequencies <= FAST_ANOMALY_CONFIG["rare_discrete_fraction"]
+            ]
+            local_flag = finite_mask & np.isin(phase_data, rare_values)
         else:
             tail_probability = max(
-                FAST_ANOMALY_CONFIG[
-                    "tail_probability"
-                ],
+                FAST_ANOMALY_CONFIG["tail_probability"],
                 min(
                     0.01,
-                    FAST_ANOMALY_CONFIG[
-                        "minimum_tail_observations"
-                    ]
-                    / finite_values.size,
+                    FAST_ANOMALY_CONFIG["minimum_tail_observations"] / finite_values.size,
                 ),
             )
-
             lower, upper = np.quantile(
                 finite_values,
-                [
-                    tail_probability,
-                    1.0
-                    - tail_probability,
-                ],
+                [tail_probability, 1.0 - tail_probability],
+            )
+            local_flag = finite_mask & (
+                ((phase_data < lower) | (phase_data > upper))
+                & (local_z >= FAST_ANOMALY_CONFIG["minimum_amplitude_z"])
+                | (local_z >= FAST_ANOMALY_CONFIG["catastrophic_z"])
             )
 
-            local_flag = (
-                finite_mask
-                & (
-                    (
-                        (
-                            phase_data
-                            < lower
-                        )
-                        | (
-                            phase_data
-                            > upper
-                        )
-                    )
-                    & (
-                        local_z
-                        >= FAST_ANOMALY_CONFIG[
-                            "minimum_amplitude_z"
-                        ]
-                    )
-                    | (
-                        local_z
-                        >= FAST_ANOMALY_CONFIG[
-                            "catastrophic_z"
-                        ]
-                    )
-                )
-            )
+        amplitude_flag[indices] = local_flag
 
-        amplitude_flag[
-            indices
-        ] = local_flag
+        if finite_values.size / len(indices) >= 0.995:
+            dropout_flag[indices] = ~finite_mask
 
-        if (
-            finite_values.size
-            / len(indices)
-            >= 0.995
-        ):
-            dropout_flag[
-                indices
-            ] = ~finite_mask
-
-        phase_rate_positions = (
-            indices[
-                np.isfinite(
-                    rates[indices]
-                )
-            ]
-        )
-
-        phase_rates = rates[
-            phase_rate_positions
-        ]
-
-        if (
-            phase_rates.size
-            >= FAST_ANOMALY_CONFIG[
-                "minimum_phase_samples"
-            ]
-        ):
-            rate_center, rate_scale = (
-                _fad_scale(
-                    phase_rates
-                )
-            )
-
-            rate_distinct = (
-                np.unique(
-                    phase_rates
-                ).size
-            )
-
-            local_rate_z = (
-                np.abs(
-                    phase_rates
-                    - rate_center
-                )
-                / rate_scale
-            )
-
-            rate_z[
-                phase_rate_positions
-            ] = (
-                np.minimum(
-                    local_rate_z,
-                    100.0,
-                )
-                .astype(np.float32)
-            )
-
-            if (
-                rate_distinct
-                > FAST_ANOMALY_CONFIG[
-                    "maximum_discrete_values"
-                ]
-            ):
+        phase_rate_positions = indices[np.isfinite(rates[indices])]
+        phase_rates = rates[phase_rate_positions]
+        if phase_rates.size >= FAST_ANOMALY_CONFIG["minimum_phase_samples"]:
+            rate_center, rate_scale = _fad_scale(phase_rates)
+            rate_distinct = np.unique(phase_rates).size
+            local_rate_z = np.abs(phase_rates - rate_center) / rate_scale
+            rate_z[phase_rate_positions] = np.minimum(local_rate_z, 100.0).astype(np.float32)
+            if rate_distinct > FAST_ANOMALY_CONFIG["maximum_discrete_values"]:
                 rate_tail_probability = max(
-                    FAST_ANOMALY_CONFIG[
-                        "tail_probability"
-                    ],
+                    FAST_ANOMALY_CONFIG["tail_probability"],
                     min(
                         0.01,
-                        FAST_ANOMALY_CONFIG[
-                            "minimum_tail_observations"
-                        ]
-                        / phase_rates.size,
+                        FAST_ANOMALY_CONFIG["minimum_tail_observations"] / phase_rates.size,
                     ),
                 )
-
-                rate_lower, rate_upper = (
-                    np.quantile(
-                        phase_rates,
-                        [
-                            rate_tail_probability,
-                            1.0
-                            - rate_tail_probability,
-                        ],
-                    )
+                rate_lower, rate_upper = np.quantile(
+                    phase_rates,
+                    [rate_tail_probability, 1.0 - rate_tail_probability],
+                )
+                rate_flag[phase_rate_positions] = (
+                    (((phase_rates < rate_lower) | (phase_rates > rate_upper))
+                    & (local_rate_z >= FAST_ANOMALY_CONFIG["minimum_rate_z"]))
+                    | (local_rate_z >= FAST_ANOMALY_CONFIG["catastrophic_z"])
                 )
 
-                rate_flag[
-                    phase_rate_positions
-                ] = (
-                    (
-                        (
-                            (
-                                phase_rates
-                                < rate_lower
-                            )
-                            | (
-                                phase_rates
-                                > rate_upper
-                            )
-                        )
-                        & (
-                            local_rate_z
-                            >= FAST_ANOMALY_CONFIG[
-                                "minimum_rate_z"
-                            ]
-                        )
-                    )
-                    | (
-                        local_rate_z
-                        >= FAST_ANOMALY_CONFIG[
-                            "catastrophic_z"
-                        ]
-                    )
-                )
-
-    parameter_baselines[
-        parameter
-    ] = baselines
-
-    combined_flag = (
-        eligible
-        & (
-            amplitude_flag
-            | rate_flag
-            | dropout_flag
-        )
-    )
-
-    flagged_positions = (
-        np.flatnonzero(
-            combined_flag
-        )
-    )
+    parameter_baselines[parameter] = baselines
+    combined_flag = eligible & (amplitude_flag | rate_flag | dropout_flag)
+    flagged_positions = np.flatnonzero(combined_flag)
 
     if flagged_positions.size:
-        channel, signal = (
-            _fad_channel_signal(
-                parameter
-            )
-        )
-
+        channel, signal = _fad_channel_signal(parameter)
         types = np.where(
-            dropout_flag[
-                flagged_positions
-            ],
+            dropout_flag[flagged_positions],
             "UNEXPECTED_DATA_DROPOUT",
             np.where(
-                amplitude_flag[
-                    flagged_positions
-                ]
-                & rate_flag[
-                    flagged_positions
-                ],
+                amplitude_flag[flagged_positions] & rate_flag[flagged_positions],
                 "PHASE_TAIL+TEMPORAL_JUMP",
                 np.where(
-                    amplitude_flag[
-                        flagged_positions
-                    ],
+                    amplitude_flag[flagged_positions],
                     "PHASE_CONDITIONAL_TAIL",
                     "TEMPORAL_JUMP",
                 ),
             ),
         )
-
         scores = np.maximum(
-            amplitude_z[
-                flagged_positions
-            ],
-            rate_z[
-                flagged_positions
-            ],
+            amplitude_z[flagged_positions],
+            rate_z[flagged_positions],
         ).astype(float)
-
-        scores[
-            dropout_flag[
-                flagged_positions
-            ]
-        ] = np.maximum(
-            scores[
-                dropout_flag[
-                    flagged_positions
-                ]
-            ],
-            FAST_ANOMALY_CONFIG[
-                "minimum_amplitude_z"
-            ],
+        scores[dropout_flag[flagged_positions]] = np.maximum(
+            scores[dropout_flag[flagged_positions]],
+            FAST_ANOMALY_CONFIG["minimum_amplitude_z"],
         )
-
         raw_event_frames.append(
             pd.DataFrame(
                 {
-                    "RowPosition": (
-                        flagged_positions
-                    ),
-                    "Timestamp": (
-                        metadata[
-                            "Timestamp"
-                        ]
-                        .to_numpy()[
-                            flagged_positions
-                        ]
-                    ),
-                    "StartDatetime": (
-                        metadata[
-                            "StartDatetime"
-                        ]
-                        .to_numpy()[
-                            flagged_positions
-                        ]
-                    ),
-                    "FlightPhase": (
-                        phase_values[
-                            flagged_positions
-                        ]
-                    ),
+                    "RowPosition": flagged_positions,
+                    "Timestamp": metadata["Timestamp"].to_numpy()[flagged_positions],
+                    "StartDatetime": metadata["StartDatetime"].to_numpy()[flagged_positions],
+                    "FlightPhase": phase_values[flagged_positions],
                     "Parameter": parameter,
                     "Signal": signal,
                     "Channel": channel,
-                    "Value": values[
-                        flagged_positions
-                    ],
+                    "Value": values[flagged_positions],
                     "PeerParameter": None,
                     "PeerValue": np.nan,
                     "Score": scores,
@@ -1002,488 +768,147 @@ for parameter_index, parameter in enumerate(
             )
         )
 
-    eligible_values = values[
-        eligible
-    ]
-
-    median_series = (
-        pd.Series(
-            eligible_values
-        )
-        .groupby(
-            group_codes
-        )
-        .median()
-    )
-
-    count_series = (
-        pd.Series(
-            eligible_values
-        )
-        .groupby(
-            group_codes
-        )
-        .count()
-    )
-
-    for code, median_value in (
-        median_series.items()
-    ):
-        if (
-            not np.isfinite(
-                median_value
-            )
-            or count_series.loc[
-                code
-            ]
-            == 0
-        ):
+    eligible_values = values[eligible]
+    median_series = pd.Series(eligible_values).groupby(group_codes).median()
+    count_series = pd.Series(eligible_values).groupby(group_codes).count()
+    for code, median_value in median_series.items():
+        if not np.isfinite(median_value) or count_series.loc[code] == 0:
             continue
-
-        start_datetime, phase = (
-            group_keys[code]
-        )
-
+        start_datetime, phase = group_keys[code]
         flight_phase_median_records.append(
             {
-                "StartDatetime": (
-                    start_datetime
-                ),
-                "FlightPhase": float(
-                    phase
-                ),
+                "StartDatetime": start_datetime,
+                "FlightPhase": float(phase),
                 "Parameter": parameter,
-                "MedianValue": float(
-                    median_value
-                ),
-                "Samples": int(
-                    count_series.loc[
-                        code
-                    ]
-                ),
+                "MedianValue": float(median_value),
+                "Samples": int(count_series.loc[code]),
             }
         )
 
-    if (
-        parameter_index % 20 == 0
-        or parameter_index
-        == len(
-            analysis_parameters
-        )
-    ):
-        print(
-            f"Scored "
-            f"{parameter_index:,} of "
-            f"{len(analysis_parameters):,} "
-            f"parameters"
-        )
+    if parameter_index % 20 == 0 or parameter_index == len(analysis_parameters):
+        print(f"Scored {parameter_index:,} of {len(analysis_parameters):,} parameters")
 
 channel_pairs = {}
-
 for parameter in analysis_parameters:
-    channel, signal = (
-        _fad_channel_signal(
-            parameter
-        )
-    )
-
+    channel, signal = _fad_channel_signal(parameter)
     if channel in CHANNELS:
-        channel_pairs.setdefault(
-            signal,
-            {},
-        )[channel] = parameter
+        channel_pairs.setdefault(signal, {})[channel] = parameter
 
 channel_pairs = {
     signal: members
-    for signal, members
-    in channel_pairs.items()
-    if all(
-        channel in members
-        for channel in CHANNELS
-    )
+    for signal, members in channel_pairs.items()
+    if all(channel in members for channel in CHANNELS)
 }
 
-for signal, members in (
-    channel_pairs.items()
-):
+for signal, members in channel_pairs.items():
     ac_parameter = members["AC"]
     bc_parameter = members["BC"]
+    ac_values = pd.to_numeric(
+        deep_data_df[ac_parameter], errors="coerce"
+    ).to_numpy(dtype=float)[source_positions]
+    bc_values = pd.to_numeric(
+        deep_data_df[bc_parameter], errors="coerce"
+    ).to_numpy(dtype=float)[source_positions]
+    difference = ac_values - bc_values
 
-    ac_values = (
-        pd.to_numeric(
-            _data_df[ac_parameter],
-            errors="coerce",
-        )
-        .to_numpy(dtype=float)[
-            source_positions
-        ]
-    )
-
-    bc_values = (
-        pd.to_numeric(
-            _data_df[bc_parameter],
-            errors="coerce",
-        )
-        .to_numpy(dtype=float)[
-            source_positions
-        ]
-    )
-
-    difference = (
-        ac_values
-        - bc_values
-    )
-
-    for phase, indices in (
-        phase_indices.items()
-    ):
-        finite_positions = (
-            indices[
-                np.isfinite(
-                    difference[
-                        indices
-                    ]
-                )
-            ]
-        )
-
-        phase_difference = (
-            difference[
-                finite_positions
-            ]
-        )
-
-        if (
-            phase_difference.size
-            < FAST_ANOMALY_CONFIG[
-                "minimum_phase_samples"
-            ]
-        ):
+    for phase, indices in phase_indices.items():
+        finite_positions = indices[np.isfinite(difference[indices])]
+        phase_difference = difference[finite_positions]
+        if phase_difference.size < FAST_ANOMALY_CONFIG["minimum_phase_samples"]:
             continue
-
-        center, scale = _fad_scale(
-            phase_difference
-        )
-
-        pair_z = (
-            np.abs(
-                phase_difference
-                - center
-            )
-            / scale
-        )
-
-        (
-            distinct_values,
-            distinct_counts,
-        ) = np.unique(
-            phase_difference,
-            return_counts=True,
-        )
-
-        if (
-            len(distinct_values)
-            <= FAST_ANOMALY_CONFIG[
-                "maximum_discrete_values"
+        center, scale = _fad_scale(phase_difference)
+        pair_z = np.abs(phase_difference - center) / scale
+        distinct_values, distinct_counts = np.unique(phase_difference, return_counts=True)
+        if len(distinct_values) <= FAST_ANOMALY_CONFIG["maximum_discrete_values"]:
+            frequencies = distinct_counts / distinct_counts.sum()
+            rare_values = distinct_values[
+                frequencies <= FAST_ANOMALY_CONFIG["pair_rare_discrete_fraction"]
             ]
-        ):
-            frequencies = (
-                distinct_counts
-                / distinct_counts.sum()
-            )
-
-            rare_values = (
-                distinct_values[
-                    frequencies
-                    <= FAST_ANOMALY_CONFIG[
-                        "pair_rare_discrete_fraction"
-                    ]
-                ]
-            )
-
-            pair_flag = np.isin(
-                phase_difference,
-                rare_values,
-            )
+            pair_flag = np.isin(phase_difference, rare_values)
         else:
             tail_probability = max(
-                FAST_ANOMALY_CONFIG[
-                    "tail_probability"
-                ],
+                FAST_ANOMALY_CONFIG["tail_probability"],
                 min(
                     0.01,
-                    FAST_ANOMALY_CONFIG[
-                        "minimum_tail_observations"
-                    ]
-                    / phase_difference.size,
+                    FAST_ANOMALY_CONFIG["minimum_tail_observations"] / phase_difference.size,
                 ),
             )
-
             lower, upper = np.quantile(
                 phase_difference,
-                [
-                    tail_probability,
-                    1.0
-                    - tail_probability,
-                ],
+                [tail_probability, 1.0 - tail_probability],
             )
-
             pair_flag = (
-                (
-                    (
-                        (
-                            phase_difference
-                            < lower
-                        )
-                        | (
-                            phase_difference
-                            > upper
-                        )
-                    )
-                    & (
-                        pair_z
-                        >= FAST_ANOMALY_CONFIG[
-                            "minimum_amplitude_z"
-                        ]
-                    )
-                )
-                | (
-                    pair_z
-                    >= FAST_ANOMALY_CONFIG[
-                        "catastrophic_z"
-                    ]
-                )
+                (((phase_difference < lower) | (phase_difference > upper))
+                & (pair_z >= FAST_ANOMALY_CONFIG["minimum_amplitude_z"]))
+                | (pair_z >= FAST_ANOMALY_CONFIG["catastrophic_z"])
             )
 
-        flagged_local = (
-            np.flatnonzero(
-                pair_flag
-            )
-        )
-
+        flagged_local = np.flatnonzero(pair_flag)
         if flagged_local.size == 0:
             continue
-
-        flagged_positions = (
-            finite_positions[
-                flagged_local
-            ]
-        )
-
-        ac_baseline = (
-            parameter_baselines
-            .get(
-                ac_parameter,
-                {},
-            )
-            .get(phase)
-        )
-
-        bc_baseline = (
-            parameter_baselines
-            .get(
-                bc_parameter,
-                {},
-            )
-            .get(phase)
-        )
-
-        if (
-            ac_baseline is None
-            or bc_baseline is None
-        ):
+        flagged_positions = finite_positions[flagged_local]
+        ac_baseline = parameter_baselines.get(ac_parameter, {}).get(phase)
+        bc_baseline = parameter_baselines.get(bc_parameter, {}).get(phase)
+        if ac_baseline is None or bc_baseline is None:
             continue
-
-        ac_z = (
-            np.abs(
-                ac_values[
-                    flagged_positions
-                ]
-                - ac_baseline[
-                    "center"
-                ]
-            )
-            / ac_baseline[
-                "scale"
-            ]
-        )
-
-        bc_z = (
-            np.abs(
-                bc_values[
-                    flagged_positions
-                ]
-                - bc_baseline[
-                    "center"
-                ]
-            )
-            / bc_baseline[
-                "scale"
-            ]
-        )
-
+        ac_z = np.abs(ac_values[flagged_positions] - ac_baseline["center"]) / ac_baseline["scale"]
+        bc_z = np.abs(bc_values[flagged_positions] - bc_baseline["center"]) / bc_baseline["scale"]
         ac_wins = (
-            ac_z
-            >= FAST_ANOMALY_CONFIG[
-                "minimum_amplitude_z"
-            ]
+            ac_z >= FAST_ANOMALY_CONFIG["minimum_amplitude_z"]
         ) & (
-            ac_z
-            >= FAST_ANOMALY_CONFIG[
-                "pair_attribution_ratio"
-            ]
-            * bc_z
+            ac_z >= FAST_ANOMALY_CONFIG["pair_attribution_ratio"] * bc_z
         )
-
         bc_wins = (
-            bc_z
-            >= FAST_ANOMALY_CONFIG[
-                "minimum_amplitude_z"
-            ]
+            bc_z >= FAST_ANOMALY_CONFIG["minimum_amplitude_z"]
         ) & (
-            bc_z
-            >= FAST_ANOMALY_CONFIG[
-                "pair_attribution_ratio"
-            ]
-            * ac_z
+            bc_z >= FAST_ANOMALY_CONFIG["pair_attribution_ratio"] * ac_z
         )
-
-        attributed_parameter = (
+        attributed_parameter = np.where(
+            ac_wins,
+            ac_parameter,
             np.where(
-                ac_wins,
-                ac_parameter,
-                np.where(
-                    bc_wins,
-                    bc_parameter,
-                    (
-                        f"{ac_parameter} | "
-                        f"{bc_parameter}"
-                    ),
-                ),
-            )
+                bc_wins,
+                bc_parameter,
+                f"{ac_parameter} | {bc_parameter}",
+            ),
         )
-
-        attributed_channel = (
-            np.where(
-                ac_wins,
-                "AC",
-                np.where(
-                    bc_wins,
-                    "BC",
-                    "AC|BC",
-                ),
-            )
+        attributed_channel = np.where(ac_wins, "AC", np.where(bc_wins, "BC", "AC|BC"))
+        attributed_value = np.where(
+            ac_wins,
+            ac_values[flagged_positions],
+            np.where(bc_wins, bc_values[flagged_positions], np.nan),
         )
-
-        attributed_value = (
-            np.where(
-                ac_wins,
-                ac_values[
-                    flagged_positions
-                ],
-                np.where(
-                    bc_wins,
-                    bc_values[
-                        flagged_positions
-                    ],
-                    np.nan,
-                ),
-            )
-        )
-
         peer_parameter = np.where(
             ac_wins,
             bc_parameter,
-            np.where(
-                bc_wins,
-                ac_parameter,
-                None,
-            ),
+            np.where(bc_wins, ac_parameter, None),
         )
-
         peer_value = np.where(
             ac_wins,
-            bc_values[
-                flagged_positions
-            ],
-            np.where(
-                bc_wins,
-                ac_values[
-                    flagged_positions
-                ],
-                np.nan,
-            ),
+            bc_values[flagged_positions],
+            np.where(bc_wins, ac_values[flagged_positions], np.nan),
         )
-
         confidence = np.where(
             ac_wins | bc_wins,
-            np.maximum(
-                ac_z,
-                bc_z,
-            )
-            / (
-                ac_z
-                + bc_z
-                + 1.0e-12
-            ),
+            np.maximum(ac_z, bc_z) / (ac_z + bc_z + 1.0e-12),
             0.5,
         )
-
         raw_event_frames.append(
             pd.DataFrame(
                 {
-                    "RowPosition": (
-                        flagged_positions
-                    ),
-                    "Timestamp": (
-                        metadata[
-                            "Timestamp"
-                        ]
-                        .to_numpy()[
-                            flagged_positions
-                        ]
-                    ),
-                    "StartDatetime": (
-                        metadata[
-                            "StartDatetime"
-                        ]
-                        .to_numpy()[
-                            flagged_positions
-                        ]
-                    ),
-                    "FlightPhase": (
-                        phase_values[
-                            flagged_positions
-                        ]
-                    ),
-                    "Parameter": (
-                        attributed_parameter
-                    ),
+                    "RowPosition": flagged_positions,
+                    "Timestamp": metadata["Timestamp"].to_numpy()[flagged_positions],
+                    "StartDatetime": metadata["StartDatetime"].to_numpy()[flagged_positions],
+                    "FlightPhase": phase_values[flagged_positions],
+                    "Parameter": attributed_parameter,
                     "Signal": signal,
-                    "Channel": (
-                        attributed_channel
-                    ),
-                    "Value": (
-                        attributed_value
-                    ),
-                    "PeerParameter": (
-                        peer_parameter
-                    ),
-                    "PeerValue": (
-                        peer_value
-                    ),
-                    "Score": np.minimum(
-                        pair_z[
-                            flagged_local
-                        ],
-                        100.0,
-                    ),
-                    "AnomalyType": (
-                        "AC_BC_CHANNEL_DIVERGENCE"
-                    ),
-                    "AttributionConfidence": (
-                        confidence
-                    ),
+                    "Channel": attributed_channel,
+                    "Value": attributed_value,
+                    "PeerParameter": peer_parameter,
+                    "PeerValue": peer_value,
+                    "Score": np.minimum(pair_z[flagged_local], 100.0),
+                    "AnomalyType": "AC_BC_CHANNEL_DIVERGENCE",
+                    "AttributionConfidence": confidence,
                 }
             )
         )
@@ -1505,25 +930,13 @@ event_columns = [
 ]
 
 raw_events = (
-    pd.concat(
-        raw_event_frames,
-        ignore_index=True,
-    )
+    pd.concat(raw_event_frames, ignore_index=True)
     if raw_event_frames
-    else pd.DataFrame(
-        columns=event_columns
-    )
+    else pd.DataFrame(columns=event_columns)
 )
 
 if not raw_events.empty:
-    raw_events = (
-        raw_events.sort_values(
-            "Score",
-            ascending=False,
-            kind="stable",
-        )
-    )
-
+    raw_events = raw_events.sort_values("Score", ascending=False, kind="stable")
     raw_events = (
         raw_events.groupby(
             [
@@ -1539,444 +952,137 @@ if not raw_events.empty:
             sort=False,
         )
         .agg(
-            Value=(
-                "Value",
-                "first",
-            ),
+            Value=("Value", "first"),
             PeerParameter=(
                 "PeerParameter",
                 lambda values: next(
-                    (
-                        value
-                        for value in values
-                        if pd.notna(value)
-                    ),
+                    (value for value in values if pd.notna(value)),
                     None,
                 ),
             ),
-            PeerValue=(
-                "PeerValue",
-                "first",
-            ),
-            Score=(
-                "Score",
-                "max",
-            ),
-            AnomalyType=(
-                "AnomalyType",
-                lambda values: "+".join(
-                    sorted(set(values))
-                ),
-            ),
-            AttributionConfidence=(
-                "AttributionConfidence",
-                "max",
-            ),
+            PeerValue=("PeerValue", "first"),
+            Score=("Score", "max"),
+            AnomalyType=("AnomalyType", lambda values: "+".join(sorted(set(values)))),
+            AttributionConfidence=("AttributionConfidence", "max"),
         )
         .reset_index()
     )
 
-(
-    fast_anomaly_samples,
-    fast_anomaly_episodes,
-) = _fad_episode_table(
+fast_anomaly_samples, fast_anomaly_episodes = _fad_episode_table(
     raw_events,
     episode_gap_seconds,
-    FAST_ANOMALY_CONFIG[
-        "minimum_episode_samples"
-    ],
-    FAST_ANOMALY_CONFIG[
-        "minimum_episode_seconds"
-    ],
-    FAST_ANOMALY_CONFIG[
-        "catastrophic_z"
-    ],
+    FAST_ANOMALY_CONFIG["minimum_episode_samples"],
+    FAST_ANOMALY_CONFIG["minimum_episode_seconds"],
+    FAST_ANOMALY_CONFIG["catastrophic_z"],
 )
 
-phase_issue_events = (
-    metadata.loc[
-        phase_disagreement,
-        [
+phase_issue_events = metadata.loc[
+    phase_disagreement,
+    ["Timestamp", "StartDatetime", "ACFlightPhase", "BCFlightPhase"],
+].copy()
+
+if phase_issue_events.empty:
+    fast_phase_issue_samples = pd.DataFrame(
+        columns=[
             "Timestamp",
             "StartDatetime",
             "ACFlightPhase",
             "BCFlightPhase",
-        ],
-    ]
-    .copy()
-)
-
-if phase_issue_events.empty:
-    fast_phase_issue_samples = (
-        pd.DataFrame(
-            columns=[
-                "Timestamp",
-                "StartDatetime",
-                "ACFlightPhase",
-                "BCFlightPhase",
-                "AnomalyType",
-                "EpisodeId",
-            ]
-        )
+            "AnomalyType",
+            "EpisodeId",
+        ]
     )
-
-    fast_phase_issue_episodes = (
-        pd.DataFrame(
-            columns=[
-                "StartDatetime",
-                "EpisodeId",
-                "EpisodeStart",
-                "EpisodeEnd",
-                "DurationSeconds",
-                "Samples",
-                "ACFlightPhases",
-                "BCFlightPhases",
-            ]
-        )
+    fast_phase_issue_episodes = pd.DataFrame(
+        columns=[
+            "StartDatetime",
+            "EpisodeId",
+            "EpisodeStart",
+            "EpisodeEnd",
+            "DurationSeconds",
+            "Samples",
+            "ACFlightPhases",
+            "BCFlightPhases",
+        ]
     )
 else:
-    phase_issue_events[
-        "AnomalyType"
-    ] = (
-        "FLIGHT_PHASE_DISAGREEMENT"
+    phase_issue_events["AnomalyType"] = "FLIGHT_PHASE_DISAGREEMENT"
+    phase_issue_events = phase_issue_events.sort_values(
+        ["StartDatetime", "Timestamp"], kind="stable"
+    ).reset_index(drop=True)
+    same_issue_flight = phase_issue_events["StartDatetime"].eq(
+        phase_issue_events["StartDatetime"].shift()
     )
-
-    phase_issue_events = (
-        phase_issue_events.sort_values(
-            [
-                "StartDatetime",
-                "Timestamp",
-            ],
-            kind="stable",
-        )
-        .reset_index(drop=True)
-    )
-
-    same_issue_flight = (
-        phase_issue_events[
-            "StartDatetime"
-        ]
-        .eq(
-            phase_issue_events[
-                "StartDatetime"
-            ].shift()
-        )
-    )
-
-    issue_gap = (
-        phase_issue_events[
-            "Timestamp"
-        ]
-        .diff()
-        .dt.total_seconds()
-    )
-
-    phase_issue_events[
-        "EpisodeId"
-    ] = (
-        (
-            ~same_issue_flight
-            | issue_gap.isna()
-            | (
-                issue_gap
-                > episode_gap_seconds
-            )
-        )
+    issue_gap = phase_issue_events["Timestamp"].diff().dt.total_seconds()
+    phase_issue_events["EpisodeId"] = (
+        (~same_issue_flight | issue_gap.isna() | (issue_gap > episode_gap_seconds))
         .cumsum()
         .astype(np.int64)
     )
-
-    fast_phase_issue_samples = (
-        phase_issue_events
-    )
-
+    fast_phase_issue_samples = phase_issue_events
     fast_phase_issue_episodes = (
-        phase_issue_events.groupby(
-            [
-                "StartDatetime",
-                "EpisodeId",
-            ],
-            sort=False,
-        )
+        phase_issue_events.groupby(["StartDatetime", "EpisodeId"], sort=False)
         .agg(
-            EpisodeStart=(
-                "Timestamp",
-                "min",
-            ),
-            EpisodeEnd=(
-                "Timestamp",
-                "max",
-            ),
-            Samples=(
-                "Timestamp",
-                "size",
-            ),
-            ACFlightPhases=(
-                "ACFlightPhase",
-                lambda values: sorted(
-                    set(
-                        values.dropna()
-                    )
-                ),
-            ),
-            BCFlightPhases=(
-                "BCFlightPhase",
-                lambda values: sorted(
-                    set(
-                        values.dropna()
-                    )
-                ),
-            ),
+            EpisodeStart=("Timestamp", "min"),
+            EpisodeEnd=("Timestamp", "max"),
+            Samples=("Timestamp", "size"),
+            ACFlightPhases=("ACFlightPhase", lambda values: sorted(set(values.dropna()))),
+            BCFlightPhases=("BCFlightPhase", lambda values: sorted(set(values.dropna()))),
         )
         .reset_index()
     )
-
-    fast_phase_issue_episodes[
-        "DurationSeconds"
-    ] = (
-        fast_phase_issue_episodes[
-            "EpisodeEnd"
-        ]
-        - fast_phase_issue_episodes[
-            "EpisodeStart"
-        ]
+    fast_phase_issue_episodes["DurationSeconds"] = (
+        fast_phase_issue_episodes["EpisodeEnd"]
+        - fast_phase_issue_episodes["EpisodeStart"]
     ).dt.total_seconds()
 
-flight_phase_medians = (
-    pd.DataFrame(
-        flight_phase_median_records
-    )
-)
-
+flight_phase_medians = pd.DataFrame(flight_phase_median_records)
 trend_records = []
 
 if not flight_phase_medians.empty:
-    for (
-        parameter,
-        phase,
-    ), group in (
-        flight_phase_medians.groupby(
-            [
-                "Parameter",
-                "FlightPhase",
-            ],
-            sort=False,
-        )
+    for (parameter, phase), group in flight_phase_medians.groupby(
+        ["Parameter", "FlightPhase"], sort=False
     ):
-        group = (
-            group.sort_values(
-                "StartDatetime"
-            )
-            .drop_duplicates(
-                "StartDatetime"
-            )
-        )
-
-        if (
-            len(group)
-            < FAST_ANOMALY_CONFIG[
-                "minimum_trend_flights"
-            ]
-        ):
+        group = group.sort_values("StartDatetime").drop_duplicates("StartDatetime")
+        if len(group) < FAST_ANOMALY_CONFIG["minimum_trend_flights"]:
             continue
-
         x = (
-            (
-                group["StartDatetime"]
-                - group[
-                    "StartDatetime"
-                ].iloc[0]
-            )
-            .dt.total_seconds()
-            .to_numpy(dtype=float)
-            / 86400.0
-        )
-
-        y = group[
-            "MedianValue"
-        ].to_numpy(dtype=float)
-
-        if (
-            x[-1] <= x[0]
-            or not np.isfinite(
-                y
-            ).all()
-        ):
+            group["StartDatetime"] - group["StartDatetime"].iloc[0]
+        ).dt.total_seconds().to_numpy(dtype=float) / 86400.0
+        y = group["MedianValue"].to_numpy(dtype=float)
+        if x[-1] <= x[0] or not np.isfinite(y).all():
             continue
-
-        center, scale = (
-            _fad_scale(y)
-        )
-
-        (
-            slope,
-            intercept,
-            _,
-            _,
-        ) = theilslopes(
-            y,
-            x,
-            0.99,
-        )
-
-        _, noise_scale = (
-            _fad_scale(
-                y
-                - (
-                    slope
-                    * x
-                    + intercept
-                )
-            )
-        )
-
-        noise_scale = max(
-            noise_scale,
-            abs(center) * 1.0e-6,
-            scale * 0.02,
-        )
-
-        tau_result = kendalltau(
-            x,
-            y,
-            nan_policy="omit",
-        )
-
-        tau_value = getattr(
-            tau_result,
-            "statistic",
-            tau_result[0],
-        )
-
-        tau = (
-            float(tau_value)
-            if np.isfinite(
-                tau_value
-            )
-            else 0.0
-        )
-
-        trend_p = (
-            float(
-                tau_result.pvalue
-            )
-            if np.isfinite(
-                tau_result.pvalue
-            )
-            else 1.0
-        )
-
-        estimated_change = float(
-            slope
-            * (
-                x[-1]
-                - x[0]
-            )
-        )
-
-        trend_effect_z = (
-            abs(
-                estimated_change
-            )
-            / noise_scale
-        )
-
-        relative_change = (
-            abs(
-                estimated_change
-            )
-            / max(
-                abs(center),
-                scale,
-                1.0e-12,
-            )
-        )
-
+        center, scale = _fad_scale(y)
+        slope, intercept, _, _ = theilslopes(y, x, 0.99)
+        _, noise_scale = _fad_scale(y - (slope * x + intercept))
+        noise_scale = max(noise_scale, abs(center) * 1.0e-6, scale * 0.02)
+        tau_result = kendalltau(x, y, nan_policy="omit")
+        tau_value = getattr(tau_result, "statistic", tau_result[0])
+        tau = float(tau_value) if np.isfinite(tau_value) else 0.0
+        trend_p = float(tau_result.pvalue) if np.isfinite(tau_result.pvalue) else 1.0
+        estimated_change = float(slope * (x[-1] - x[0]))
+        trend_effect_z = abs(estimated_change) / noise_scale
+        relative_change = abs(estimated_change) / max(abs(center), scale, 1.0e-12)
         best_change_z = 0.0
         best_split = None
-
-        for split in range(
-            3,
-            len(y) - 2,
-        ):
-            change_z = (
-                abs(
-                    float(
-                        np.median(
-                            y[split:]
-                        )
-                        - np.median(
-                            y[:split]
-                        )
-                    )
-                )
-                / noise_scale
-            )
-
-            if (
-                change_z
-                > best_change_z
-            ):
-                best_change_z = (
-                    change_z
-                )
+        for split in range(3, len(y) - 2):
+            change_z = abs(float(np.median(y[split:]) - np.median(y[:split]))) / noise_scale
+            if change_z > best_change_z:
+                best_change_z = change_z
                 best_split = split
-
-        change_p = min(
-            1.0,
-            2.0
-            * norm.sf(
-                best_change_z
-            )
-            * max(
-                1,
-                len(y) - 5,
-            ),
-        )
-
-        combined_p = min(
-            1.0,
-            min(
-                trend_p,
-                change_p,
-            )
-            * 2.0,
-        )
-
+        change_p = min(1.0, 2.0 * norm.sf(best_change_z) * max(1, len(y) - 5))
+        combined_p = min(1.0, min(trend_p, change_p) * 2.0)
         effect_qualified = (
             (
-                trend_effect_z
-                >= FAST_ANOMALY_CONFIG[
-                    "minimum_trend_effect_z"
-                ]
-                and abs(tau)
-                >= FAST_ANOMALY_CONFIG[
-                    "minimum_trend_tau"
-                ]
-                and relative_change
-                >= FAST_ANOMALY_CONFIG[
-                    "minimum_relative_trend_change"
-                ]
+                trend_effect_z >= FAST_ANOMALY_CONFIG["minimum_trend_effect_z"]
+                and abs(tau) >= FAST_ANOMALY_CONFIG["minimum_trend_tau"]
+                and relative_change >= FAST_ANOMALY_CONFIG["minimum_relative_trend_change"]
             )
             or (
-                best_change_z
-                >= FAST_ANOMALY_CONFIG[
-                    "minimum_trend_effect_z"
-                ]
-                * 1.5
-                and relative_change
-                >= FAST_ANOMALY_CONFIG[
-                    "minimum_relative_trend_change"
-                ]
+                best_change_z >= FAST_ANOMALY_CONFIG["minimum_trend_effect_z"] * 1.5
+                and relative_change >= FAST_ANOMALY_CONFIG["minimum_relative_trend_change"]
             )
         )
-
-        channel, signal = (
-            _fad_channel_signal(
-                parameter
-            )
-        )
-
+        channel, signal = _fad_channel_signal(parameter)
         trend_records.append(
             {
                 "Parameter": parameter,
@@ -1984,46 +1090,21 @@ if not flight_phase_medians.empty:
                 "Channel": channel,
                 "FlightPhase": phase,
                 "Flights": len(group),
-                "FirstFlight": (
-                    group[
-                        "StartDatetime"
-                    ].iloc[0]
-                ),
-                "LastFlight": (
-                    group[
-                        "StartDatetime"
-                    ].iloc[-1]
-                ),
+                "FirstFlight": group["StartDatetime"].iloc[0],
+                "LastFlight": group["StartDatetime"].iloc[-1],
                 "ChangePointFlight": (
-                    group[
-                        "StartDatetime"
-                    ].iloc[
-                        best_split
-                    ]
-                    if best_split
-                    is not None
+                    group["StartDatetime"].iloc[best_split]
+                    if best_split is not None
                     else pd.NaT
                 ),
-                "TheilSenSlopePerDay": float(
-                    slope
-                ),
-                "EstimatedWindowChange": (
-                    estimated_change
-                ),
-                "RelativeWindowChange": (
-                    relative_change
-                ),
-                "TrendEffectZ": float(
-                    trend_effect_z
-                ),
+                "TheilSenSlopePerDay": float(slope),
+                "EstimatedWindowChange": estimated_change,
+                "RelativeWindowChange": relative_change,
+                "TrendEffectZ": float(trend_effect_z),
                 "KendallTau": tau,
-                "ChangePointZ": float(
-                    best_change_z
-                ),
+                "ChangePointZ": float(best_change_z),
                 "PValue": combined_p,
-                "EffectQualified": (
-                    effect_qualified
-                ),
+                "EffectQualified": effect_qualified,
             }
         )
 
@@ -2048,194 +1129,55 @@ fast_degradation = pd.DataFrame(
         "EffectQualified",
     ],
 )
-
 if not fast_degradation.empty:
-    fast_degradation[
-        "AdjustedPValue"
-    ] = _fad_bh(
-        fast_degradation[
-            "PValue"
-        ].to_numpy()
-    )
-
+    fast_degradation["AdjustedPValue"] = _fad_bh(fast_degradation["PValue"].to_numpy())
     fast_degradation = (
         fast_degradation.loc[
-            fast_degradation[
-                "EffectQualified"
-            ]
-            & (
-                fast_degradation[
-                    "AdjustedPValue"
-                ]
-                <= FAST_ANOMALY_CONFIG[
-                    "trend_fdr"
-                ]
-            )
+            fast_degradation["EffectQualified"]
+            & (fast_degradation["AdjustedPValue"] <= FAST_ANOMALY_CONFIG["trend_fdr"])
         ]
-        .drop(
-            columns=[
-                "EffectQualified"
-            ]
-        )
+        .drop(columns=["EffectQualified"])
         .sort_values(
-            [
-                "TrendEffectZ",
-                "ChangePointZ",
-                "AdjustedPValue",
-            ],
-            ascending=[
-                False,
-                False,
-                True,
-            ],
+            ["TrendEffectZ", "ChangePointZ", "AdjustedPValue"],
+            ascending=[False, False, True],
             kind="stable",
         )
         .reset_index(drop=True)
     )
 else:
-    fast_degradation = (
-        fast_degradation.drop(
-            columns=[
-                "EffectQualified"
-            ]
-        )
-    )
-
-    fast_degradation[
-        "AdjustedPValue"
-    ] = pd.Series(
-        dtype=float
-    )
+    fast_degradation = fast_degradation.drop(columns=["EffectQualified"])
+    fast_degradation["AdjustedPValue"] = pd.Series(dtype=float)
 
 contextual_records = []
 
 if not flight_phase_medians.empty:
-    for phase, group in (
-        flight_phase_medians.groupby(
-            "FlightPhase",
-            sort=False,
-        )
-    ):
-        matrix = (
-            group.pivot_table(
-                index="StartDatetime",
-                columns="Parameter",
-                values="MedianValue",
-                aggfunc="median",
-            )
-            .sort_index()
-        )
-
-        if (
-            len(matrix)
-            < FAST_ANOMALY_CONFIG[
-                "contextual_minimum_flights"
-            ]
-        ):
+    for phase, group in flight_phase_medians.groupby("FlightPhase", sort=False):
+        matrix = group.pivot_table(
+            index="StartDatetime",
+            columns="Parameter",
+            values="MedianValue",
+            aggfunc="median",
+        ).sort_index()
+        if len(matrix) < FAST_ANOMALY_CONFIG["contextual_minimum_flights"]:
             continue
-
-        coverage = (
-            matrix.notna().mean()
-        )
-
-        usable_columns = (
-            coverage.index[
-                coverage >= 0.8
-            ].tolist()
-        )
-
-        if (
-            len(usable_columns)
-            < 3
-        ):
+        coverage = matrix.notna().mean()
+        usable_columns = coverage.index[coverage >= 0.8].tolist()
+        if len(usable_columns) < 3:
             continue
-
-        matrix = matrix[
-            usable_columns
-        ]
-
-        centers = matrix.median(
-            axis=0
-        )
-
-        scales = pd.Series(
-            index=usable_columns,
-            dtype=float,
-        )
-
+        matrix = matrix[usable_columns]
+        centers = matrix.median(axis=0)
+        scales = pd.Series(index=usable_columns, dtype=float)
         for column in usable_columns:
-            _, scales[column] = (
-                _fad_scale(
-                    matrix[
-                        column
-                    ]
-                    .dropna()
-                    .to_numpy(),
-                    centers[column],
-                )
-            )
-
-        standardized = (
-            matrix.subtract(
-                centers,
-                axis=1,
-            )
-            .divide(
-                scales,
-                axis=1,
-            )
-            .fillna(0.0)
-            .clip(
-                -10.0,
-                10.0,
-            )
-        )
-
-        values = (
-            standardized.to_numpy(
-                dtype=float
-            )
-        )
-
-        if min(
-            values.shape
-        ) < 3:
+            _, scales[column] = _fad_scale(matrix[column].dropna().to_numpy(), centers[column])
+        standardized = matrix.subtract(centers, axis=1).divide(scales, axis=1).fillna(0.0)
+        standardized = standardized.clip(-10.0, 10.0)
+        values = standardized.to_numpy(dtype=float)
+        if min(values.shape) < 3:
             continue
-
-        (
-            _,
-            singular_values,
-            components,
-        ) = np.linalg.svd(
-            values,
-            full_matrices=False,
-        )
-
-        variance = (
-            singular_values
-            ** 2
-        )
-
-        cumulative = (
-            np.cumsum(
-                variance
-            )
-            / max(
-                float(
-                    variance.sum()
-                ),
-                1.0e-12,
-            )
-        )
-
-        variance_components = int(
-            np.searchsorted(
-                cumulative,
-                0.90,
-            )
-            + 1
-        )
-
+        _, singular_values, components = np.linalg.svd(values, full_matrices=False)
+        variance = singular_values ** 2
+        cumulative = np.cumsum(variance) / max(float(variance.sum()), 1.0e-12)
+        variance_components = int(np.searchsorted(cumulative, 0.90) + 1)
         component_count = max(
             1,
             min(
@@ -2245,334 +1187,137 @@ if not flight_phase_medians.empty:
                 values.shape[1] // 3,
             ),
         )
-
-        reconstruction = (
-            values
-            @ components[
-                :component_count
-            ].T
-        ) @ components[
-            :component_count
-        ]
-
-        residual = np.abs(
-            values
-            - reconstruction
-        )
-
-        for (
-            column_index,
-            parameter,
-        ) in enumerate(
-            usable_columns
-        ):
-            (
-                residual_center,
-                residual_scale,
-            ) = _fad_scale(
-                residual[
-                    :,
-                    column_index,
-                ]
-            )
-
-            residual_z = (
-                np.abs(
-                    residual[
-                        :,
-                        column_index,
-                    ]
-                    - residual_center
-                )
-                / residual_scale
-            )
-
-            raw_z = np.abs(
-                values[
-                    :,
-                    column_index,
-                ]
-            )
-
+        reconstruction = (values @ components[:component_count].T) @ components[:component_count]
+        residual = np.abs(values - reconstruction)
+        for column_index, parameter in enumerate(usable_columns):
+            residual_center, residual_scale = _fad_scale(residual[:, column_index])
+            residual_z = np.abs(residual[:, column_index] - residual_center) / residual_scale
+            raw_z = np.abs(values[:, column_index])
             flagged = np.flatnonzero(
-                (
-                    residual_z
-                    >= FAST_ANOMALY_CONFIG[
-                        "contextual_minimum_z"
-                    ]
-                )
-                & (
-                    raw_z
-                    >= FAST_ANOMALY_CONFIG[
-                        "contextual_minimum_raw_z"
-                    ]
-                )
+                (residual_z >= FAST_ANOMALY_CONFIG["contextual_minimum_z"])
+                & (raw_z >= FAST_ANOMALY_CONFIG["contextual_minimum_raw_z"])
             )
-
-            channel, signal = (
-                _fad_channel_signal(
-                    parameter
-                )
-            )
-
+            channel, signal = _fad_channel_signal(parameter)
             for row_index in flagged:
                 contextual_records.append(
                     {
-                        "StartDatetime": (
-                            matrix.index[
-                                row_index
-                            ]
-                        ),
-                        "FlightPhase": float(
-                            phase
-                        ),
-                        "Parameter": (
-                            parameter
-                        ),
+                        "StartDatetime": matrix.index[row_index],
+                        "FlightPhase": float(phase),
+                        "Parameter": parameter,
                         "Signal": signal,
                         "Channel": channel,
-                        "MedianValue": (
-                            matrix.iloc[
-                                row_index,
-                                column_index,
-                            ]
-                        ),
-                        "RawRobustZ": float(
-                            raw_z[
-                                row_index
-                            ]
-                        ),
-                        "ContextualResidualZ": float(
-                            residual_z[
-                                row_index
-                            ]
-                        ),
-                        "Components": (
-                            component_count
-                        ),
+                        "MedianValue": matrix.iloc[row_index, column_index],
+                        "RawRobustZ": float(raw_z[row_index]),
+                        "ContextualResidualZ": float(residual_z[row_index]),
+                        "Components": component_count,
                     }
                 )
 
-fast_contextual_findings = (
-    pd.DataFrame(
-        contextual_records,
+fast_contextual_findings = pd.DataFrame(
+    contextual_records,
+    columns=[
+        "StartDatetime",
+        "FlightPhase",
+        "Parameter",
+        "Signal",
+        "Channel",
+        "MedianValue",
+        "RawRobustZ",
+        "ContextualResidualZ",
+        "Components",
+    ],
+)
+if not fast_contextual_findings.empty:
+    fast_contextual_findings = fast_contextual_findings.sort_values(
+        ["ContextualResidualZ", "RawRobustZ"],
+        ascending=[False, False],
+        kind="stable",
+    ).reset_index(drop=True)
+
+if fast_anomaly_episodes.empty:
+    fast_parameter_summary = pd.DataFrame(
         columns=[
-            "StartDatetime",
-            "FlightPhase",
             "Parameter",
             "Signal",
             "Channel",
-            "MedianValue",
-            "RawRobustZ",
-            "ContextualResidualZ",
-            "Components",
-        ],
+            "ConfirmedEpisodes",
+            "AffectedFlights",
+            "AnomalousSamples",
+            "MaximumScore",
+            "AffectedFlightPhases",
+            "FirstObserved",
+            "LastObserved",
+        ]
     )
-)
-
-if not fast_contextual_findings.empty:
-    fast_contextual_findings = (
-        fast_contextual_findings
-        .sort_values(
-            [
-                "ContextualResidualZ",
-                "RawRobustZ",
-            ],
-            ascending=[
-                False,
-                False,
-            ],
-            kind="stable",
-        )
-        .reset_index(drop=True)
-    )
-
-if fast_anomaly_episodes.empty:
-    fast_parameter_summary = (
-        pd.DataFrame(
-            columns=[
-                "Parameter",
-                "Signal",
-                "Channel",
-                "ConfirmedEpisodes",
-                "AffectedFlights",
-                "AnomalousSamples",
-                "MaximumScore",
-                "AffectedFlightPhases",
-                "FirstObserved",
-                "LastObserved",
-            ]
-        )
-    )
-
-    regular_flight_summary = (
-        pd.DataFrame(
-            columns=[
-                "StartDatetime",
-                "ConfirmedEpisodes",
-                "AnomalousParameters",
-                "Parameters",
-                "FlightPhases",
-                "FirstAnomaly",
-                "LastAnomaly",
-                "MaximumScore",
-                "AnomalousSamples",
-            ]
-        )
+    regular_flight_summary = pd.DataFrame(
+        columns=[
+            "StartDatetime",
+            "ConfirmedEpisodes",
+            "AnomalousParameters",
+            "Parameters",
+            "FlightPhases",
+            "FirstAnomaly",
+            "LastAnomaly",
+            "MaximumScore",
+            "AnomalousSamples",
+        ]
     )
 else:
     fast_parameter_summary = (
-        fast_anomaly_episodes
-        .groupby(
-            [
-                "Parameter",
-                "Signal",
-                "Channel",
-            ],
-            dropna=False,
-        )
+        fast_anomaly_episodes.groupby(["Parameter", "Signal", "Channel"], dropna=False)
         .agg(
-            ConfirmedEpisodes=(
-                "EpisodeId",
-                "size",
-            ),
-            AffectedFlights=(
-                "StartDatetime",
-                "nunique",
-            ),
-            AnomalousSamples=(
-                "AnomalousSamples",
-                "sum",
-            ),
-            MaximumScore=(
-                "MaxScore",
-                "max",
-            ),
-            AffectedFlightPhases=(
-                "FlightPhase",
-                lambda values: sorted(
-                    set(values)
-                ),
-            ),
-            FirstObserved=(
-                "EpisodeStart",
-                "min",
-            ),
-            LastObserved=(
-                "EpisodeEnd",
-                "max",
-            ),
+            ConfirmedEpisodes=("EpisodeId", "size"),
+            AffectedFlights=("StartDatetime", "nunique"),
+            AnomalousSamples=("AnomalousSamples", "sum"),
+            MaximumScore=("MaxScore", "max"),
+            AffectedFlightPhases=("FlightPhase", lambda values: sorted(set(values))),
+            FirstObserved=("EpisodeStart", "min"),
+            LastObserved=("EpisodeEnd", "max"),
         )
         .reset_index()
         .sort_values(
-            [
-                "MaximumScore",
-                "AffectedFlights",
-                "ConfirmedEpisodes",
-            ],
-            ascending=[
-                False,
-                False,
-                False,
-            ],
+            ["MaximumScore", "AffectedFlights", "ConfirmedEpisodes"],
+            ascending=[False, False, False],
             kind="stable",
         )
         .reset_index(drop=True)
     )
-
     regular_flight_summary = (
-        fast_anomaly_episodes
-        .groupby(
-            "StartDatetime"
-        )
+        fast_anomaly_episodes.groupby("StartDatetime")
         .agg(
-            ConfirmedEpisodes=(
-                "EpisodeId",
-                "size",
-            ),
-            AnomalousParameters=(
-                "Parameter",
-                "nunique",
-            ),
-            Parameters=(
-                "Parameter",
-                lambda values: sorted(
-                    set(values)
-                ),
-            ),
-            FlightPhases=(
-                "FlightPhase",
-                lambda values: sorted(
-                    set(values)
-                ),
-            ),
-            FirstAnomaly=(
-                "EpisodeStart",
-                "min",
-            ),
-            LastAnomaly=(
-                "EpisodeEnd",
-                "max",
-            ),
-            MaximumScore=(
-                "MaxScore",
-                "max",
-            ),
-            AnomalousSamples=(
-                "AnomalousSamples",
-                "sum",
-            ),
+            ConfirmedEpisodes=("EpisodeId", "size"),
+            AnomalousParameters=("Parameter", "nunique"),
+            Parameters=("Parameter", lambda values: sorted(set(values))),
+            FlightPhases=("FlightPhase", lambda values: sorted(set(values))),
+            FirstAnomaly=("EpisodeStart", "min"),
+            LastAnomaly=("EpisodeEnd", "max"),
+            MaximumScore=("MaxScore", "max"),
+            AnomalousSamples=("AnomalousSamples", "sum"),
         )
         .reset_index()
     )
 
 phase_flight_summary = (
-    fast_phase_issue_episodes
-    .groupby(
-        "StartDatetime"
-    )
+    fast_phase_issue_episodes.groupby("StartDatetime")
     .size()
-    .rename(
-        "FlightPhaseIssueEpisodes"
-    )
+    .rename("FlightPhaseIssueEpisodes")
     .reset_index()
     if not fast_phase_issue_episodes.empty
-    else pd.DataFrame(
-        columns=[
-            "StartDatetime",
-            "FlightPhaseIssueEpisodes",
-        ]
-    )
+    else pd.DataFrame(columns=["StartDatetime", "FlightPhaseIssueEpisodes"])
 )
 
-fast_anomaly_flights = (
-    regular_flight_summary.merge(
-        phase_flight_summary,
-        on="StartDatetime",
-        how="outer",
-    )
+fast_anomaly_flights = regular_flight_summary.merge(
+    phase_flight_summary,
+    on="StartDatetime",
+    how="outer",
 )
 
 contextual_flight_summary = (
-    fast_contextual_findings
-    .groupby(
-        "StartDatetime"
-    )
+    fast_contextual_findings.groupby("StartDatetime")
     .agg(
-        ContextualFindings=(
-            "Parameter",
-            "size",
-        ),
-        ContextualParameters=(
-            "Parameter",
-            lambda values: sorted(
-                set(values)
-            ),
-        ),
-        MaximumContextualZ=(
-            "ContextualResidualZ",
-            "max",
-        ),
+        ContextualFindings=("Parameter", "size"),
+        ContextualParameters=("Parameter", lambda values: sorted(set(values))),
+        MaximumContextualZ=("ContextualResidualZ", "max"),
     )
     .reset_index()
     if not fast_contextual_findings.empty
@@ -2586,12 +1331,10 @@ contextual_flight_summary = (
     )
 )
 
-fast_anomaly_flights = (
-    fast_anomaly_flights.merge(
-        contextual_flight_summary,
-        on="StartDatetime",
-        how="outer",
-    )
+fast_anomaly_flights = fast_anomaly_flights.merge(
+    contextual_flight_summary,
+    on="StartDatetime",
+    how="outer",
 )
 
 for column in [
@@ -2601,127 +1344,55 @@ for column in [
     "FlightPhaseIssueEpisodes",
     "ContextualFindings",
 ]:
-    if (
-        column
-        not in fast_anomaly_flights.columns
-    ):
-        fast_anomaly_flights[
-            column
-        ] = 0
+    if column not in fast_anomaly_flights.columns:
+        fast_anomaly_flights[column] = 0
+    fast_anomaly_flights[column] = pd.to_numeric(
+        fast_anomaly_flights[column], errors="coerce"
+    ).fillna(0).astype(int)
 
-    fast_anomaly_flights[
-        column
-    ] = (
-        pd.to_numeric(
-            fast_anomaly_flights[
-                column
-            ],
-            errors="coerce",
-        )
-        .fillna(0)
-        .astype(int)
-    )
-
-fast_anomaly_samples[
-    "AircraftIdentifier"
-] = str(selected_acid)
-
-fast_anomaly_samples[
-    "EngineSerialNumber"
-] = str(selected_esn)
-
-fast_anomaly_episodes[
-    "AircraftIdentifier"
-] = str(selected_acid)
-
-fast_anomaly_episodes[
-    "EngineSerialNumber"
-] = str(selected_esn)
-
-fast_anomaly_flights[
-    "AircraftIdentifier"
-] = str(selected_acid)
-
-fast_anomaly_flights[
-    "EngineSerialNumber"
-] = str(selected_esn)
+fast_anomaly_samples["AircraftIdentifier"] = str(selected_acid)
+fast_anomaly_samples["EngineSerialNumber"] = str(selected_esn)
+fast_anomaly_episodes["AircraftIdentifier"] = str(selected_acid)
+fast_anomaly_episodes["EngineSerialNumber"] = str(selected_esn)
+fast_anomaly_flights["AircraftIdentifier"] = str(selected_acid)
+fast_anomaly_flights["EngineSerialNumber"] = str(selected_esn)
 
 print(
-    f"Confirmed samples: "
-    f"{len(fast_anomaly_samples):,} | "
-    f"episodes: "
-    f"{len(fast_anomaly_episodes):,} | "
-    f"affected flights: "
-    f"{len(fast_anomaly_flights):,} | "
-    f"FlightPhase disagreement episodes: "
-    f"{len(fast_phase_issue_episodes):,} | "
-    f"degradation findings: "
-    f"{len(fast_degradation):,} | "
-    f"contextual findings: "
-    f"{len(fast_contextual_findings):,}"
+    f"Confirmed samples: {len(fast_anomaly_samples):,} | "
+    f"episodes: {len(fast_anomaly_episodes):,} | "
+    f"affected flights: {len(fast_anomaly_flights):,} | "
+    f"FlightPhase disagreement episodes: {len(fast_phase_issue_episodes):,} | "
+    f"degradation findings: {len(fast_degradation):,} | "
+    f"contextual findings: {len(fast_contextual_findings):,}"
 )
 
 print(
-    "Outputs: "
-    "fast_anomaly_samples, "
-    "fast_anomaly_episodes, "
-    "fast_anomaly_flights, "
-    "fast_parameter_summary, "
-    "fast_phase_issue_samples, "
-    "fast_phase_issue_episodes, "
-    "fast_degradation, "
-    "fast_contextual_findings"
+    "Outputs: fast_anomaly_samples, fast_anomaly_episodes, fast_anomaly_flights, "
+    "fast_parameter_summary, fast_phase_issue_samples, fast_phase_issue_episodes, "
+    "fast_degradation, fast_contextual_findings, parameter_reduction_df"
 )
 
 ipy_display(
-    fast_anomaly_flights
-    .sort_values(
-        [
-            "MaximumScore",
-            "ConfirmedEpisodes",
-        ],
-        ascending=[
-            False,
-            False,
-        ],
+    parameter_reduction_df.loc[
+        parameter_reduction_df["Selected"]
+    ].head(200)
+)
+ipy_display(
+    fast_anomaly_flights.sort_values(
+        ["MaximumScore", "ConfirmedEpisodes"],
+        ascending=[False, False],
         na_position="last",
         kind="stable",
-    )
-    .head(200)
+    ).head(200)
 )
-
+ipy_display(fast_parameter_summary.head(200))
 ipy_display(
-    fast_parameter_summary
-    .head(200)
-)
-
-ipy_display(
-    fast_anomaly_episodes
-    .sort_values(
-        [
-            "MaxScore",
-            "EpisodeStart",
-        ],
-        ascending=[
-            False,
-            True,
-        ],
+    fast_anomaly_episodes.sort_values(
+        ["MaxScore", "EpisodeStart"],
+        ascending=[False, True],
         kind="stable",
-    )
-    .head(500)
+    ).head(500)
 )
-
-ipy_display(
-    fast_phase_issue_episodes
-    .head(200)
-)
-
-ipy_display(
-    fast_degradation
-    .head(200)
-)
-
-ipy_display(
-    fast_contextual_findings
-    .head(200)
-)
+ipy_display(fast_phase_issue_episodes.head(200))
+ipy_display(fast_degradation.head(200))
+ipy_display(fast_contextual_findings.head(200))
