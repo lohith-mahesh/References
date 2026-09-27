@@ -18,6 +18,7 @@ EC_CHANNELS = ("AC", "BC")
 EC_DIVERGENCE_THRESHOLD = 0.25
 EC_MAX_LAG_SECONDS = 5.0
 EC_MAX_EVENT_ROWS = 5_000
+EC_STATE_TOLERANCE = 1e-6
 
 EC_DEFAULT_PARAMETERS = [
     "IThrustReverser_trLVTPosVCtrl_data",
@@ -30,6 +31,19 @@ EC_DEFAULT_PARAMETERS = [
     "IThrustReverser_trDoorStowStatus_data",
     "IThrustReverser_trIsDeployed_data",
 ]
+
+EC_GENERIC_STATE_VALUES = (0.0, 1.0, 100.0)
+EC_PARAMETER_STATE_VALUES = {
+    "IThrustReverser_trLVTPosVCtrl_data": (0.0, 100.0),
+    "IThrustReverser_loOwnTRLVTRaw_data": (0.0, 100.0),
+    "IThrustReverser_upOwnTRLVTRaw_data": (0.0, 100.0),
+    "IThrustReverser_trDoorDeplStatus_data": (0.0, 1.0, 2.0, 3.0),
+    "IThrustReverser_trArmed_data": (0.0, 1.0),
+    "IThrustReverser_trInTransit_data": (0.0, 1.0),
+    "IThrustReverser_trIsUnlocked_data": (0.0, 1.0),
+    "IThrustReverser_trDoorStowStatus_data": (0.0, 1.0),
+    "IThrustReverser_trIsDeployed_data": (0.0, 1.0),
+}
 
 EC_LABELS = {
     "IThrustReverser_trLVTPosVCtrl_data": "LVTPosVCntrl",
@@ -152,20 +166,17 @@ def _ec_event_text(base, resolved):
     return f"{label}={_ec_format_value(value)}"
 
 
-def _ec_spark_large_change(current, previous, absolute_threshold, relative_threshold):
-    current_number = current.cast("double")
-    previous_number = previous.cast("double")
-    difference = F.abs(current_number - previous_number)
-    scale = F.greatest(F.abs(current_number), F.abs(previous_number), F.lit(1e-12))
-    return (
-        current_number.isNotNull()
-        & previous_number.isNotNull()
-        & (difference >= F.lit(float(absolute_threshold)))
-        & ((difference / scale) >= F.lit(float(relative_threshold)))
-    )
+def _ec_recognized_state(value, base):
+    recognized = F.lit(None).cast("double")
+    for state in EC_PARAMETER_STATE_VALUES.get(base, EC_GENERIC_STATE_VALUES):
+        recognized = F.when(
+            F.abs(value.cast("double") - F.lit(float(state))) <= F.lit(EC_STATE_TOLERANCE),
+            F.lit(float(state)),
+        ).otherwise(recognized)
+    return recognized
 
 
-def _ec_build_event_df(source, parameters, absolute_threshold, relative_threshold):
+def _ec_build_event_df(source, parameters):
     order_window = Window.partitionBy("AssetIdentifier").orderBy("Timestamp")
     state_window = order_window.rowsBetween(Window.unboundedPreceding, Window.currentRow)
     state_expressions = []
@@ -209,6 +220,8 @@ def _ec_build_event_df(source, parameters, absolute_threshold, relative_threshol
                 "bc": bc_state,
                 "value": f"_ec_value_{index}",
                 "disagreement": f"_ec_disagreement_{index}",
+                "recognized": f"_ec_recognized_{index}",
+                "tracked": f"_ec_tracked_{index}",
                 "is_numeric": is_numeric,
             }
         )
@@ -227,68 +240,53 @@ def _ec_build_event_df(source, parameters, absolute_threshold, relative_threshol
             disagreement = both_present & ((difference / scale) >= F.lit(EC_DIVERGENCE_THRESHOLD))
         else:
             disagreement = both_present & (ac_state != bc_state)
+        recognized = (
+            _ec_recognized_state(current, metadata["base"])
+            if metadata["is_numeric"]
+            else current
+        )
         resolved_expressions.extend(
             [
                 current.alias(metadata["value"]),
                 F.coalesce(disagreement, F.lit(False)).alias(metadata["disagreement"]),
+                recognized.alias(metadata["recognized"]),
             ]
         )
     resolved_df = state_df.select("*", *resolved_expressions)
+    tracked_expressions = [
+        F.last(F.col(metadata["recognized"]), ignorenulls=True)
+        .over(state_window)
+        .alias(metadata["tracked"])
+        for metadata in parameter_metadata
+    ]
+    tracked_df = resolved_df.select("*", *tracked_expressions)
     previous_expressions = []
     for metadata in parameter_metadata:
         previous_expressions.extend(
             [
-                F.lag(metadata["value"]).over(order_window).alias(f"_ec_previous_value_{metadata['index']}"),
+                F.lag(metadata["tracked"]).over(order_window).alias(f"_ec_previous_tracked_{metadata['index']}"),
                 F.lag(metadata["disagreement"]).over(order_window).alias(f"_ec_previous_disagreement_{metadata['index']}"),
-                F.lag(metadata["ac"]).over(order_window).alias(f"_ec_previous_ac_{metadata['index']}"),
-                F.lag(metadata["bc"]).over(order_window).alias(f"_ec_previous_bc_{metadata['index']}"),
             ]
         )
-    comparison_df = resolved_df.select("*", *previous_expressions)
+    comparison_df = tracked_df.select("*", *previous_expressions)
     event_expressions = []
     for metadata in parameter_metadata:
         index = metadata["index"]
         current = F.col(metadata["value"])
-        previous = F.col(f"_ec_previous_value_{index}")
+        recognized = F.col(metadata["recognized"])
+        tracked = F.col(metadata["tracked"])
+        previous_tracked = F.col(f"_ec_previous_tracked_{index}")
         disagreement = F.col(metadata["disagreement"])
         previous_disagreement = F.coalesce(
             F.col(f"_ec_previous_disagreement_{index}"),
             F.lit(False),
         )
-        if metadata["is_numeric"]:
-            primary_change = _ec_spark_large_change(
-                current,
-                previous,
-                absolute_threshold,
-                relative_threshold,
-            )
-            ac_change = _ec_spark_large_change(
-                F.col(metadata["ac"]),
-                F.col(f"_ec_previous_ac_{index}"),
-                absolute_threshold,
-                relative_threshold,
-            )
-            bc_change = _ec_spark_large_change(
-                F.col(metadata["bc"]),
-                F.col(f"_ec_previous_bc_{index}"),
-                absolute_threshold,
-                relative_threshold,
-            )
-        else:
-            primary_change = current != previous
-            ac_change = F.col(metadata["ac"]) != F.col(f"_ec_previous_ac_{index}")
-            bc_change = F.col(metadata["bc"]) != F.col(f"_ec_previous_bc_{index}")
+        recognized_transition = recognized.isNotNull() & (
+            previous_tracked.isNull() | (tracked != previous_tracked)
+        )
         event_condition = current.isNotNull() & (
-            previous.isNull()
-            | F.coalesce(primary_change, F.lit(False))
+            recognized_transition
             | (disagreement != previous_disagreement)
-            | (
-                disagreement
-                & (
-                    F.coalesce(ac_change, F.lit(False))
-                    | F.coalesce(bc_change, F.lit(False))
-                )
-            )
         )
         event_expressions.append(
             F.when(
@@ -571,22 +569,6 @@ ec_remove_parameter_button = widgets.Button(
     button_style="danger",
     icon="trash",
 )
-ec_absolute_change_widget = widgets.BoundedFloatText(
-    value=0.5,
-    min=0.0,
-    max=1_000_000_000.0,
-    step=0.1,
-    description="Min change:",
-    layout=widgets.Layout(width="260px"),
-)
-ec_relative_change_widget = widgets.BoundedFloatText(
-    value=25.0,
-    min=0.0,
-    max=100.0,
-    step=5.0,
-    description="Min change %:",
-    layout=widgets.Layout(width="260px"),
-)
 ec_load_button = widgets.Button(
     description="Load comparison",
     button_style="success",
@@ -691,8 +673,6 @@ def _ec_load_comparison(_):
         flight_date = ec_date_widget.value
         start_time = ec_flight_widget.value
         parameters = _ec_selected_parameters()
-        absolute_threshold = float(ec_absolute_change_widget.value)
-        relative_threshold = float(ec_relative_change_widget.value) / 100.0
         if flight_date is None or start_time is None:
             raise ValueError("Choose a date and flight before loading the comparison.")
         if not parameters:
@@ -765,19 +745,14 @@ def _ec_load_comparison(_):
         )
         ec_progress_widget.value = "<b>Detecting large transitions in Spark…</b>"
         event_frame = (
-            _ec_build_event_df(
-                source,
-                parameters,
-                absolute_threshold,
-                relative_threshold,
-            )
+            _ec_build_event_df(source, parameters)
             .limit(EC_MAX_EVENT_ROWS + 1)
             .toPandas()
         )
         if len(event_frame) > EC_MAX_EVENT_ROWS:
             raise RuntimeError(
                 f"More than {EC_MAX_EVENT_ROWS:,} qualifying events were found. "
-                "Increase the change thresholds or select fewer signals."
+                "Select fewer signals."
             )
         if event_frame.empty:
             raise ValueError("No populated signal states were found for the selected flight and engines.")
@@ -787,7 +762,7 @@ def _ec_load_comparison(_):
             f"Aircraft {aircraft} | Flight {flight_date} "
             f"{_ec_timestamp_text(start_time)}–{_ec_timestamp_text(end_time)} | "
             f"{len(event_frame):,} qualifying engine events | "
-            f"numeric changes ≥{absolute_threshold:g} and ≥{relative_threshold:.0%} | "
+            "recognized state transitions only | "
             f"AC primary, BC fallback | AC/BC divergence threshold {EC_DIVERGENCE_THRESHOLD:.0%}."
         )
         with ec_table_output:
@@ -817,7 +792,6 @@ ec_controls = widgets.VBox(
         ec_flight_widget,
         ec_parameter_search,
         ec_parameter_widget,
-        widgets.HBox([ec_absolute_change_widget, ec_relative_change_widget]),
         widgets.HBox([ec_remove_parameter_button, ec_load_button]),
         ec_progress_widget,
         ec_status_output,
