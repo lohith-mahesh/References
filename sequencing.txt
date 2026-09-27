@@ -265,20 +265,22 @@ def _ec_build_event_df(source, parameters):
                 "base": base,
                 "ac": ac_state,
                 "bc": bc_state,
-                "value": f"_ec_value_{index}",
                 "disagreement": f"_ec_disagreement_{index}",
-                "recognized": f"_ec_recognized_{index}",
-                "tracked": f"_ec_tracked_{index}",
+                "ac_recognized": f"_ec_ac_recognized_{index}",
+                "bc_recognized": f"_ec_bc_recognized_{index}",
+                "ac_tracked": f"_ec_ac_tracked_{index}",
+                "bc_tracked": f"_ec_bc_tracked_{index}",
+                "candidate": f"_ec_candidate_{index}",
+                "candidate_tracked": f"_ec_candidate_tracked_{index}",
                 "is_boolean": is_boolean,
                 "is_numeric": is_numeric,
             }
         )
     state_df = source.select("Timestamp", "AssetIdentifier", *state_expressions)
-    resolved_expressions = []
+    recognized_expressions = []
     for metadata in parameter_metadata:
         ac_state = F.col(metadata["ac"])
         bc_state = F.col(metadata["bc"])
-        current = F.coalesce(ac_state, bc_state)
         if metadata["is_numeric"]:
             disagreement = _ec_extreme_channel_conflict(
                 ac_state,
@@ -286,55 +288,89 @@ def _ec_build_event_df(source, parameters):
                 metadata["base"],
                 metadata["is_boolean"],
             )
+            ac_recognized = _ec_recognized_state(ac_state, metadata["base"])
+            bc_recognized = _ec_recognized_state(bc_state, metadata["base"])
         else:
             disagreement = F.lit(False)
-        recognized = (
-            _ec_recognized_state(current, metadata["base"])
-            if metadata["is_numeric"]
-            else current
-        )
-        resolved_expressions.extend(
+            ac_recognized = ac_state
+            bc_recognized = bc_state
+        recognized_expressions.extend(
             [
-                current.alias(metadata["value"]),
                 F.coalesce(disagreement, F.lit(False)).alias(metadata["disagreement"]),
-                recognized.alias(metadata["recognized"]),
+                ac_recognized.alias(metadata["ac_recognized"]),
+                bc_recognized.alias(metadata["bc_recognized"]),
             ]
         )
-    resolved_df = state_df.select("*", *resolved_expressions)
+    recognized_df = state_df.select("*", *recognized_expressions)
     tracked_expressions = [
-        F.last(F.col(metadata["recognized"]), ignorenulls=True)
-        .over(state_window)
-        .alias(metadata["tracked"])
+        expression
         for metadata in parameter_metadata
+        for expression in (
+            F.last(F.col(metadata["ac_recognized"]), ignorenulls=True)
+            .over(state_window)
+            .alias(metadata["ac_tracked"]),
+            F.last(F.col(metadata["bc_recognized"]), ignorenulls=True)
+            .over(state_window)
+            .alias(metadata["bc_tracked"]),
+        )
     ]
-    tracked_df = resolved_df.select("*", *tracked_expressions)
+    tracked_df = recognized_df.select("*", *tracked_expressions)
     previous_expressions = []
     for metadata in parameter_metadata:
         previous_expressions.extend(
             [
-                F.lag(metadata["tracked"]).over(order_window).alias(f"_ec_previous_tracked_{metadata['index']}"),
-                F.lag(metadata["disagreement"]).over(order_window).alias(f"_ec_previous_disagreement_{metadata['index']}"),
+                F.lag(metadata["ac_tracked"])
+                .over(order_window)
+                .alias(f"_ec_previous_ac_tracked_{metadata['index']}"),
+                F.lag(metadata["bc_tracked"])
+                .over(order_window)
+                .alias(f"_ec_previous_bc_tracked_{metadata['index']}"),
             ]
         )
-    comparison_df = tracked_df.select("*", *previous_expressions)
+    channel_comparison_df = tracked_df.select("*", *previous_expressions)
+    candidate_expressions = []
+    for metadata in parameter_metadata:
+        index = metadata["index"]
+        ac_recognized = F.col(metadata["ac_recognized"])
+        bc_recognized = F.col(metadata["bc_recognized"])
+        ac_tracked = F.col(metadata["ac_tracked"])
+        bc_tracked = F.col(metadata["bc_tracked"])
+        previous_ac = F.col(f"_ec_previous_ac_tracked_{index}")
+        previous_bc = F.col(f"_ec_previous_bc_tracked_{index}")
+        ac_transition = ac_recognized.isNotNull() & (
+            previous_ac.isNull() | (ac_tracked != previous_ac)
+        )
+        bc_transition = bc_recognized.isNotNull() & (
+            previous_bc.isNull() | (bc_tracked != previous_bc)
+        )
+        candidate_expressions.append(
+            F.when(ac_transition, ac_tracked)
+            .when(bc_transition, bc_tracked)
+            .alias(metadata["candidate"])
+        )
+    candidate_df = channel_comparison_df.select("*", *candidate_expressions)
+    candidate_tracked_expressions = [
+        F.last(F.col(metadata["candidate"]), ignorenulls=True)
+        .over(state_window)
+        .alias(metadata["candidate_tracked"])
+        for metadata in parameter_metadata
+    ]
+    candidate_tracked_df = candidate_df.select("*", *candidate_tracked_expressions)
+    previous_candidate_expressions = [
+        F.lag(metadata["candidate_tracked"])
+        .over(order_window)
+        .alias(f"_ec_previous_candidate_{metadata['index']}")
+        for metadata in parameter_metadata
+    ]
+    comparison_df = candidate_tracked_df.select("*", *previous_candidate_expressions)
     event_expressions = []
     for metadata in parameter_metadata:
         index = metadata["index"]
-        current = F.col(metadata["value"])
-        recognized = F.col(metadata["recognized"])
-        tracked = F.col(metadata["tracked"])
-        previous_tracked = F.col(f"_ec_previous_tracked_{index}")
-        disagreement = F.col(metadata["disagreement"])
-        previous_disagreement = F.coalesce(
-            F.col(f"_ec_previous_disagreement_{index}"),
-            F.lit(False),
-        )
-        recognized_transition = recognized.isNotNull() & (
-            previous_tracked.isNull() | (tracked != previous_tracked)
-        )
-        event_condition = current.isNotNull() & (
-            recognized_transition
-            | (disagreement & ~previous_disagreement)
+        candidate = F.col(metadata["candidate"])
+        candidate_tracked = F.col(metadata["candidate_tracked"])
+        previous_candidate = F.col(f"_ec_previous_candidate_{index}")
+        event_condition = candidate.isNotNull() & (
+            previous_candidate.isNull() | (candidate_tracked != previous_candidate)
         )
         event_expressions.append(
             F.when(
@@ -344,10 +380,8 @@ def _ec_build_event_df(source, parameters):
                     F.lit(index).alias("parameter_order"),
                     F.col(metadata["ac"]).cast("string").alias("ac_value"),
                     F.col(metadata["bc"]).cast("string").alias("bc_value"),
-                    F.when(recognized_transition, recognized.cast("string"))
-                    .otherwise(current.cast("string"))
-                    .alias("value"),
-                    disagreement.alias("disagreement"),
+                    candidate_tracked.cast("string").alias("value"),
+                    F.col(metadata["disagreement"]).alias("disagreement"),
                 ),
             )
         )
@@ -802,4 +836,3 @@ ec_controls = widgets.VBox(
 ipy_display(ec_controls)
 _ec_refresh_parameter_search()
 _ec_refresh_flights(raise_errors=True)
-
