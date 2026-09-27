@@ -17,6 +17,8 @@ EC_PARAMETER_PREFIX = "Parameter:EVHMU_EEC_"
 EC_CHANNELS = ("AC", "BC")
 EC_MAX_EVENT_ROWS = 5_000
 EC_STATE_TOLERANCE = 1e-6
+EC_LVT_LOW_THRESHOLD = 1.0
+EC_LVT_HIGH_THRESHOLD = 99.0
 
 EC_DEFAULT_PARAMETERS = [
     "IThrustReverser_trLVTPosVCtrl_data",
@@ -49,6 +51,12 @@ EC_BINARY_PARAMETERS = {
     "IThrustReverser_trIsUnlocked_data",
     "IThrustReverser_trDoorStowStatus_data",
     "IThrustReverser_trIsDeployed_data",
+}
+
+EC_ANALOG_LVT_PARAMETERS = {
+    "IThrustReverser_trLVTPosVCtrl_data",
+    "IThrustReverser_loOwnTRLVTRaw_data",
+    "IThrustReverser_upOwnTRLVTRaw_data",
 }
 
 EC_LABELS = {
@@ -175,6 +183,13 @@ def _ec_event_text(base, resolved):
 
 
 def _ec_recognized_state(value, base):
+    if base in EC_ANALOG_LVT_PARAMETERS:
+        numeric = value.cast("double")
+        return (
+            F.when(numeric <= F.lit(EC_LVT_LOW_THRESHOLD), F.lit(0.0))
+            .when(numeric >= F.lit(EC_LVT_HIGH_THRESHOLD), F.lit(100.0))
+            .otherwise(F.lit(None).cast("double"))
+        )
     recognized = F.lit(None).cast("double")
     for state in EC_PARAMETER_STATE_VALUES.get(base, EC_GENERIC_STATE_VALUES):
         recognized = F.when(
@@ -329,7 +344,9 @@ def _ec_build_event_df(source, parameters):
                     F.lit(index).alias("parameter_order"),
                     F.col(metadata["ac"]).cast("string").alias("ac_value"),
                     F.col(metadata["bc"]).cast("string").alias("bc_value"),
-                    current.cast("string").alias("value"),
+                    F.when(recognized_transition, recognized.cast("string"))
+                    .otherwise(current.cast("string"))
+                    .alias("value"),
                     disagreement.alias("disagreement"),
                 ),
             )
