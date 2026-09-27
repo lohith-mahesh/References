@@ -3,333 +3,309 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import ipywidgets as widgets
-from IPython.display import clear_output, display as ipy_display
+from IPython.display import clear_output, display
 from pyspark.sql import functions as F
 
-CDA_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousscan-cda`"
+SCAN_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousscan-cda`"
 PARAMETER_PREFIX = "Parameter:EVHMU_EEC_AC_"
 
-EVENT_PARAMETERS = [
-    ("TR Armed", "IThrustReverser_trArmed_data", "on_off"),
-    ("In Transit", "IThrustReverser_trInTransit_data", "on_off"),
-    ("Is Unlocked", "IThrustReverser_trIsUnlocked_data", "on_off"),
-    ("Door Stow", "IThrustReverser_trDoorStowStatus_data", "open_close"),
-    ("DoorDep Status", "IThrustReverser_trDoorDeplStatus_data", "raw"),
-    ("IsDeployed", "IThrustReverser_trIsDeployed_data", "binary"),
-    ("Up TRLVT", "IThrustReverser_upOwnTRLVTRaw_data", "position"),
-    ("Low TRLVT", "IThrustReverser_loOwnTRLVTRaw_data", "position"),
-    ("LVTPosVCntrl", "IThrustReverser_trLVTPosVCtrl_data", "position"),
-]
+EVENT_PARAMETERS = {
+    "TR Armed": "IThrustReverser_trArmed_data",
+    "DoorDep Status": "IThrustReverser_trDoorDeplStatus_data",
+    "Door Stow Status": "IThrustReverser_trDoorStowStatus_data",
+    "In Transit": "IThrustReverser_trInTransit_data",
+    "IsDeployed": "IThrustReverser_trIsDeployed_data",
+    "Is Unlocked": "IThrustReverser_trIsUnlocked_data",
+    "LVTPosVCntrl": "IThrustReverser_trLVTPosVCtrl_data",
+    "Low TRLVT": "IThrustReverser_loOwnTRLVTRaw_data",
+    "Up TRLVT": "IThrustReverser_upOwnTRLVTRaw_data",
+}
 
-IDENTIFIER_COLUMNS = ["ParentAssetIdentifier", "AssetIdentifier", "Timestamp"]
-POSITION_STOWED_MAX = 1.0
-POSITION_DEPLOYED_MIN = 98.0
-POSITION_VALID_MIN = 0.0
-POSITION_VALID_MAX = 100.0
-MAX_PANDAS_ROWS = 1_000_000
+POSITION_EVENTS = {"LVTPosVCntrl", "Low TRLVT", "Up TRLVT"}
+ON_OFF_EVENTS = {"TR Armed", "In Transit", "Is Unlocked"}
+ZERO_ONE_EVENTS = {"IsDeployed"}
+REQUIRED_BASE_COLUMNS = {"Timestamp", "ParentAssetIdentifier", "AssetIdentifier"}
 
 
-def _parse_timestamp(text, field_name):
-    value = text.strip()
+def _parse_timestamp(value, field_name):
+    value = value.strip()
     if not value:
         raise ValueError(f"{field_name} is required.")
     try:
         parsed = pd.Timestamp(value)
     except Exception as exc:
         raise ValueError(
-            f"{field_name} must be a valid date/time, for example 2026-09-27 20:03:55.600."
+            f"{field_name} must be a valid timestamp, for example 2026-09-27 20:03:55.600."
         ) from exc
     if pd.isna(parsed):
-        raise ValueError(f"{field_name} is invalid.")
+        raise ValueError(f"{field_name} is not a valid timestamp.")
     if parsed.tzinfo is not None:
-        raise ValueError(f"{field_name} must not include a timezone offset.")
-    return parsed.to_pydatetime()
+        raise ValueError(f"{field_name} must not contain a timezone offset.")
+    return parsed
 
 
-def _normalize_scalar(value):
+def _position_state(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    if 0.0 <= numeric <= 1.0:
+        return "STOWED [0–1]"
+    if 1.0 < numeric < 98.0:
+        return "TRANSIT (1–98)"
+    if 98.0 <= numeric <= 100.0:
+        return "DEPLOYED [98–100]"
+    return f"OUT OF RANGE [{numeric:g}]"
+
+
+def _normalized_scalar(value):
     if pd.isna(value):
         return None
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, bool):
+    if isinstance(value, (np.bool_, bool)):
         return int(value)
-    if isinstance(value, (int, np.integer)):
+    if isinstance(value, (np.integer, int)):
         return int(value)
-    if isinstance(value, (float, np.floating)):
+    if isinstance(value, (np.floating, float)):
         numeric = float(value)
         if not np.isfinite(numeric):
             return None
         if numeric.is_integer():
             return int(numeric)
         return numeric
-    return value
+    return str(value).strip()
 
 
-def _same_state(left, right):
-    if left is None or right is None:
-        return left is right
-    if isinstance(left, (int, float, np.integer, np.floating)) and isinstance(
-        right, (int, float, np.integer, np.floating)
-    ):
-        return float(left) == float(right)
-    return left == right
-
-
-def _format_raw(value):
-    value = _normalize_scalar(value)
-    if value is None:
-        return None
-    if isinstance(value, float):
-        return f"{value:.12g}"
-    return str(value)
-
-
-def _position_state(value):
-    value = _normalize_scalar(value)
-    if not isinstance(value, (int, float)):
-        return None
-    numeric = float(value)
-    if not np.isfinite(numeric):
-        return None
-    if numeric < POSITION_VALID_MIN or numeric > POSITION_VALID_MAX:
-        return "OUT OF RANGE [expected 0-100]"
-    if numeric <= POSITION_STOWED_MAX:
-        return "STOWED [0-1]"
-    if numeric < POSITION_DEPLOYED_MIN:
-        return "TRANSIT (1-98)"
-    return "DEPLOYED [98-100]"
-
-
-def _event_text(label, kind, value):
-    normalized = _normalize_scalar(value)
+def _binary_value(value, true_text, false_text):
+    normalized = _normalized_scalar(value)
     if normalized is None:
-        return None, None
-
-    if kind == "position":
-        state = _position_state(normalized)
-        return state, None if state is None else f"{label} = {state}"
-
-    if kind == "on_off":
-        if normalized == 1:
-            return 1, f"{label} = ON"
-        if normalized == 0:
-            return 0, f"{label} = OFF"
-        raw = _format_raw(normalized)
-        return normalized, f"{label} = {raw}"
-
-    if kind == "open_close":
-        if normalized == 1:
-            return 1, f"{label} = OPEN"
-        if normalized == 0:
-            return 0, f"{label} = CLOSE"
-        raw = _format_raw(normalized)
-        return normalized, f"{label} = {raw}"
-
-    if kind == "binary":
-        raw = _format_raw(normalized)
-        return normalized, f"{label} = {raw}"
-
-    raw = _format_raw(normalized)
-    return normalized, f"{label} = {raw}"
+        return None
+    if normalized in (1, "1", "1.0", "True", "true", "TRUE"):
+        return true_text
+    if normalized in (0, "0", "0.0", "False", "false", "FALSE"):
+        return false_text
+    return str(normalized)
 
 
-def _build_event_table(source_pdf, engine_ids, available_events):
-    event_records = []
+def _event_text(event_name, value):
+    if event_name in POSITION_EVENTS:
+        state = _position_state(value)
+        return None if state is None else f"{event_name} = {state}"
+    if event_name in ON_OFF_EVENTS:
+        state = _binary_value(value, "ON", "OFF")
+        return None if state is None else f"{event_name} = {state}"
+    if event_name in ZERO_ONE_EVENTS:
+        state = _binary_value(value, "1", "0")
+        return None if state is None else f"{event_name} = {state}"
+    normalized = _normalized_scalar(value)
+    return None if normalized is None else f"{event_name} = {normalized}"
 
+
+def _change_key(event_name, value):
+    if event_name in POSITION_EVENTS:
+        return _position_state(value)
+    if event_name in ON_OFF_EVENTS or event_name in ZERO_ONE_EVENTS:
+        return _normalized_scalar(value)
+    return _normalized_scalar(value)
+
+
+def _extract_events(source_pdf, engine_ids, available_parameters):
+    records = []
     for engine_id in engine_ids:
-        engine_pdf = source_pdf.loc[source_pdf["AssetIdentifier"] == engine_id].copy()
-        engine_pdf = engine_pdf.sort_values(["Timestamp", "_SourceOrder"], kind="stable")
-
-        for parameter_order, (label, full_column, kind) in enumerate(available_events):
-            parameter_rows = engine_pdf.loc[
-                engine_pdf[full_column].notna(), ["Timestamp", "_SourceOrder", full_column]
-            ]
-            previous_state = None
-            has_previous_state = False
-
-            for timestamp, source_order, raw_value in parameter_rows.itertuples(index=False, name=None):
-                state, text = _event_text(label, kind, raw_value)
-                if state is None or text is None:
+        engine_pdf = source_pdf.loc[source_pdf["AssetIdentifier"].astype(str) == engine_id]
+        engine_pdf = engine_pdf.sort_values("Timestamp", kind="stable")
+        for event_name, full_column in available_parameters.items():
+            previous_key = object()
+            has_previous = False
+            for timestamp, value in engine_pdf[["Timestamp", full_column]].itertuples(index=False, name=None):
+                if pd.isna(timestamp) or pd.isna(value):
                     continue
-                if not has_previous_state or not _same_state(state, previous_state):
-                    event_records.append(
+                key = _change_key(event_name, value)
+                text = _event_text(event_name, value)
+                if key is None or text is None:
+                    continue
+                if not has_previous or key != previous_key:
+                    records.append(
                         {
                             "Timestamp": timestamp,
                             "EngineNo": engine_id,
                             "Event": text,
-                            "_ParameterOrder": parameter_order,
-                            "_SourceOrder": source_order,
+                            "_ParameterOrder": list(EVENT_PARAMETERS).index(event_name),
                         }
                     )
-                    previous_state = state
-                    has_previous_state = True
+                    previous_key = key
+                    has_previous = True
 
-    if not event_records:
+    if not records:
         return pd.DataFrame(columns=["Timestamp", *engine_ids])
 
-    events = pd.DataFrame(event_records)
-    events = events.sort_values(
-        ["Timestamp", "_ParameterOrder", "_SourceOrder", "EngineNo"], kind="stable"
+    long_df = pd.DataFrame.from_records(records)
+    long_df = long_df.sort_values(
+        ["Timestamp", "_ParameterOrder", "EngineNo"], kind="stable"
     ).reset_index(drop=True)
-    events["_ParameterOccurrence"] = events.groupby(
-        ["Timestamp", "EngineNo", "_ParameterOrder"], sort=False
+    long_df["_EventSlot"] = long_df.groupby(
+        ["Timestamp", "EngineNo"], sort=False
     ).cumcount()
 
-    event_table = (
-        events.pivot(
-            index=["Timestamp", "_ParameterOrder", "_ParameterOccurrence"],
-            columns="EngineNo",
-            values="Event",
-        )
-        .reindex(columns=engine_ids)
-        .reset_index()
-        .sort_values(
-            ["Timestamp", "_ParameterOrder", "_ParameterOccurrence"], kind="stable"
-        )
-        .drop(columns=["_ParameterOrder", "_ParameterOccurrence"])
-        .reset_index(drop=True)
-    )
-    event_table.columns.name = None
-    return event_table
+    wide_df = long_df.pivot(
+        index=["Timestamp", "_EventSlot"], columns="EngineNo", values="Event"
+    ).reset_index()
+    wide_df.columns.name = None
+    for engine_id in engine_ids:
+        if engine_id not in wide_df.columns:
+            wide_df[engine_id] = pd.NA
+    wide_df = wide_df[["Timestamp", *engine_ids]]
+    wide_df = wide_df.sort_values("Timestamp", kind="stable").reset_index(drop=True)
+    return wide_df
 
 
-cda_catalog = spark.table(CDA_TABLE)
-cda_columns = cda_catalog.columns
-cda_schema = set(cda_columns)
-
-missing_identifiers = [column for column in IDENTIFIER_COLUMNS if column not in cda_schema]
-if missing_identifiers:
-    raise ValueError(f"The CDA table is missing required columns: {missing_identifiers}")
-
-available_events = []
-missing_event_columns = []
-for label, suffix, kind in EVENT_PARAMETERS:
-    full_column = f"{PARAMETER_PREFIX}{suffix}"
-    if full_column in cda_schema:
-        available_events.append((label, full_column, kind))
-    else:
-        missing_event_columns.append(full_column)
-
-if not available_events:
-    raise ValueError("None of the required AC thrust-reverser event parameters exist in the CDA table.")
-
-aircraft_widget = widgets.Text(
-    description="Aircraft ID:",
-    placeholder="ParentAssetIdentifier",
-    layout=widgets.Layout(width="430px"),
-)
-start_time_widget = widgets.Text(
-    description="Start:",
-    placeholder="YYYY-MM-DD HH:MM:SS.sss",
-    layout=widgets.Layout(width="430px"),
-)
-end_time_widget = widgets.Text(
-    description="End:",
-    placeholder="YYYY-MM-DD HH:MM:SS.sss",
-    layout=widgets.Layout(width="430px"),
-)
-load_button = widgets.Button(
-    description="Build event table",
-    button_style="primary",
-    layout=widgets.Layout(width="190px"),
-)
-output = widgets.Output()
-
-filtered_cda_df = None
-event_source_df = None
-event_df = None
+def _month_pairs(start_ts, end_ts):
+    periods = pd.period_range(start=start_ts.to_period("M"), end=end_ts.to_period("M"), freq="M")
+    return [(int(period.year), int(period.month)) for period in periods]
 
 
-def _build_events(_):
-    global filtered_cda_df, event_source_df, event_df
-
-    load_button.disabled = True
+def _build_timeline(_=None):
+    run_button.disabled = True
     try:
         with output:
             clear_output(wait=True)
-
-            aircraft_id = aircraft_widget.value.strip()
+            aircraft_id = aircraft_input.value.strip()
             if not aircraft_id:
-                raise ValueError("Aircraft ID is required.")
+                raise ValueError("Flight No. / Aircraft ID is required.")
 
-            start_ts = _parse_timestamp(start_time_widget.value, "Start")
-            end_ts = _parse_timestamp(end_time_widget.value, "End")
+            start_ts = _parse_timestamp(start_input.value, "Start timestamp")
+            end_ts = _parse_timestamp(end_input.value, "End timestamp")
             if start_ts > end_ts:
-                raise ValueError("Start must not be later than End.")
+                raise ValueError("Start timestamp must not be later than end timestamp.")
 
-            query = cda_catalog.where(
-                (F.col("ParentAssetIdentifier").cast("string") == F.lit(aircraft_id))
-                & F.col("Timestamp").between(F.lit(start_ts), F.lit(end_ts))
+            scan_df = spark.table(SCAN_TABLE)
+            schema_columns = set(scan_df.columns)
+            missing_base = sorted(REQUIRED_BASE_COLUMNS - schema_columns)
+            if missing_base:
+                raise ValueError(f"The CDA scan table is missing required columns: {missing_base}")
+
+            full_parameters = {
+                event_name: f"{PARAMETER_PREFIX}{suffix}"
+                for event_name, suffix in EVENT_PARAMETERS.items()
+            }
+            missing_parameters = [
+                column for column in full_parameters.values() if column not in schema_columns
+            ]
+            if missing_parameters:
+                raise ValueError(
+                    "The CDA scan table is missing required AC thrust-reverser parameters: "
+                    + ", ".join(missing_parameters)
+                )
+
+            filter_condition = (
+                (F.col("ParentAssetIdentifier").cast("string") == aircraft_id)
+                & F.col("Timestamp").between(start_ts.to_pydatetime(), end_ts.to_pydatetime())
             )
 
-            if "year" in cda_schema and "Month" in cda_schema:
-                start_month = start_ts.year * 12 + start_ts.month
-                end_month = end_ts.year * 12 + end_ts.month
-                month_number = F.col("year").cast("int") * F.lit(12) + F.col("Month").cast("int")
-                query = query.where(month_number.between(start_month, end_month))
+            if "year" in schema_columns and "Month" in schema_columns:
+                partition_condition = F.lit(False)
+                for year_value, month_value in _month_pairs(start_ts, end_ts):
+                    partition_condition = partition_condition | (
+                        (F.col("year") == year_value) & (F.col("Month") == month_value)
+                    )
+                filter_condition = filter_condition & partition_condition
 
-            selected_columns = IDENTIFIER_COLUMNS + [item[1] for item in available_events]
-            filtered_cda_df = query.select(*selected_columns)
+            selected_columns = [
+                "Timestamp",
+                "ParentAssetIdentifier",
+                "AssetIdentifier",
+                *full_parameters.values(),
+            ]
+            filtered_spark_df = (
+                scan_df.where(filter_condition)
+                .select(*selected_columns)
+                .orderBy(F.col("Timestamp"), F.col("AssetIdentifier"))
+            )
 
-            row_count = filtered_cda_df.count()
-            if row_count == 0:
-                raise ValueError("No CDA samples were found for that aircraft and time interval.")
-            if row_count > MAX_PANDAS_ROWS:
-                raise RuntimeError(
-                    f"The selected interval contains {row_count:,} rows. "
-                    f"Reduce the interval below {MAX_PANDAS_ROWS:,} rows before event extraction."
+            engine_ids = [
+                row["AssetIdentifier"]
+                for row in filtered_spark_df.select(
+                    F.col("AssetIdentifier").cast("string").alias("AssetIdentifier")
                 )
-
-            source_pdf = filtered_cda_df.toPandas()
-            source_pdf["Timestamp"] = pd.to_datetime(source_pdf["Timestamp"], errors="coerce")
-            source_pdf["AssetIdentifier"] = source_pdf["AssetIdentifier"].astype("string")
-            source_pdf = source_pdf.loc[
-                source_pdf["Timestamp"].notna() & source_pdf["AssetIdentifier"].notna()
-            ].copy()
-            if source_pdf.empty:
-                raise ValueError("The filtered CDA rows contain no usable Timestamp/Engine ID pairs.")
-
-            source_pdf["_SourceOrder"] = np.arange(len(source_pdf), dtype=np.int64)
-            source_pdf = source_pdf.sort_values(
-                ["Timestamp", "AssetIdentifier", "_SourceOrder"], kind="stable"
-            ).reset_index(drop=True)
-
-            engine_ids = sorted(source_pdf["AssetIdentifier"].dropna().unique().tolist())
+                .where(F.col("AssetIdentifier").isNotNull())
+                .distinct()
+                .orderBy("AssetIdentifier")
+                .collect()
+            ]
+            if not engine_ids:
+                raise ValueError("No CDA records were found for the requested aircraft and time interval.")
             if len(engine_ids) != 2:
                 raise ValueError(
-                    f"Expected exactly two engine IDs in the selected interval; found {len(engine_ids)}: {engine_ids}"
+                    f"Expected exactly two engine identifiers in the requested interval; found {len(engine_ids)}: {engine_ids}"
                 )
 
-            event_source_df = source_pdf.drop(columns="_SourceOrder").reset_index(drop=True)
-            event_df = _build_event_table(source_pdf, engine_ids, available_events)
+            source_pdf = filtered_spark_df.toPandas()
+            if source_pdf.empty:
+                raise ValueError("No CDA records were found after filtering.")
+            source_pdf["Timestamp"] = pd.to_datetime(source_pdf["Timestamp"], errors="coerce")
+            source_pdf["AssetIdentifier"] = source_pdf["AssetIdentifier"].astype("string")
+            source_pdf = source_pdf.loc[source_pdf["Timestamp"].notna()].copy()
+            if source_pdf.empty:
+                raise ValueError("All filtered CDA timestamps are invalid or null.")
+
+            event_df = _extract_events(source_pdf, engine_ids, full_parameters)
+            filtered_cda_df = source_pdf
+            globals()["filtered_cda_df"] = filtered_cda_df
+            globals()["event_df"] = event_df
 
             print(f"Aircraft ID: {aircraft_id}")
             print(f"Interval: {start_ts} through {end_ts}")
-            print(f"CDA samples: {row_count:,}")
-            print(f"Engine IDs: {engine_ids[0]}, {engine_ids[1]}")
-            print(f"AC event parameters available: {len(available_events)} / {len(EVENT_PARAMETERS)}")
-            if missing_event_columns:
-                print("Missing AC event parameters:")
-                for column in missing_event_columns:
-                    print(f"  {column}")
+            print(f"Engines: {engine_ids[0]}, {engine_ids[1]}")
+            print(f"Filtered CDA rows: {len(filtered_cda_df):,}")
             print(f"Event rows: {len(event_df):,}")
-            ipy_display(event_df)
-
+            display(event_df)
     except Exception as exc:
-        event_df = None
-        print(f"Unable to build event table: {exc}")
+        print(f"Unable to build the thrust-reverser event timeline: {exc}")
         raise
     finally:
-        load_button.disabled = False
+        run_button.disabled = False
 
 
-load_button.on_click(_build_events)
-ipy_display(
+existing_aircraft_input = globals().get("aircraft_input")
+existing_start_input = globals().get("start_input")
+existing_end_input = globals().get("end_input")
+
+previous_aircraft = getattr(existing_aircraft_input, "value", "")
+previous_start = getattr(existing_start_input, "value", "")
+previous_end = getattr(existing_end_input, "value", "")
+
+aircraft_input = widgets.Text(
+    value=previous_aircraft,
+    description="Flight No.:",
+    placeholder="Aircraft ID",
+    layout=widgets.Layout(width="420px"),
+)
+start_input = widgets.Text(
+    value=previous_start,
+    description="Start:",
+    placeholder="YYYY-MM-DD HH:MM:SS.sss",
+    layout=widgets.Layout(width="420px"),
+)
+end_input = widgets.Text(
+    value=previous_end,
+    description="End:",
+    placeholder="YYYY-MM-DD HH:MM:SS.sss",
+    layout=widgets.Layout(width="420px"),
+)
+run_button = widgets.Button(
+    description="Build event timeline",
+    button_style="primary",
+    layout=widgets.Layout(width="220px"),
+)
+output = widgets.Output()
+run_button.on_click(_build_timeline)
+
+display(
     widgets.VBox(
         [
-            aircraft_widget,
-            widgets.HBox([start_time_widget, end_time_widget]),
-            load_button,
+            widgets.HBox([aircraft_input, start_input, end_input]),
+            run_button,
             output,
         ]
     )
