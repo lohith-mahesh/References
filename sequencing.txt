@@ -1,1223 +1,708 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import html
-import re
 
-import pandas as pd
 import ipywidgets as widgets
+import numpy as np
+import pandas as pd
 from IPython.display import HTML, clear_output, display as ipy_display
-from pyspark.sql import Window
 from pyspark.sql import functions as F
-from pyspark.sql.types import BooleanType, NumericType
 
-_TEE_ASSET_TABLE = "ehm_fleetstore_prd1eun82719_internal.assetmanagement.aircraftengine"
-_TEE_MASTER_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousmaster-aircraftengine-cda`"
-_TEE_SCAN_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousscan-cda`"
-_TEE_ENGINE_TYPE = "Pearl 700"
-_TEE_PREFIX = "Parameter:EVHMU_EEC_"
-_TEE_BREAK_SECONDS = 3600.0
-_TEE_CHANNEL_DISAGREEMENT_THRESHOLD = 0.2
-_TEE_MAX_VIEW_SECONDS = 7 * 24 * 60 * 60
-_TEE_MAX_WINDOW_EVENTS = 50000
-_TEE_SIGNALS = [
-    {
-        "key": "lvt_position",
-        "suffix": "IThrustReverser_trLVTPosVCtrl_data",
-        "label": "LVTPosVCntrl",
-        "style": "numeric",
-        "color": "#ead5e6",
-        "text": "#202124",
-    },
-    {
-        "key": "lower_raw",
-        "suffix": "IThrustReverser_loOwnTRLVTRaw_data",
-        "label": "Low TRLVT Raw",
-        "style": "numeric",
-        "color": "#d6b900",
-        "text": "#111111",
-    },
-    {
-        "key": "upper_raw",
-        "suffix": "IThrustReverser_upOwnTRLVTRaw_data",
-        "label": "Up TRLVT Raw",
-        "style": "numeric",
-        "color": "#3f51b5",
-        "text": "#ffffff",
-    },
-    {
-        "key": "door_deployment",
-        "suffix": "IThrustReverser_trDoorDeplStatus_data",
-        "label": "DoorDep Status",
-        "style": "numeric",
-        "color": "#f5e6a9",
-        "text": "#202124",
-    },
-    {
-        "key": "armed",
-        "suffix": "IThrustReverser_trArmed_data",
-        "label": "TR Armed",
-        "style": "armed",
-        "color": "#159b21",
-        "text": "#ffffff",
-    },
-    {
-        "key": "in_transit",
-        "suffix": "IThrustReverser_trInTransit_data",
-        "label": "In Transit",
-        "style": "on_off",
-        "color": "#69dbe5",
-        "text": "#102124",
-    },
-    {
-        "key": "unlocked",
-        "suffix": "IThrustReverser_trIsUnlocked_data",
-        "label": "Is Unlocked",
-        "style": "on_off",
-        "color": "#d7d7d7",
-        "text": "#202124",
-    },
-    {
-        "key": "door_stow",
-        "suffix": "IThrustReverser_trDoorStowStatus_data",
-        "label": "Door Stow",
-        "style": "door_stow",
-        "color": "#f4a000",
-        "text": "#202124",
-    },
-    {
-        "key": "deployed",
-        "suffix": "IThrustReverser_trIsDeployed_data",
-        "label": "IsDeployed",
-        "style": "numeric",
-        "color": "#5bbbbb",
-        "text": "#102124",
-    },
+EC_ASSET_TABLE = "ehm_fleetstore_prd1eun82719_internal.assetmanagement.aircraftengine"
+EC_MASTER_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousmaster-aircraftengine-cda`"
+EC_SCAN_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousscan-cda`"
+EC_ENGINE_TYPE_CODE = "Pearl 700"
+EC_PARAMETER_PREFIX = "Parameter:EVHMU_EEC_"
+EC_CHANNELS = ("AC", "BC")
+EC_DIVERGENCE_THRESHOLD = 0.25
+EC_MAX_LAG_SECONDS = 5.0
+EC_MAX_PANDAS_ROWS = 1_000_000
+EC_MAX_EVENT_ROWS = 5_000
+
+EC_DEFAULT_PARAMETERS = [
+    "IThrustReverser_trLVTPosVCtrl_data",
+    "IThrustReverser_loOwnTRLVTRaw_data",
+    "IThrustReverser_upOwnTRLVTRaw_data",
+    "IThrustReverser_trDoorDeplStatus_data",
+    "IThrustReverser_trArmed_data",
+    "IThrustReverser_trInTransit_data",
+    "IThrustReverser_trIsUnlocked_data",
+    "IThrustReverser_trDoorStowStatus_data",
+    "IThrustReverser_trIsDeployed_data",
 ]
-_TEE_SIGNAL_BY_KEY = {item["key"]: item for item in _TEE_SIGNALS}
-_TEE_SIGNAL_ORDER = {item["key"]: index for index, item in enumerate(_TEE_SIGNALS)}
-_TEE_ENDPOINTS = {
-    "lvt_position": (0.0, 100.0),
-    "lower_raw": (0.0, 100.0),
-    "upper_raw": (0.0, 100.0),
-    "deployed": (0.0, 1.0),
+
+EC_LABELS = {
+    "IThrustReverser_trLVTPosVCtrl_data": "LVTPosVCntrl",
+    "IThrustReverser_loOwnTRLVTRaw_data": "low TRLVT Raw",
+    "IThrustReverser_upOwnTRLVTRaw_data": "Up TRLVT Raw",
+    "IThrustReverser_trDoorDeplStatus_data": "DoorDep Status",
+    "IThrustReverser_trArmed_data": "TR Armed",
+    "IThrustReverser_trInTransit_data": "In Transit",
+    "IThrustReverser_trIsUnlocked_data": "Is Unlocked",
+    "IThrustReverser_trDoorStowStatus_data": "Door Stow",
+    "IThrustReverser_trIsDeployed_data": "IsDeployed",
+}
+
+EC_COLORS = {
+    "IThrustReverser_trLVTPosVCtrl_data": "#f4cccc",
+    "IThrustReverser_loOwnTRLVTRaw_data": "#bf9000",
+    "IThrustReverser_upOwnTRLVTRaw_data": "#6666cc",
+    "IThrustReverser_trDoorDeplStatus_data": "#fff2cc",
+    "IThrustReverser_trArmed_data": "#00b050",
+    "IThrustReverser_trInTransit_data": "#74dfe5",
+    "IThrustReverser_trIsUnlocked_data": "#d9d9d9",
+    "IThrustReverser_trDoorStowStatus_data": "#f4a300",
+    "IThrustReverser_trIsDeployed_data": "#319c95",
+}
+
+EC_EXTRA_COLORS = [
+    "#cfe2f3",
+    "#d9ead3",
+    "#ead1dc",
+    "#fce5cd",
+    "#d0e0e3",
+    "#fff2cc",
+    "#c9daf8",
+    "#d9d2e9",
+    "#b6d7a8",
+    "#f9cb9c",
+]
+
+EC_ON_OFF_PARAMETERS = {
+    "IThrustReverser_trArmed_data",
+    "IThrustReverser_trInTransit_data",
+    "IThrustReverser_trIsUnlocked_data",
 }
 
 
-def _tee_qc(name):
+def _ec_quote(name):
     return F.col(f"`{name.replace('`', '``')}`")
 
 
-def _tee_timestamp_label(value):
-    timestamp = pd.Timestamp(value)
-    return timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+def _ec_parameter_label(base):
+    if base in EC_LABELS:
+        return EC_LABELS[base]
+    label = base
+    for ending in ("_data", "_flt"):
+        if label.endswith(ending):
+            label = label[:-len(ending)]
+    return label
 
 
-def _tee_duration_label(seconds):
-    milliseconds = max(0, int(round(float(seconds) * 1000.0)))
-    days, milliseconds = divmod(milliseconds, 86400000)
-    hours, milliseconds = divmod(milliseconds, 3600000)
-    minutes, milliseconds = divmod(milliseconds, 60000)
-    whole_seconds, milliseconds = divmod(milliseconds, 1000)
-    if days:
-        return f"{days}d {hours:02d}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
-    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
+def _ec_full_column(channel, base):
+    return f"{EC_PARAMETER_PREFIX}{channel}_{base}"
 
 
-def _tee_scalar_text(value):
-    if value is None or pd.isna(value):
-        return ""
-    text = str(value).strip()
-    if not text:
-        return ""
-    if re.fullmatch(r"[+-]?\d+\.0+", text):
-        return text.split(".", 1)[0]
-    return text
+def _ec_is_missing(value):
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
 
 
-def _tee_binary_token(value, true_text, false_text):
-    text = _tee_scalar_text(value)
-    lowered = text.lower()
-    if lowered in {"1", "true", "t"}:
-        return true_text
-    if lowered in {"0", "false", "f"}:
-        return false_text
-    return text
+def _ec_scalar(value):
+    return value.item() if isinstance(value, np.generic) else value
 
 
-def _tee_single_event_text(signal_key, value):
-    spec = _TEE_SIGNAL_BY_KEY[signal_key]
-    if spec["style"] == "on_off":
-        return f"{spec['label']} {_tee_binary_token(value, 'ON', 'OFF')}"
-    if spec["style"] == "armed":
-        state = _tee_binary_token(value, "Armed", "Not Armed")
-        return "TR Armed" if state == "Armed" else f"TR {state}"
-    if spec["style"] == "door_stow":
-        return f"Door Stow {_tee_binary_token(value, 'Open', 'Close')}"
-    return f"{spec['label']} = {_tee_scalar_text(value)}"
+def _ec_number(value):
+    value = _ec_scalar(value)
+    if isinstance(value, (bool, np.bool_)):
+        return float(bool(value))
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+    try:
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+    except Exception:
+        return None
 
 
-def _tee_channel_value_text(signal_key, value):
-    spec = _TEE_SIGNAL_BY_KEY[signal_key]
-    if spec["style"] == "on_off":
-        return _tee_binary_token(value, "ON", "OFF")
-    if spec["style"] == "armed":
-        return _tee_binary_token(value, "Armed", "Not Armed")
-    if spec["style"] == "door_stow":
-        return _tee_binary_token(value, "Open", "Close")
-    return _tee_scalar_text(value)
+def _ec_values_equal(left, right):
+    left_number = _ec_number(left)
+    right_number = _ec_number(right)
+    if left_number is not None and right_number is not None:
+        return bool(np.isclose(left_number, right_number, rtol=0.0, atol=1e-12))
+    return _ec_scalar(left) == _ec_scalar(right)
 
 
-def _tee_event_text(signal_key, ac_value, bc_value, disagreement):
-    if bool(disagreement):
-        label = _TEE_SIGNAL_BY_KEY[signal_key]["label"]
-        ac_text = _tee_channel_value_text(signal_key, ac_value)
-        bc_text = _tee_channel_value_text(signal_key, bc_value)
-        return f"{label} AC={ac_text} | BC={bc_text}", True
-    resolved = ac_value if _tee_scalar_text(ac_value) else bc_value
-    return _tee_single_event_text(signal_key, resolved), False
+def _ec_value_key(value):
+    value = _ec_scalar(value)
+    number = _ec_number(value)
+    if number is not None:
+        return ("number", round(number, 9))
+    return ("text", str(value))
 
 
-def _tee_position_sort_key(value):
-    if value is None or pd.isna(value):
-        return (9, "")
-    text = str(value).strip().lower()
-    if text in {"1", "01", "left", "l", "port"}:
-        return (0, text)
-    if text in {"2", "02", "right", "r", "starboard"}:
-        return (1, text)
-    match = re.search(r"\d+", text)
-    return (2, int(match.group(0))) if match else (3, text)
+def _ec_format_value(value):
+    value = _ec_scalar(value)
+    if isinstance(value, (bool, np.bool_)):
+        return "1" if bool(value) else "0"
+    number = _ec_number(value)
+    if number is not None:
+        if np.isclose(number, round(number), rtol=0.0, atol=1e-12):
+            return str(int(round(number)))
+        return f"{number:.9g}"
+    return str(value)
 
 
-def _tee_months_between(start_value, end_value):
-    current = date(start_value.year, start_value.month, 1)
-    final = date(end_value.year, end_value.month, 1)
-    values = []
-    while current <= final:
-        values.append((current.year, current.month))
-        current = date(current.year + 1, 1, 1) if current.month == 12 else date(current.year, current.month + 1, 1)
-    return values
+def _ec_parameter_is_discrete(frame, base, available_columns):
+    observed = []
+    for channel in EC_CHANNELS:
+        column = _ec_full_column(channel, base)
+        if column in available_columns:
+            observed.extend(frame[column].dropna().tolist())
+    if not observed:
+        return False
+    if all(isinstance(_ec_scalar(value), (bool, np.bool_)) for value in observed):
+        return True
+    numeric = [_ec_number(value) for value in observed]
+    if any(value is None for value in numeric):
+        return len({str(_ec_scalar(value)) for value in observed}) <= 16
+    values = np.asarray(numeric, dtype=float)
+    return len(np.unique(values)) <= 16 and np.allclose(values, np.round(values))
 
 
-def _tee_merge_intervals(window_rows):
-    intervals = sorted(
-        (
-            pd.Timestamp(row.StartDatetime),
-            pd.Timestamp(row.EndDatetime),
-        )
-        for row in window_rows
-        if row.StartDatetime is not None and row.EndDatetime is not None
-    )
-    merged = []
-    for start_value, end_value in intervals:
-        if end_value < start_value:
-            continue
-        if not merged or start_value > merged[-1][1]:
-            merged.append([start_value, end_value])
-        elif end_value > merged[-1][1]:
-            merged[-1][1] = end_value
-    return [(start_value, end_value) for start_value, end_value in merged]
-
-
-def _tee_breaks_from_intervals(intervals):
-    breaks = []
-    for previous, current in zip(intervals, intervals[1:]):
-        gap_seconds = float((current[0] - previous[1]).total_seconds())
-        if gap_seconds > _TEE_BREAK_SECONDS:
-            breaks.append(
-                {
-                    "start": previous[1],
-                    "end": current[0],
-                    "seconds": gap_seconds,
-                }
-            )
-    return breaks
-
-
-def _tee_match_timezone(value, reference):
-    timestamp = pd.Timestamp(value)
-    reference = pd.Timestamp(reference)
-    if reference.tzinfo is None and timestamp.tzinfo is not None:
-        return timestamp.tz_localize(None)
-    if reference.tzinfo is not None and timestamp.tzinfo is None:
-        return timestamp.tz_localize(reference.tzinfo)
-    if reference.tzinfo is not None and timestamp.tzinfo is not None:
-        return timestamp.tz_convert(reference.tzinfo)
-    return timestamp
-
-
-def _tee_normalized_spark_value(column_name, schema_by_name):
-    if column_name not in schema_by_name:
-        return F.lit(None).cast("string")
-    raw = _tee_qc(column_name)
-    data_type = schema_by_name[column_name]
-    if isinstance(data_type, BooleanType):
-        return F.when(raw.isNull(), F.lit(None).cast("string")).otherwise(raw.cast("string"))
-    if isinstance(data_type, NumericType):
-        numeric = raw.cast("double")
-        return (
-            F.when(raw.isNull() | F.isnan(numeric), F.lit(None).cast("string"))
-            .when(numeric == F.lit(0.0), F.lit("0"))
-            .otherwise(raw.cast("string"))
-        )
-    return F.when(raw.isNull(), F.lit(None).cast("string")).otherwise(raw.cast("string"))
-
-
-def _tee_numeric_spark_value(column_name, schema_by_name):
-    if column_name not in schema_by_name:
-        return F.lit(None).cast("double")
-    raw = _tee_qc(column_name)
-    data_type = schema_by_name[column_name]
-    if isinstance(data_type, BooleanType):
-        return (
-            F.when(raw.isNull(), F.lit(None).cast("double"))
-            .when(raw, F.lit(1.0))
-            .otherwise(F.lit(0.0))
-        )
-    if isinstance(data_type, NumericType):
-        numeric = raw.cast("double")
-        return F.when(raw.isNull() | F.isnan(numeric), F.lit(None).cast("double")).otherwise(numeric)
-    return F.lit(None).cast("double")
-
-
-def _tee_empty_events():
-    return pd.DataFrame(
-        columns=[
-            "Timestamp",
-            "StartDatetime",
-            "EngineSerialNumber",
-            "SignalOrder",
-            "Signal",
-            "ACValue",
-            "BCValue",
-            "Disagreement",
-        ]
-    )
-
-
-def _tee_load_timeline(aircraft_identifier, start_date, end_date, asset_esns):
-    start_calendar_id = int(start_date.strftime("%Y%m%d"))
-    end_calendar_id = int(end_date.strftime("%Y%m%d"))
-    master_source = spark.table(_TEE_MASTER_TABLE)
-    master_columns = set(master_source.columns)
-    required_master = {
-        "AircraftIdentifier",
-        "EngineSerialNumber",
-        "AircraftId",
-        "StartDatetime",
-        "EndDatetime",
-        "CalendarId",
-    }
-    missing_master = sorted(required_master - master_columns)
-    if missing_master:
-        raise ValueError(f"The master table is missing required columns: {missing_master}")
-    position_expression = F.col("EnginePosition") if "EnginePosition" in master_columns else F.lit(None)
-    master_filtered = (
-        master_source.where(
-            (F.col("AircraftIdentifier").cast("string") == aircraft_identifier)
-            & F.col("CalendarId").between(start_calendar_id, end_calendar_id)
-        )
-        .select(
-            F.col("AircraftId").alias("AircraftId"),
-            F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
-            F.col("StartDatetime").alias("StartDatetime"),
-            F.col("EndDatetime").alias("EndDatetime"),
-            position_expression.cast("string").alias("EnginePosition"),
-        )
-        .where(
-            F.col("AircraftId").isNotNull()
-            & F.col("EngineSerialNumber").isNotNull()
-            & F.col("StartDatetime").isNotNull()
-            & F.col("EndDatetime").isNotNull()
-            & (F.col("EndDatetime") >= F.col("StartDatetime"))
-        )
-    )
-    master_windows = (
-        master_filtered.groupBy("AircraftId", "EngineSerialNumber", "StartDatetime")
-        .agg(
-            F.max("EndDatetime").alias("EndDatetime"),
-            F.first("EnginePosition", ignorenulls=True).alias("EnginePosition"),
-        )
-    )
-    window_rows = master_windows.orderBy("StartDatetime", "EnginePosition", "EngineSerialNumber").collect()
-    if not window_rows:
-        raise RuntimeError("No flight windows were found for the selected aircraft and date range.")
-    merged_intervals = _tee_merge_intervals(window_rows)
-    break_rows = _tee_breaks_from_intervals(merged_intervals)
-    range_start = min(start_value for start_value, _ in merged_intervals)
-    range_end = max(end_value for _, end_value in merged_intervals)
-    position_by_esn = {}
-    for row in window_rows:
-        esn = str(row.EngineSerialNumber)
-        if esn not in position_by_esn or position_by_esn[esn] is None:
-            position_by_esn[esn] = row.EnginePosition
-    master_esns = set(position_by_esn)
-    display_esns = set(master_esns)
-    if len(display_esns) < 2:
-        display_esns.update(str(value) for value in asset_esns)
-    ordered_esns = sorted(
-        display_esns,
-        key=lambda esn: (_tee_position_sort_key(position_by_esn.get(esn)), str(esn)),
-    )
-    scan_source = spark.table(_TEE_SCAN_TABLE)
-    scan_columns = set(scan_source.columns)
-    required_scan = {"AircraftId", "AssetIdentifier", "StartDatetime", "Timestamp"}
-    missing_scan = sorted(required_scan - scan_columns)
-    if missing_scan:
-        raise ValueError(f"The scan table is missing required columns: {missing_scan}")
-    schema_by_name = {field.name: field.dataType for field in scan_source.schema.fields}
-    return {
-        "events": _tee_empty_events(),
-        "breaks": break_rows,
-        "intervals": merged_intervals,
-        "window_rows": window_rows,
-        "master_windows": master_windows,
-        "range_start": range_start,
-        "range_end": range_end,
-        "ordered_esns": ordered_esns,
-        "positions": position_by_esn,
-        "availability": [],
-        "usable_signals": [],
-        "truncated": False,
-        "scan_columns": scan_columns,
-        "schema_by_name": schema_by_name,
-        "aircraft_identifier": aircraft_identifier,
-        "calendar_start": start_date,
-        "calendar_end": end_date,
-    }
-
-
-def _tee_query_event_window(state, selected_signal_keys, view_start, view_end):
-    view_start = _tee_match_timezone(view_start, state["range_start"])
-    view_end = _tee_match_timezone(view_end, state["range_start"])
-    if view_start > view_end:
-        view_start, view_end = view_end, view_start
-    view_seconds = float((view_end - view_start).total_seconds())
-    if view_seconds > _TEE_MAX_VIEW_SECONDS:
-        raise ValueError(
-            f"The visible window is limited to {_TEE_MAX_VIEW_SECONDS / 86400:g} days. "
-            "Move or narrow the slider; the full archive remains available."
-        )
-    scan_columns = state["scan_columns"]
-    schema_by_name = state["schema_by_name"]
-    availability = []
-    usable_signal_keys = []
-    parameter_columns = []
-    for signal_key in selected_signal_keys:
-        spec = _TEE_SIGNAL_BY_KEY[signal_key]
-        ac_name = f"{_TEE_PREFIX}AC_{spec['suffix']}"
-        bc_name = f"{_TEE_PREFIX}BC_{spec['suffix']}"
-        ac_available = ac_name in scan_columns
-        bc_available = bc_name in scan_columns
-        availability.append(
-            {
-                "signal": spec["label"],
-                "AC": ac_available,
-                "BC": bc_available,
-            }
-        )
-        if ac_available or bc_available:
-            usable_signal_keys.append(signal_key)
-        if ac_available:
-            parameter_columns.append(ac_name)
-        if bc_available:
-            parameter_columns.append(bc_name)
-    if not usable_signal_keys:
-        raise RuntimeError("None of the selected signals exists in the scan-table schema.")
-    parameter_columns = list(dict.fromkeys(parameter_columns))
-    context_rows = [
-        row
-        for row in state["window_rows"]
-        if pd.Timestamp(row.EndDatetime) >= view_start
-        and pd.Timestamp(row.StartDatetime) <= view_end
-    ]
-    if not context_rows:
+def _ec_resolve_channels(ac_value, bc_value, is_discrete):
+    ac_missing = _ec_is_missing(ac_value)
+    bc_missing = _ec_is_missing(bc_value)
+    if ac_missing and bc_missing:
+        return None
+    if ac_missing:
+        value = _ec_scalar(bc_value)
+        return {"value": value, "key": _ec_value_key(value), "disagreement": False}
+    if bc_missing:
+        value = _ec_scalar(ac_value)
+        return {"value": value, "key": _ec_value_key(value), "disagreement": False}
+    ac_value = _ec_scalar(ac_value)
+    bc_value = _ec_scalar(bc_value)
+    if _ec_values_equal(ac_value, bc_value):
+        return {"value": ac_value, "key": _ec_value_key(ac_value), "disagreement": False}
+    ac_number = _ec_number(ac_value)
+    bc_number = _ec_number(bc_value)
+    if is_discrete or ac_number is None or bc_number is None:
+        disagreement = True
+    else:
+        scale = max(abs(ac_number), abs(bc_number), 1e-12)
+        disagreement = abs(ac_number - bc_number) / scale >= EC_DIVERGENCE_THRESHOLD
+    if disagreement:
         return {
-            "events": _tee_empty_events(),
-            "availability": availability,
-            "usable_signals": usable_signal_keys,
-            "truncated": False,
-            "view_start": view_start,
-            "view_end": view_end,
+            "value": ac_value,
+            "ac": ac_value,
+            "bc": bc_value,
+            "key": ("ACBC", _ec_value_key(ac_value), _ec_value_key(bc_value)),
+            "disagreement": True,
         }
-    context_start = min(pd.Timestamp(row.StartDatetime) for row in context_rows)
-    context_end = max(pd.Timestamp(row.EndDatetime) for row in context_rows)
-    context_windows = state["master_windows"].where(
-        (F.col("EndDatetime") >= F.lit(view_start.to_pydatetime()))
-        & (F.col("StartDatetime") <= F.lit(view_end.to_pydatetime()))
-    )
-    scan_source = spark.table(_TEE_SCAN_TABLE)
-    partition_filter = None
-    if "year" in scan_columns and "Month" in scan_columns:
-        partition_filter = F.lit(False)
-        for partition_year, partition_month in _tee_months_between(context_start.date(), context_end.date()):
-            partition_filter = partition_filter | (
-                (F.col("year") == partition_year)
-                & (F.col("Month") == partition_month)
-            )
-    scan_filtered = scan_source.where(partition_filter) if partition_filter is not None else scan_source
-    scan_alias = scan_filtered.alias("scan")
-    window_alias = F.broadcast(context_windows).alias("window")
-    join_condition = (
-        (scan_alias["AircraftId"] == window_alias["AircraftId"])
-        & (scan_alias["AssetIdentifier"].cast("string") == window_alias["EngineSerialNumber"])
-        & scan_alias["Timestamp"].between(window_alias["StartDatetime"], window_alias["EndDatetime"])
-    )
-    selected_expressions = [
-        scan_alias["Timestamp"].alias("Timestamp"),
-        window_alias["StartDatetime"].alias("StartDatetime"),
-        window_alias["EngineSerialNumber"].alias("EngineSerialNumber"),
-    ]
-    selected_expressions.extend(scan_alias[name].alias(name) for name in parameter_columns)
-    scan_base = scan_alias.join(window_alias, join_condition, "inner").select(*selected_expressions)
-    state_frame = scan_base
-    state_specs = []
-    for signal_key in usable_signal_keys:
-        spec = _TEE_SIGNAL_BY_KEY[signal_key]
-        ac_name = f"{_TEE_PREFIX}AC_{spec['suffix']}"
-        bc_name = f"{_TEE_PREFIX}BC_{spec['suffix']}"
-        ac_value = _tee_normalized_spark_value(ac_name, schema_by_name)
-        bc_value = _tee_normalized_spark_value(bc_name, schema_by_name)
-        ac_numeric = _tee_numeric_spark_value(ac_name, schema_by_name)
-        bc_numeric = _tee_numeric_spark_value(bc_name, schema_by_name)
-        ac_rounded = F.round(ac_numeric, 0)
-        bc_rounded = F.round(bc_numeric, 0)
-        both_present = ac_value.isNotNull() & bc_value.isNotNull()
-        both_numeric = ac_numeric.isNotNull() & bc_numeric.isNotNull()
-        disagreement = both_present & F.when(
-            both_numeric,
-            F.abs(ac_numeric - bc_numeric) > F.lit(_TEE_CHANNEL_DISAGREEMENT_THRESHOLD),
-        ).otherwise(ac_value != bc_value)
-        canonical_endpoint = F.lit(None).cast("string")
-        if signal_key in _TEE_ENDPOINTS:
-            for endpoint in _TEE_ENDPOINTS[signal_key]:
-                endpoint_text = str(int(endpoint)) if float(endpoint).is_integer() else str(endpoint)
-                canonical_endpoint = F.coalesce(
-                    canonical_endpoint,
-                    F.when(ac_rounded == F.lit(endpoint), F.lit(endpoint_text)),
-                    F.when(bc_rounded == F.lit(endpoint), F.lit(endpoint_text)),
-                )
-            event_allowed = disagreement | canonical_endpoint.isNotNull()
-        else:
-            event_allowed = F.lit(True)
-        resolved = F.when(
-            canonical_endpoint.isNotNull() & ~disagreement,
-            canonical_endpoint,
-        ).otherwise(F.coalesce(ac_value, bc_value))
-        display_ac_value = F.when(
-            canonical_endpoint.isNotNull() & ~disagreement & ac_value.isNotNull(),
-            canonical_endpoint,
-        ).otherwise(ac_value)
-        display_bc_value = F.when(
-            canonical_endpoint.isNotNull() & ~disagreement & bc_value.isNotNull(),
-            canonical_endpoint,
-        ).otherwise(bc_value)
-        state = (
-            F.when(ac_value.isNull() & bc_value.isNull(), F.lit(None).cast("string"))
-            .when(disagreement, F.lit("D"))
-            .otherwise(F.concat(F.lit("V|"), resolved))
-        )
-        order_value = _TEE_SIGNAL_ORDER[signal_key]
-        state_column = f"_TEEState{order_value}"
-        ac_column = f"_TEEAC{order_value}"
-        bc_column = f"_TEEBC{order_value}"
-        disagreement_column = f"_TEEDisagreement{order_value}"
-        allowed_column = f"_TEEAllowed{order_value}"
-        state_frame = (
-            state_frame.withColumn(state_column, state)
-            .withColumn(ac_column, display_ac_value)
-            .withColumn(bc_column, display_bc_value)
-            .withColumn(disagreement_column, disagreement)
-            .withColumn(allowed_column, event_allowed)
-        )
-        state_specs.append(
-            {
-                "key": signal_key,
-                "order": order_value,
-                "state": state_column,
-                "ac": ac_column,
-                "bc": bc_column,
-                "disagreement": disagreement_column,
-                "allowed": allowed_column,
-            }
-        )
-    visible_condition = F.col("Timestamp").between(
-        F.lit(view_start.to_pydatetime()),
-        F.lit(view_end.to_pydatetime()),
-    )
-    history_window = (
-        Window.partitionBy("EngineSerialNumber")
-        .orderBy("Timestamp", "StartDatetime")
-        .rowsBetween(Window.unboundedPreceding, -1)
-    )
-    boundary_partition = Window.partitionBy("EngineSerialNumber")
-    event_frame = state_frame
-    for state_spec in state_specs:
-        current_state = F.col(state_spec["state"])
-        previous_state_column = f"_TEEPreviousState{state_spec['order']}"
-        previous_timestamp_column = f"_TEEPreviousTimestamp{state_spec['order']}"
-        boundary_timestamp_column = f"_TEEBoundaryTimestamp{state_spec['order']}"
-        visible_eligible = (
-            current_state.isNotNull()
-            & F.col(state_spec["allowed"])
-            & visible_condition
-        )
-        event_frame = (
-            event_frame.withColumn(
-                previous_state_column,
-                F.last(current_state, ignorenulls=True).over(history_window),
-            )
-            .withColumn(
-                previous_timestamp_column,
-                F.last(
-                    F.when(current_state.isNotNull(), F.col("Timestamp")),
-                    ignorenulls=True,
-                ).over(history_window),
-            )
-            .withColumn(
-                boundary_timestamp_column,
-                F.min(
-                    F.when(visible_eligible, F.col("Timestamp"))
-                ).over(boundary_partition),
-            )
-        )
-        state_spec["previous_state"] = previous_state_column
-        state_spec["previous_timestamp"] = previous_timestamp_column
-        state_spec["boundary_timestamp"] = boundary_timestamp_column
-    changed_structs = []
-    eligible_structs = []
-    for state_spec in state_specs:
-        current_state = F.col(state_spec["state"])
-        previous_state = F.col(state_spec["previous_state"])
-        previous_timestamp = F.col(state_spec["previous_timestamp"])
-        eligible = current_state.isNotNull() & F.col(state_spec["allowed"])
-        changed = eligible & (
-            previous_state.isNull()
-            | (current_state != previous_state)
-            | ((F.col("Timestamp").cast("double") - previous_timestamp.cast("double")) > _TEE_BREAK_SECONDS)
-        )
-        event_struct = F.struct(
-            F.lit(state_spec["order"]).alias("SignalOrder"),
-            F.lit(state_spec["key"]).alias("Signal"),
-            F.col(state_spec["ac"]).alias("ACValue"),
-            F.col(state_spec["bc"]).alias("BCValue"),
-            F.col(state_spec["disagreement"]).alias("Disagreement"),
-        )
-        changed_structs.append(F.when(changed, event_struct))
-        boundary = (
-            eligible
-            & visible_condition
-            & (F.col("Timestamp") == F.col(state_spec["boundary_timestamp"]))
-        )
-        eligible_structs.append(F.when(boundary, event_struct))
-    changed_array = F.filter(F.array(*changed_structs), lambda item: item.isNotNull())
-    eligible_array = F.filter(F.array(*eligible_structs), lambda item: item.isNotNull())
-    event_columns = [
-        "Timestamp",
-        "StartDatetime",
-        "EngineSerialNumber",
-        "SignalOrder",
-        "Signal",
-        "ACValue",
-        "BCValue",
-        "Disagreement",
-    ]
-    transition_events = (
-        event_frame.select(
-            "Timestamp",
-            "StartDatetime",
-            "EngineSerialNumber",
-            F.explode(changed_array).alias("Event"),
-        )
-        .select(
-            "Timestamp",
-            "StartDatetime",
-            "EngineSerialNumber",
-            F.col("Event.SignalOrder").alias("SignalOrder"),
-            F.col("Event.Signal").alias("Signal"),
-            F.col("Event.ACValue").alias("ACValue"),
-            F.col("Event.BCValue").alias("BCValue"),
-            F.col("Event.Disagreement").alias("Disagreement"),
-        )
-        .where(visible_condition)
-    )
-    boundary_events = (
-        event_frame.select(
-            "Timestamp",
-            "StartDatetime",
-            "EngineSerialNumber",
-            F.explode(eligible_array).alias("Event"),
-        )
-        .select(
-            "Timestamp",
-            "StartDatetime",
-            "EngineSerialNumber",
-            F.col("Event.SignalOrder").alias("SignalOrder"),
-            F.col("Event.Signal").alias("Signal"),
-            F.col("Event.ACValue").alias("ACValue"),
-            F.col("Event.BCValue").alias("BCValue"),
-            F.col("Event.Disagreement").alias("Disagreement"),
-        )
-    )
-    state_changes = (
-        transition_events.unionByName(boundary_events)
-        .dropDuplicates(event_columns)
-        .orderBy("Timestamp", "SignalOrder", "EngineSerialNumber")
-    )
-    event_data = state_changes.limit(_TEE_MAX_WINDOW_EVENTS + 1).toPandas()
-    truncated = len(event_data) > _TEE_MAX_WINDOW_EVENTS
-    if truncated:
-        event_data = event_data.iloc[:_TEE_MAX_WINDOW_EVENTS].copy()
-    if not event_data.empty:
-        event_data["Timestamp"] = pd.to_datetime(event_data["Timestamp"], errors="coerce")
-        event_data["StartDatetime"] = pd.to_datetime(event_data["StartDatetime"], errors="coerce")
-        event_data["EngineSerialNumber"] = event_data["EngineSerialNumber"].astype("string")
-        event_data = event_data.dropna(subset=["Timestamp", "EngineSerialNumber", "Signal"])
-        event_data = event_data.sort_values(
-            ["Timestamp", "SignalOrder", "EngineSerialNumber"],
-            kind="stable",
-        ).reset_index(drop=True)
-    return {
-        "events": event_data,
-        "availability": availability,
-        "usable_signals": usable_signal_keys,
-        "truncated": truncated,
-        "view_start": view_start,
-        "view_end": view_end,
-    }
+    return {"value": ac_value, "key": _ec_value_key(ac_value), "disagreement": False}
 
 
-def _tee_rows_for_range(state, start_time, end_time):
-    events = state["events"]
-    visible_events = events.loc[
-        events["Timestamp"].between(start_time, end_time, inclusive="both")
-    ] if not events.empty else events
-    rows = []
-    if not visible_events.empty:
-        grouped = visible_events.groupby(["Timestamp", "Signal"], sort=False, dropna=False)
-        for (timestamp, signal_key), group in grouped:
-            cells = {}
-            disagreements = {}
-            for record in group.itertuples(index=False):
-                esn = str(record.EngineSerialNumber)
-                event_text, disagreement = _tee_event_text(
-                    signal_key,
-                    record.ACValue,
-                    record.BCValue,
-                    record.Disagreement,
-                )
-                cells.setdefault(esn, []).append(event_text)
-                disagreements[esn] = disagreements.get(esn, False) or disagreement
-            rows.append(
-                {
-                    "kind": "event",
-                    "sort": (pd.Timestamp(timestamp).value, _TEE_SIGNAL_ORDER[signal_key]),
-                    "timestamp": pd.Timestamp(timestamp),
-                    "signal": signal_key,
-                    "cells": cells,
-                    "disagreements": disagreements,
-                }
-            )
-    for gap in state["breaks"]:
-        if gap["start"] <= end_time and gap["end"] >= start_time:
-            rows.append(
-                {
-                    "kind": "break",
-                    "sort": (pd.Timestamp(gap["start"]).value, len(_TEE_SIGNALS) + 1),
-                    "gap": gap,
-                }
-            )
-    return sorted(rows, key=lambda row: row["sort"])
+def _ec_truthy(value):
+    number = _ec_number(value)
+    if number is not None:
+        return not np.isclose(number, 0.0, rtol=0.0, atol=1e-12)
+    return str(value).strip().lower() in {"true", "on", "yes", "open", "1"}
 
 
-def _tee_table_html(state, start_time, end_time):
-    rows = _tee_rows_for_range(state, start_time, end_time)
-    engine_headers = []
-    for esn in state["ordered_esns"]:
-        position = state["positions"].get(esn)
-        position_html = "" if position is None else f"<span>Position {html.escape(str(position))}</span>"
-        engine_headers.append(
-            f"<th><strong>{html.escape(str(esn))}</strong>{position_html}</th>"
-        )
-    body = []
-    for row in rows:
-        if row["kind"] == "break":
-            gap = row["gap"]
-            body.append(
-                f'<tr class="tee-break"><td colspan="{len(state["ordered_esns"]) + 1}">'
-                f'BREAK · {_tee_duration_label(gap["seconds"])} · '
-                f'{html.escape(_tee_timestamp_label(gap["start"]))} → '
-                f'{html.escape(_tee_timestamp_label(gap["end"]))}</td></tr>'
-            )
-            continue
-        spec = _TEE_SIGNAL_BY_KEY[row["signal"]]
-        cells = []
-        for esn in state["ordered_esns"]:
-            values = row["cells"].get(esn, [])
-            if not values:
-                cells.append('<td class="tee-empty"></td>')
+def _ec_event_text(base, resolved):
+    label = _ec_parameter_label(base)
+    if resolved["disagreement"]:
+        return f"{label} AC={_ec_format_value(resolved['ac'])} | BC={_ec_format_value(resolved['bc'])}"
+    value = resolved["value"]
+    if base in EC_ON_OFF_PARAMETERS:
+        return f"{label} {'ON' if _ec_truthy(value) else 'OFF'}"
+    if base == "IThrustReverser_trDoorStowStatus_data":
+        return f"{label} {'Close' if _ec_truthy(value) else 'Open'}"
+    if isinstance(_ec_scalar(value), (bool, np.bool_)):
+        return f"{label} {'ON' if bool(value) else 'OFF'}"
+    return f"{label}={_ec_format_value(value)}"
+
+
+def _ec_extract_events(frame, engine, parameters, available_columns, discrete_by_parameter):
+    engine_frame = frame.loc[
+        frame["AssetIdentifier"].astype("string") == str(engine)
+    ].copy()
+    engine_frame = engine_frame.dropna(subset=["Timestamp"]).sort_values("Timestamp", kind="stable")
+    channel_state = {}
+    resolved_state = {}
+    events = []
+    parameter_order = {base: index for index, base in enumerate(parameters)}
+    for timestamp, timestamp_frame in engine_frame.groupby("Timestamp", sort=True):
+        touched = set()
+        for base in parameters:
+            for channel in EC_CHANNELS:
+                column = _ec_full_column(channel, base)
+                if column not in available_columns:
+                    continue
+                populated = timestamp_frame[column].dropna()
+                if not populated.empty:
+                    channel_state[(base, channel)] = populated.iloc[-1]
+                    touched.add(base)
+        for base in parameters:
+            if base not in touched:
                 continue
-            cell_text = "<br>".join(html.escape(value) for value in values)
-            if row["disagreements"].get(esn, False):
-                cells.append(f'<td class="tee-disagreement">{cell_text}</td>')
-            else:
-                cells.append(
-                    f'<td style="background:{spec["color"]};color:{spec["text"]}">{cell_text}</td>'
-                )
+            resolved = _ec_resolve_channels(
+                channel_state.get((base, "AC")),
+                channel_state.get((base, "BC")),
+                discrete_by_parameter[base],
+            )
+            if resolved is None:
+                continue
+            if resolved_state.get(base) == resolved["key"]:
+                continue
+            resolved_state[base] = resolved["key"]
+            events.append(
+                {
+                    "timestamp": pd.Timestamp(timestamp),
+                    "engine": str(engine),
+                    "parameter": base,
+                    "parameter_order": parameter_order[base],
+                    "value_key": resolved["key"],
+                    "text": _ec_event_text(base, resolved),
+                }
+            )
+    return events
+
+
+def _ec_format_lag(milliseconds):
+    absolute = abs(milliseconds)
+    if np.isclose(absolute, round(absolute), rtol=0.0, atol=1e-6):
+        return f"{int(round(absolute)):,} ms"
+    return f"{absolute:,.3f}".rstrip("0").rstrip(".") + " ms"
+
+
+def _ec_match_lags(events_by_engine, engines):
+    first_engine, second_engine = engines
+    first_events = events_by_engine[first_engine]
+    second_events = events_by_engine[second_engine]
+    candidates_by_key = {}
+    for index, event in enumerate(second_events):
+        key = (event["parameter"], event["value_key"])
+        candidates_by_key.setdefault(key, []).append((index, event))
+    used_second_indices = set()
+    lag_by_row = {}
+    for first_event in first_events:
+        key = (first_event["parameter"], first_event["value_key"])
+        candidates = [
+            (index, event)
+            for index, event in candidates_by_key.get(key, [])
+            if index not in used_second_indices
+            and abs((event["timestamp"] - first_event["timestamp"]).total_seconds()) <= EC_MAX_LAG_SECONDS
+        ]
+        if not candidates:
+            continue
+        second_index, second_event = min(
+            candidates,
+            key=lambda item: abs((item[1]["timestamp"] - first_event["timestamp"]).total_seconds()),
+        )
+        used_second_indices.add(second_index)
+        milliseconds = (second_event["timestamp"] - first_event["timestamp"]).total_seconds() * 1000.0
+        if np.isclose(milliseconds, 0.0, rtol=0.0, atol=1e-9):
+            row_key = (first_event["timestamp"], first_event["parameter"])
+            lag_by_row[row_key] = "0 ms"
+        elif milliseconds > 0:
+            row_key = (second_event["timestamp"], second_event["parameter"])
+            lag_by_row[row_key] = f"{_ec_format_lag(milliseconds)} ({second_engine} later)"
+        else:
+            row_key = (first_event["timestamp"], first_event["parameter"])
+            lag_by_row[row_key] = f"{_ec_format_lag(milliseconds)} ({first_engine} later)"
+    return lag_by_row
+
+
+def _ec_timestamp_text(timestamp):
+    return pd.Timestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
+
+
+def _ec_render_table(events_by_engine, engines, parameters, context_text):
+    lag_by_row = _ec_match_lags(events_by_engine, engines)
+    rows = {}
+    for engine in engines:
+        for event in events_by_engine[engine]:
+            key = (event["timestamp"], event["parameter"])
+            row = rows.setdefault(
+                key,
+                {
+                    "timestamp": event["timestamp"],
+                    "parameter": event["parameter"],
+                    "parameter_order": event["parameter_order"],
+                    "values": {},
+                },
+            )
+            row["values"][engine] = event["text"]
+    ordered_rows = sorted(
+        rows.values(),
+        key=lambda row: (row["timestamp"], row["parameter_order"]),
+    )
+    if len(ordered_rows) > EC_MAX_EVENT_ROWS:
+        raise RuntimeError(
+            f"The selected parameters generated {len(ordered_rows):,} change rows. "
+            f"Reduce the parameter selection below {EC_MAX_EVENT_ROWS:,} rows."
+        )
+    color_map = dict(EC_COLORS)
+    extra_index = 0
+    for base in parameters:
+        if base not in color_map:
+            color_map[base] = EC_EXTRA_COLORS[extra_index % len(EC_EXTRA_COLORS)]
+            extra_index += 1
+    body = []
+    for row in ordered_rows:
+        base = row["parameter"]
+        color = color_map[base]
+        value_cells = []
+        for engine in engines:
+            value = row["values"].get(engine, "")
+            style = f"background:{color};" if value else ""
+            value_cells.append(
+                f'<td class="ec-value" style="{style}">{html.escape(value)}</td>'
+            )
+        lag = lag_by_row.get((row["timestamp"], base), "")
         body.append(
             "<tr>"
-            f'<td class="tee-time">{html.escape(_tee_timestamp_label(row["timestamp"]))}</td>'
-            + "".join(cells)
+            f'<td class="ec-time">{_ec_timestamp_text(row["timestamp"])}</td>'
+            + "".join(value_cells)
+            + f'<td class="ec-lag">{html.escape(lag)}</td>'
             + "</tr>"
         )
     if not body:
-        body.append(
-            f'<tr><td class="tee-none" colspan="{len(state["ordered_esns"]) + 1}">'
-            "No selected-signal state changes fall inside this range.</td></tr>"
-        )
+        body.append('<tr><td colspan="4" class="ec-empty">No value changes were found.</td></tr>')
     return f"""
     <style>
-      .tee-summary {{ margin: 4px 0 10px; color: #303134; font-size: 13px; }}
-      .tee-scroll {{ width: 100%; max-height: 760px; overflow: auto; border: 1px solid #8a8a8a; background: #fff; }}
-      .tee-table {{ width: 100%; min-width: {360 + 390 * max(1, len(state['ordered_esns']))}px; table-layout: fixed; border-collapse: separate; border-spacing: 0; font: 13px/1.25 Arial, sans-serif; }}
-      .tee-table th {{ position: sticky; top: 0; z-index: 4; height: 42px; padding: 6px 10px; background: #f2f2f2; border-right: 1px solid #555; border-bottom: 2px solid #333; text-align: center; }}
-      .tee-table th:first-child {{ left: 0; z-index: 6; width: 250px; text-align: left; }}
-      .tee-table th span {{ display: block; margin-top: 2px; color: #5f6368; font-size: 11px; font-weight: normal; }}
-      .tee-table td {{ min-height: 25px; padding: 5px 8px; border-right: 1px solid #666; border-bottom: 1px solid #777; vertical-align: middle; overflow-wrap: anywhere; }}
-      .tee-time {{ position: sticky; left: 0; z-index: 2; width: 250px; white-space: nowrap; background: #fff; color: #202124; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-      .tee-empty {{ background: #fff; }}
-      .tee-disagreement {{ background: #ffd6d6; color: #8b0000; box-shadow: inset 0 0 0 2px #c62828; font-weight: 700; }}
-      .tee-break td {{ position: static; padding: 8px 12px; background: repeating-linear-gradient(135deg,#555 0,#555 8px,#666 8px,#666 16px); color: #fff; text-align: center; font-weight: 800; letter-spacing: .08em; border-bottom: 2px solid #222; }}
-      .tee-none {{ padding: 28px !important; color: #666; text-align: center; font-style: italic; }}
+      .ec-wrap {{ width:100%; max-height:760px; overflow:auto; border:1px solid #555; background:#fff; }}
+      .ec-context {{ margin:6px 0 10px; font-size:13px; color:#333; }}
+      .ec-table {{ width:100%; min-width:920px; border-collapse:collapse; table-layout:fixed; font-size:13px; color:#111; }}
+      .ec-table th {{ position:sticky; top:0; z-index:3; background:#efefef; border:1px solid #333; padding:7px 8px; text-align:center; font-weight:700; }}
+      .ec-table td {{ border:1px solid #333; padding:5px 7px; vertical-align:middle; }}
+      .ec-time {{ width:150px; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
+      .ec-value {{ width:34%; overflow-wrap:anywhere; }}
+      .ec-lag {{ width:190px; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
+      .ec-empty {{ text-align:center; color:#666; font-style:italic; padding:18px !important; }}
     </style>
-    <div class="tee-summary">Showing {len(rows):,} event/BREAK rows from {html.escape(_tee_timestamp_label(start_time))} through {html.escape(_tee_timestamp_label(end_time))}.</div>
-    <div class="tee-scroll">
-      <table class="tee-table">
-        <thead><tr><th>Time</th>{''.join(engine_headers)}</tr></thead>
+    <div class="ec-context">{html.escape(context_text)} Change rows only; lag pairs match the same signal and resulting value within {EC_MAX_LAG_SECONDS:g} seconds.</div>
+    <div class="ec-wrap">
+      <table class="ec-table">
+        <thead><tr><th>Time</th><th>{html.escape(engines[0])}</th><th>{html.escape(engines[1])}</th><th>Lag</th></tr></thead>
         <tbody>{''.join(body)}</tbody>
       </table>
     </div>
     """
 
 
-def _tee_summary_html(state, aircraft_identifier, start_date, end_date):
-    engine_items = []
-    for esn in state["ordered_esns"]:
-        position = state["positions"].get(esn)
-        suffix = "" if position is None else f" (position {html.escape(str(position))})"
-        engine_items.append(f"{html.escape(str(esn))}{suffix}")
-    engine_warning = ""
-    if len(state["ordered_esns"]) != 2:
-        engine_warning = (
-            f'<div class="tee-warning">The selected range resolves to {len(state["ordered_esns"])} engine serial columns. '
-            "No engine record has been discarded.</div>"
-        )
-    return f"""
-    <style>
-      .tee-load-summary {{ padding: 10px 12px; margin: 4px 0 10px; border: 1px solid #c8c8c8; border-radius: 4px; background: #fafafa; font-size: 13px; line-height: 1.55; }}
-      .tee-load-summary strong {{ color: #202124; }}
-      .tee-warning {{ margin-top: 6px; padding: 6px 8px; background: #fff4ce; border-left: 4px solid #d89b00; color: #5f4300; }}
-    </style>
-    <div class="tee-load-summary">
-      <div><strong>Aircraft:</strong> {html.escape(str(aircraft_identifier))} · <strong>Calendar selection:</strong> {start_date} through {end_date}</div>
-      <div><strong>Engines:</strong> {' · '.join(engine_items)} · <strong>Master windows:</strong> {len(state['window_rows']):,} · <strong>Combined flight periods:</strong> {len(state['intervals']):,}</div>
-      <div><strong>Archive extent:</strong> {html.escape(_tee_timestamp_label(state['range_start']))} through {html.escape(_tee_timestamp_label(state['range_end']))} · <strong>BREAK rows:</strong> {len(state['breaks']):,}</div>
-      <div>Event data is queried only for the visible slider window; changing controls does not require rerunning the cell.</div>
-      {engine_warning}
-    </div>
-    """
+def _ec_month_filter(start_time, end_time):
+    current = date(start_time.year, start_time.month, 1)
+    final = date(end_time.year, end_time.month, 1)
+    expression = F.lit(False)
+    while current <= final:
+        expression = expression | ((F.col("year") == current.year) & (F.col("Month") == current.month))
+        current = date(current.year + (current.month == 12), 1 if current.month == 12 else current.month + 1, 1)
+    return expression
 
 
-def _tee_window_summary_html(state, start_time, end_time):
-    event_count = len(state["events"])
-    disagreement_count = int(state["events"]["Disagreement"].fillna(False).astype(bool).sum()) if event_count else 0
-    unavailable = []
-    for item in state["availability"]:
-        missing = [channel for channel in ("AC", "BC") if not item[channel]]
-        if missing:
-            unavailable.append(f"{html.escape(item['signal'])}: missing {'/'.join(missing)}")
-    availability_html = ""
-    if unavailable:
-        availability_html = '<div class="tee-window-warning">' + " · ".join(unavailable) + "</div>"
-    truncation_html = ""
-    if state.get("truncated", False):
-        truncation_html = (
-            f'<div class="tee-window-danger">This window contains more than {_TEE_MAX_WINDOW_EVENTS:,} state changes. '
-            f'The first {_TEE_MAX_WINDOW_EVENTS:,} are displayed; narrow the time window for a complete millisecond-level sequence.</div>'
-        )
-    return f"""
-    <style>
-      .tee-window-summary {{ padding: 8px 10px; margin: 5px 0 8px; background: #eef6ff; border-left: 4px solid #2f6fbd; font-size: 13px; line-height: 1.5; }}
-      .tee-window-warning {{ margin-top: 5px; padding: 5px 7px; background: #fff4ce; border-left: 4px solid #d89b00; color: #5f4300; }}
-      .tee-window-danger {{ margin-top: 5px; padding: 7px 9px; background: #fde7e7; border-left: 4px solid #c62828; color: #7f0000; font-weight: 700; }}
-    </style>
-    <div class="tee-window-summary">
-      <div><strong>Loaded window:</strong> {html.escape(_tee_timestamp_label(start_time))} through {html.escape(_tee_timestamp_label(end_time))}</div>
-      <div><strong>State-change events:</strong> {event_count:,} · <strong>AC/BC disagreement transitions:</strong> {disagreement_count:,} · <strong>Selected signals:</strong> {len(state['usable_signals'])}</div>
-      {truncation_html}{availability_html}
-    </div>
-    """
-
-
-def _tee_build_range_controls(state, signal_widget):
-    full_start = pd.Timestamp(state["range_start"])
-    full_end = pd.Timestamp(state["range_end"])
-    total_milliseconds = max(0, int(round((full_end - full_start).total_seconds() * 1000.0)))
-    slider_max = max(1, total_milliseconds)
-    default_interval_start, default_interval_end = state["intervals"][-1]
-    default_end = min(full_end, pd.Timestamp(default_interval_end))
-    default_start = max(full_start, pd.Timestamp(default_interval_start))
-    maximum_window = pd.to_timedelta(_TEE_MAX_VIEW_SECONDS, unit="s")
-    if default_end - default_start > maximum_window:
-        default_start = default_end - maximum_window
-
-    def offset_from_timestamp(timestamp):
-        value = int(round((timestamp - full_start).total_seconds() * 1000.0))
-        return min(total_milliseconds, max(0, value))
-
-    default_offsets = (
-        offset_from_timestamp(default_start),
-        offset_from_timestamp(default_end),
-    )
-    slider = widgets.IntRangeSlider(
-        value=default_offsets,
-        min=0,
-        max=slider_max,
-        step=1,
-        description="Archive:",
-        readout=False,
-        continuous_update=False,
-        layout=widgets.Layout(width="1200px"),
-        style={"description_width": "90px"},
-    )
-    start_text = widgets.Text(
-        value=_tee_timestamp_label(default_start),
-        description="Start:",
-        layout=widgets.Layout(width="500px"),
-    )
-    end_text = widgets.Text(
-        value=_tee_timestamp_label(default_end),
-        description="End:",
-        layout=widgets.Layout(width="500px"),
-    )
-    apply_button = widgets.Button(
-        description="Load exact window",
-        button_style="success",
-        layout=widgets.Layout(width="185px"),
-    )
-    previous_button = widgets.Button(
-        description="Previous window",
-        layout=widgets.Layout(width="160px"),
-    )
-    next_button = widgets.Button(
-        description="Next window",
-        layout=widgets.Layout(width="150px"),
-    )
-    latest_button = widgets.Button(
-        description="Latest flight",
-        layout=widgets.Layout(width="140px"),
-    )
-    range_label = widgets.HTML()
-    table_output = widgets.Output()
-    guard = {"active": False}
-    buttons = [apply_button, previous_button, next_button, latest_button]
-
-    def timestamp_from_offset(offset):
-        return full_start + pd.to_timedelta(int(offset), unit="ms")
-
-    def normalize_range(start_time, end_time, prefer_end=True):
-        start_time = _tee_match_timezone(start_time, full_start)
-        end_time = _tee_match_timezone(end_time, full_start)
-        if start_time > end_time:
-            start_time, end_time = end_time, start_time
-        start_time = min(full_end, max(full_start, start_time))
-        end_time = min(full_end, max(full_start, end_time))
-        if end_time - start_time > maximum_window:
-            if prefer_end:
-                start_time = max(full_start, end_time - maximum_window)
-            else:
-                end_time = min(full_end, start_time + maximum_window)
-        return start_time, end_time
-
-    def set_controls(start_time, end_time):
-        start_time, end_time = normalize_range(start_time, end_time)
-        offsets = (offset_from_timestamp(start_time), offset_from_timestamp(end_time))
-        guard["active"] = True
-        slider.value = offsets
-        start_time = timestamp_from_offset(offsets[0])
-        end_time = timestamp_from_offset(offsets[1])
-        start_text.value = _tee_timestamp_label(start_time)
-        end_text.value = _tee_timestamp_label(end_time)
-        guard["active"] = False
-        range_label.value = (
-            "<b>Archive:</b> "
-            + html.escape(_tee_timestamp_label(full_start))
-            + " → "
-            + html.escape(_tee_timestamp_label(full_end))
-            + "<br><b>Selected:</b> "
-            + html.escape(_tee_timestamp_label(start_time))
-            + " → "
-            + html.escape(_tee_timestamp_label(end_time))
-            + f" &nbsp; <b>Maximum loaded window:</b> {_TEE_MAX_VIEW_SECONDS / 86400:g} days"
-        )
-        return start_time, end_time
-
-    def load_window(start_time, end_time):
-        start_time, end_time = set_controls(start_time, end_time)
-        for button in buttons:
-            button.disabled = True
-        slider.disabled = True
-        with table_output:
-            clear_output(wait=True)
-            print(
-                "Loading exact event window "
-                f"{_tee_timestamp_label(start_time)} through {_tee_timestamp_label(end_time)}..."
-            )
-        try:
-            selected_signal_keys = list(signal_widget.value)
-            if not selected_signal_keys:
-                raise ValueError("Select at least one signal.")
-            result = _tee_query_event_window(
-                state,
-                selected_signal_keys,
-                start_time,
-                end_time,
-            )
-            state.update(result)
-            globals().update(
-                {
-                    "two_engine_event_data": state["events"],
-                    "two_engine_breaks": pd.DataFrame(state["breaks"]),
-                    "two_engine_selected_esns": list(state["ordered_esns"]),
-                    "two_engine_event_state": state,
-                }
-            )
-            with table_output:
-                clear_output(wait=True)
-                ipy_display(HTML(_tee_window_summary_html(state, start_time, end_time)))
-                ipy_display(HTML(_tee_table_html(state, start_time, end_time)))
-        except Exception as exc:
-            with table_output:
-                clear_output(wait=True)
-                print(f"Unable to load the selected event window: {exc}")
-        finally:
-            slider.disabled = False
-            for button in buttons:
-                button.disabled = False
-
-    def on_slider(change):
-        if guard["active"]:
-            return
-        start_time = timestamp_from_offset(change["new"][0])
-        end_time = timestamp_from_offset(change["new"][1])
-        start_time, end_time = normalize_range(start_time, end_time, prefer_end=True)
-        load_window(start_time, end_time)
-
-    def on_apply(_):
-        try:
-            start_time = _tee_match_timezone(start_text.value, full_start)
-            end_time = _tee_match_timezone(end_text.value, full_start)
-            start_time, end_time = normalize_range(start_time, end_time, prefer_end=False)
-            load_window(start_time, end_time)
-        except Exception as exc:
-            with table_output:
-                clear_output(wait=True)
-                print(f"Start and end must be valid date-time values: {exc}")
-
-    def shift_window(direction):
-        start_time = _tee_match_timezone(start_text.value, full_start)
-        end_time = _tee_match_timezone(end_text.value, full_start)
-        start_time, end_time = normalize_range(start_time, end_time)
-        width = max(pd.to_timedelta(1, unit="ms"), end_time - start_time)
-        shifted_start = start_time + direction * width
-        shifted_end = end_time + direction * width
-        if shifted_start < full_start:
-            shifted_start = full_start
-            shifted_end = min(full_end, full_start + width)
-        if shifted_end > full_end:
-            shifted_end = full_end
-            shifted_start = max(full_start, full_end - width)
-        load_window(shifted_start, shifted_end)
-
-    def on_previous(_):
-        shift_window(-1)
-
-    def on_next(_):
-        shift_window(1)
-
-    def on_latest(_):
-        interval_start, interval_end = state["intervals"][-1]
-        interval_end = min(full_end, pd.Timestamp(interval_end))
-        interval_start = max(full_start, pd.Timestamp(interval_start))
-        if interval_end - interval_start > maximum_window:
-            interval_start = interval_end - maximum_window
-        load_window(interval_start, interval_end)
-
-    slider.observe(on_slider, names="value")
-    apply_button.on_click(on_apply)
-    previous_button.on_click(on_previous)
-    next_button.on_click(on_next)
-    latest_button.on_click(on_latest)
-    controls = widgets.VBox(
-        [
-            widgets.HBox([start_text, end_text]),
-            slider,
-            range_label,
-            widgets.HBox([apply_button, previous_button, next_button, latest_button]),
-            table_output,
-        ]
-    )
-    initial_start, initial_end = set_controls(default_start, default_end)
-
-    def load_initial_window():
-        load_window(initial_start, initial_end)
-
-    return controls, load_initial_window
-
-
-_tee_asset_rows = (
-    spark.table(_TEE_ASSET_TABLE)
-    .where(F.col("EngineTypeCode") == _TEE_ENGINE_TYPE)
-    .select(
-        F.col("LatestAircraftLatestIdentifier").cast("string").alias("AircraftIdentifier"),
-        F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
-    )
-    .where(F.col("AircraftIdentifier").isNotNull() & F.col("EngineSerialNumber").isNotNull())
-    .dropDuplicates()
+_ec_asset_rows = (
+    spark.table(EC_ASSET_TABLE)
+    .where(F.col("EngineTypeCode") == EC_ENGINE_TYPE_CODE)
+    .select(F.col("LatestAircraftLatestIdentifier").cast("string").alias("AircraftIdentifier"))
+    .where(F.col("AircraftIdentifier").isNotNull())
+    .distinct()
+    .orderBy("AircraftIdentifier")
     .collect()
 )
-_tee_asset_esns_by_aircraft = {}
-for _tee_row in _tee_asset_rows:
-    _tee_asset_esns_by_aircraft.setdefault(_tee_row.AircraftIdentifier, set()).add(str(_tee_row.EngineSerialNumber))
-_tee_aircraft_options = sorted(_tee_asset_esns_by_aircraft)
-if not _tee_aircraft_options:
-    raise RuntimeError(f"No aircraft were found for engine type {_TEE_ENGINE_TYPE}.")
+_ec_aircraft_options = [row.AircraftIdentifier for row in _ec_asset_rows]
+if not _ec_aircraft_options:
+    raise RuntimeError(f"No aircraft were found for engine type {EC_ENGINE_TYPE_CODE}.")
+
+_ec_scan_schema_columns = spark.table(EC_SCAN_TABLE).columns
+_ec_scan_schema_set = set(_ec_scan_schema_columns)
+_ec_parameter_bases = set()
+for _ec_column in _ec_scan_schema_columns:
+    for _ec_channel in EC_CHANNELS:
+        _ec_prefix = f"{EC_PARAMETER_PREFIX}{_ec_channel}_"
+        if _ec_column.startswith(_ec_prefix):
+            _ec_parameter_bases.add(_ec_column[len(_ec_prefix):])
+_ec_parameter_bases = sorted(_ec_parameter_bases, key=lambda base: (_ec_parameter_label(base).lower(), base.lower()))
+_ec_default_parameters = [base for base in EC_DEFAULT_PARAMETERS if base in _ec_parameter_bases]
 
 
-def _tee_latest_calendar_date(aircraft_identifier):
-    row = (
-        spark.table(_TEE_MASTER_TABLE)
-        .where(F.col("AircraftIdentifier").cast("string") == aircraft_identifier)
-        .agg(F.max("CalendarId").alias("LatestCalendarId"))
-        .first()
-    )
-    value = row.LatestCalendarId if row else None
-    return datetime.strptime(str(int(value)), "%Y%m%d").date() if value is not None else date.today()
+def _ec_search_label(base):
+    return f"{_ec_parameter_label(base)} — {base}"
 
 
-_tee_previous_aircraft_widget = globals().get("_tee_aircraft_widget")
-_tee_previous_start_widget = globals().get("_tee_start_widget")
-_tee_previous_end_widget = globals().get("_tee_end_widget")
-_tee_previous_signal_widget = globals().get("_tee_signal_widget")
-_tee_previous_aircraft = getattr(_tee_previous_aircraft_widget, "value", None)
-_tee_default_aircraft = _tee_previous_aircraft if _tee_previous_aircraft in _tee_aircraft_options else _tee_aircraft_options[0]
-_tee_previous_start = getattr(_tee_previous_start_widget, "value", None)
-_tee_previous_end = getattr(_tee_previous_end_widget, "value", None)
-if _tee_previous_start is None or _tee_previous_end is None:
-    _tee_previous_end = _tee_latest_calendar_date(_tee_default_aircraft)
-    _tee_previous_start = _tee_previous_end - timedelta(days=182)
-_tee_signal_keys = tuple(item["key"] for item in _TEE_SIGNALS)
-_tee_previous_signals = tuple(getattr(_tee_previous_signal_widget, "value", ()))
-_tee_default_signals = tuple(value for value in _tee_previous_signals if value in _tee_signal_keys) or _tee_signal_keys
+_ec_search_to_base = {_ec_search_label(base): base for base in _ec_parameter_bases}
+_ec_default_aircraft = _ec_aircraft_options[0]
+_ec_latest_row = (
+    spark.table(EC_MASTER_TABLE)
+    .where(F.col("AircraftIdentifier").cast("string") == _ec_default_aircraft)
+    .agg(F.max("CalendarId").alias("LatestCalendarId"))
+    .first()
+)
+_ec_latest_calendar = _ec_latest_row.LatestCalendarId if _ec_latest_row else None
+_ec_default_date = (
+    datetime.strptime(str(int(_ec_latest_calendar)), "%Y%m%d").date()
+    if _ec_latest_calendar is not None
+    else date.today()
+)
 
-_tee_aircraft_widget = widgets.Dropdown(
-    options=_tee_aircraft_options,
-    value=_tee_default_aircraft,
+ec_aircraft_widget = widgets.Dropdown(
+    options=_ec_aircraft_options,
+    value=_ec_default_aircraft,
     description="Aircraft:",
-    layout=widgets.Layout(width="420px"),
+    layout=widgets.Layout(width="430px"),
 )
-_tee_start_widget = widgets.DatePicker(
-    value=_tee_previous_start,
-    description="Start date:",
+ec_date_widget = widgets.DatePicker(
+    value=_ec_default_date,
+    description="Flight date:",
     layout=widgets.Layout(width="300px"),
 )
-_tee_end_widget = widgets.DatePicker(
-    value=_tee_previous_end,
-    description="End date:",
-    layout=widgets.Layout(width="300px"),
+ec_find_flights_button = widgets.Button(
+    description="Find flights",
+    button_style="info",
+    layout=widgets.Layout(width="150px"),
 )
-_tee_signal_widget = widgets.SelectMultiple(
-    options=[(item["label"], item["key"]) for item in _TEE_SIGNALS],
-    value=_tee_default_signals,
+ec_flight_widget = widgets.Dropdown(
+    options=[],
+    description="Flight:",
+    layout=widgets.Layout(width="740px"),
+)
+ec_parameter_search = widgets.Combobox(
+    options=list(_ec_search_to_base),
+    placeholder="Search and add a parameter",
+    description="Add signal:",
+    ensure_option=True,
+    layout=widgets.Layout(width="760px"),
+)
+ec_parameter_widget = widgets.SelectMultiple(
+    options=[(_ec_parameter_label(base), base) for base in _ec_default_parameters],
     description="Signals:",
-    layout=widgets.Layout(width="520px", height="210px"),
+    layout=widgets.Layout(width="760px", height="230px"),
 )
-_tee_load_button = widgets.Button(
-    description="Load archive timeline",
-    button_style="primary",
-    layout=widgets.Layout(width="220px"),
+ec_remove_parameter_button = widgets.Button(
+    description="Remove highlighted",
+    button_style="danger",
+    icon="trash",
 )
-_tee_output = widgets.Output()
+ec_load_button = widgets.Button(
+    description="Load comparison",
+    button_style="success",
+    layout=widgets.Layout(width="190px"),
+)
+ec_status_output = widgets.Output()
+ec_table_output = widgets.Output()
 
 
-def _tee_on_aircraft_change(change):
-    if change.get("new") == change.get("old"):
+def _ec_selected_parameters():
+    return [value for _, value in ec_parameter_widget.options]
+
+
+def _ec_refresh_parameter_search():
+    selected = set(_ec_selected_parameters())
+    ec_parameter_search.options = [
+        label for label, base in _ec_search_to_base.items() if base not in selected
+    ]
+
+
+def _ec_add_parameter(change):
+    label = change["new"]
+    base = _ec_search_to_base.get(label)
+    if base is None or base in _ec_selected_parameters():
         return
-    latest_date = _tee_latest_calendar_date(change["new"])
-    _tee_end_widget.value = latest_date
-    _tee_start_widget.value = latest_date - timedelta(days=182)
-    _tee_load()
+    ec_parameter_widget.options = tuple(ec_parameter_widget.options) + ((_ec_parameter_label(base), base),)
+    ec_parameter_search.value = ""
+    _ec_refresh_parameter_search()
 
 
-def _tee_load(_=None, raise_errors=False):
-    _tee_load_button.disabled = True
+def _ec_remove_parameters(_):
+    removed = set(ec_parameter_widget.value)
+    ec_parameter_widget.options = tuple(
+        option for option in ec_parameter_widget.options if option[1] not in removed
+    )
+    _ec_refresh_parameter_search()
+
+
+def _ec_refresh_flights(_=None, raise_errors=False):
+    ec_find_flights_button.disabled = True
     try:
-        aircraft_identifier = _tee_aircraft_widget.value
-        start_date = _tee_start_widget.value
-        end_date = _tee_end_widget.value
-        selected_signal_keys = list(_tee_signal_widget.value)
-        if start_date is None or end_date is None:
-            raise ValueError("Both start and end dates are required.")
-        if start_date > end_date:
-            raise ValueError("Start date must not be later than end date.")
-        if not selected_signal_keys:
-            raise ValueError("Select at least one signal.")
-        with _tee_output:
+        with ec_status_output:
             clear_output(wait=True)
-            print("Loading the multi-month flight timeline for both engines...")
-        state = _tee_load_timeline(
-            aircraft_identifier,
-            start_date,
-            end_date,
-            _tee_asset_esns_by_aircraft.get(aircraft_identifier, set()),
-        )
-        globals().update(
-            {
-                "two_engine_event_data": state["events"],
-                "two_engine_breaks": pd.DataFrame(state["breaks"]),
-                "two_engine_master_windows": pd.DataFrame(
-                    [row.asDict(recursive=True) for row in state["window_rows"]]
-                ),
-                "two_engine_selected_esns": list(state["ordered_esns"]),
-                "two_engine_event_state": state,
-            }
-        )
-        range_controls, load_initial_window = _tee_build_range_controls(
-            state,
-            _tee_signal_widget,
-        )
-        with _tee_output:
-            clear_output(wait=True)
-            ipy_display(HTML(_tee_summary_html(state, aircraft_identifier, start_date, end_date)))
-            ipy_display(range_controls)
-        load_initial_window()
+            aircraft = ec_aircraft_widget.value
+            flight_date = ec_date_widget.value
+            if flight_date is None:
+                raise ValueError("Choose a flight date.")
+            calendar_id = int(flight_date.strftime("%Y%m%d"))
+            rows = (
+                spark.table(EC_MASTER_TABLE)
+                .where(
+                    (F.col("AircraftIdentifier").cast("string") == aircraft)
+                    & (F.col("CalendarId") == calendar_id)
+                )
+                .select(
+                    "StartDatetime",
+                    "EndDatetime",
+                    F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
+                )
+                .where(F.col("StartDatetime").isNotNull() & F.col("EndDatetime").isNotNull())
+                .groupBy("StartDatetime")
+                .agg(
+                    F.max("EndDatetime").alias("EndDatetime"),
+                    F.sort_array(F.collect_set("EngineSerialNumber")).alias("Engines"),
+                )
+                .where(F.col("EndDatetime") >= F.col("StartDatetime"))
+                .orderBy("StartDatetime")
+                .collect()
+            )
+            options = []
+            for row in rows:
+                engine_count = len([engine for engine in row.Engines if engine is not None])
+                label = (
+                    f"{row.StartDatetime.strftime('%H:%M:%S.%f')[:-3]} – "
+                    f"{row.EndDatetime.strftime('%H:%M:%S.%f')[:-3]} | {engine_count} engines"
+                )
+                options.append((label, row.StartDatetime))
+            ec_flight_widget.options = options
+            if options:
+                ec_flight_widget.value = options[0][1]
+                print(f"Found {len(options)} flights for {aircraft} on {flight_date}.")
+            else:
+                print(f"No flights were found for {aircraft} on {flight_date}.")
     except Exception as exc:
-        with _tee_output:
-            clear_output(wait=True)
-            print(f"Unable to build the two-engine event table: {exc}")
+        ec_flight_widget.options = []
+        with ec_status_output:
+            print(f"Unable to find flights: {exc}")
         if raise_errors:
             raise
     finally:
-        _tee_load_button.disabled = False
+        ec_find_flights_button.disabled = False
 
 
-_tee_aircraft_widget.observe(_tee_on_aircraft_change, names="value")
-_tee_load_button.on_click(_tee_load)
-_tee_root = widgets.VBox(
+def _ec_load_comparison(_):
+    ec_load_button.disabled = True
+    try:
+        with ec_table_output:
+            clear_output(wait=True)
+            aircraft = ec_aircraft_widget.value
+            flight_date = ec_date_widget.value
+            start_time = ec_flight_widget.value
+            parameters = _ec_selected_parameters()
+            if flight_date is None or start_time is None:
+                raise ValueError("Choose a date and flight before loading the comparison.")
+            if not parameters:
+                raise ValueError("Select at least one signal.")
+            calendar_id = int(flight_date.strftime("%Y%m%d"))
+            master_rows = (
+                spark.table(EC_MASTER_TABLE)
+                .where(
+                    (F.col("AircraftIdentifier").cast("string") == aircraft)
+                    & (F.col("CalendarId") == calendar_id)
+                    & (F.col("StartDatetime") == F.lit(start_time))
+                )
+                .select(
+                    F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
+                    "AircraftId",
+                    "EndDatetime",
+                )
+                .where(
+                    F.col("EngineSerialNumber").isNotNull()
+                    & F.col("AircraftId").isNotNull()
+                    & F.col("EndDatetime").isNotNull()
+                )
+                .collect()
+            )
+            engine_metadata = {}
+            for row in master_rows:
+                metadata = engine_metadata.setdefault(
+                    row.EngineSerialNumber,
+                    {"aircraft_ids": set(), "end_times": []},
+                )
+                metadata["aircraft_ids"].add(row.AircraftId)
+                metadata["end_times"].append(row.EndDatetime)
+            engines = sorted(engine_metadata)
+            if len(engines) != 2:
+                raise ValueError(
+                    f"Expected exactly two engines for this flight; found {len(engines)}: {engines}"
+                )
+            end_time = max(
+                end
+                for engine in engines
+                for end in engine_metadata[engine]["end_times"]
+            )
+            aircraft_ids = list(
+                {
+                    aircraft_id
+                    for engine in engines
+                    for aircraft_id in engine_metadata[engine]["aircraft_ids"]
+                }
+            )
+            selected_columns = ["Timestamp", "AssetIdentifier"]
+            for base in parameters:
+                for channel in EC_CHANNELS:
+                    column = _ec_full_column(channel, base)
+                    if column in _ec_scan_schema_set:
+                        selected_columns.append(column)
+            selected_columns = list(dict.fromkeys(selected_columns))
+            source = (
+                spark.table(EC_SCAN_TABLE)
+                .where(
+                    F.col("AircraftId").isin(aircraft_ids)
+                    & F.col("AssetIdentifier").cast("string").isin(engines)
+                    & (F.col("StartDatetime") == F.lit(start_time))
+                    & F.col("Timestamp").between(F.lit(start_time), F.lit(end_time))
+                    & _ec_month_filter(start_time, end_time)
+                )
+                .select(*[_ec_quote(column).alias(column) for column in selected_columns])
+                .orderBy("Timestamp")
+            )
+            row_count = source.count()
+            if row_count == 0:
+                raise ValueError("No scan samples were found for the selected flight and engines.")
+            if row_count > EC_MAX_PANDAS_ROWS:
+                raise RuntimeError(
+                    f"The flight contains {row_count:,} samples, above the {EC_MAX_PANDAS_ROWS:,}-row safety limit."
+                )
+            frame = source.toPandas()
+            frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], errors="coerce")
+            available_columns = set(frame.columns)
+            discrete_by_parameter = {
+                base: _ec_parameter_is_discrete(frame, base, available_columns)
+                for base in parameters
+            }
+            events_by_engine = {
+                engine: _ec_extract_events(
+                    frame,
+                    engine,
+                    parameters,
+                    available_columns,
+                    discrete_by_parameter,
+                )
+                for engine in engines
+            }
+            context = (
+                f"Aircraft {aircraft} | Flight {flight_date} "
+                f"{_ec_timestamp_text(start_time)}–{_ec_timestamp_text(end_time)} | "
+                f"{row_count:,} samples | AC primary, BC fallback | "
+                f"AC/BC divergence threshold {EC_DIVERGENCE_THRESHOLD:.0%}."
+            )
+            ipy_display(HTML(_ec_render_table(events_by_engine, engines, parameters, context)))
+    except Exception as exc:
+        with ec_table_output:
+            print(f"Unable to load comparison: {exc}")
+    finally:
+        ec_load_button.disabled = False
+
+
+ec_parameter_search.observe(_ec_add_parameter, names="value")
+ec_remove_parameter_button.on_click(_ec_remove_parameters)
+ec_find_flights_button.on_click(_ec_refresh_flights)
+ec_load_button.on_click(_ec_load_comparison)
+
+ec_controls = widgets.VBox(
     [
-        widgets.HBox([_tee_aircraft_widget, _tee_start_widget, _tee_end_widget]),
-        widgets.HBox([_tee_signal_widget, _tee_load_button]),
-        _tee_output,
+        widgets.HBox([ec_aircraft_widget, ec_date_widget, ec_find_flights_button]),
+        ec_flight_widget,
+        ec_parameter_search,
+        ec_parameter_widget,
+        widgets.HBox([ec_remove_parameter_button, ec_load_button]),
+        ec_status_output,
+        ec_table_output,
     ]
 )
-ipy_display(_tee_root)
-_tee_load(raise_errors=True)
+ipy_display(ec_controls)
+_ec_refresh_parameter_search()
+_ec_refresh_flights(raise_errors=True)
