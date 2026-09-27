@@ -670,12 +670,14 @@ def _ec_load_comparison(_):
             .select(
                 F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
                 "AircraftId",
+                "StartDatetime",
                 "EndDatetime",
             )
             .where(
                 F.col("EngineSerialNumber").isNotNull()
                 & F.col("AircraftId").isNotNull()
                 & F.col("EndDatetime").isNotNull()
+                & (F.col("EndDatetime") >= F.col("StartDatetime"))
             )
             .collect()
         )
@@ -692,18 +694,18 @@ def _ec_load_comparison(_):
             raise ValueError(
                 f"Expected exactly two engines for this flight; found {len(engines)}: {engines}"
             )
-        end_time = max(
-            end
-            for engine in engines
-            for end in engine_metadata[engine]["end_times"]
-        )
-        aircraft_ids = list(
-            {
-                aircraft_id
-                for engine in engines
-                for aircraft_id in engine_metadata[engine]["aircraft_ids"]
+        engine_windows = {}
+        for engine in engines:
+            aircraft_ids = engine_metadata[engine]["aircraft_ids"]
+            if len(aircraft_ids) != 1:
+                raise ValueError(
+                    f"Engine {engine} maps to {len(aircraft_ids)} aircraft IDs for this flight."
+                )
+            engine_windows[engine] = {
+                "aircraft_id": next(iter(aircraft_ids)),
+                "end_time": max(engine_metadata[engine]["end_times"]),
             }
-        )
+        end_time = max(window["end_time"] for window in engine_windows.values())
         selected_columns = ["Timestamp", "AssetIdentifier"]
         for base in parameters:
             for channel in EC_CHANNELS:
@@ -714,13 +716,22 @@ def _ec_load_comparison(_):
         populated_signal = F.lit(False)
         for column in selected_columns[2:]:
             populated_signal = populated_signal | _ec_quote(column).isNotNull()
+        exact_engine_window = F.lit(False)
+        for engine in engines:
+            engine_window = engine_windows[engine]
+            exact_engine_window = exact_engine_window | (
+                (F.col("AircraftId") == F.lit(engine_window["aircraft_id"]))
+                & (F.col("AssetIdentifier").cast("string") == F.lit(engine))
+                & F.col("Timestamp").between(
+                    F.lit(start_time),
+                    F.lit(engine_window["end_time"]),
+                )
+            )
         source = (
             _ec_scan_table.where(
-                F.col("AircraftId").isin(aircraft_ids)
-                & F.col("AssetIdentifier").cast("string").isin(engines)
-                & (F.col("StartDatetime") == F.lit(start_time))
-                & F.col("Timestamp").between(F.lit(start_time), F.lit(end_time))
+                (F.col("StartDatetime") == F.lit(start_time))
                 & _ec_month_filter(start_time, end_time)
+                & exact_engine_window
                 & populated_signal
             )
             .select(*[_ec_quote(column).alias(column) for column in selected_columns])
