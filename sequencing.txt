@@ -15,8 +15,6 @@ EC_SCAN_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontin
 EC_ENGINE_TYPE_CODE = "Pearl 700"
 EC_PARAMETER_PREFIX = "Parameter:EVHMU_EEC_"
 EC_CHANNELS = ("AC", "BC")
-EC_DIVERGENCE_THRESHOLD = 0.25
-EC_MAX_LAG_SECONDS = 5.0
 EC_MAX_EVENT_ROWS = 5_000
 EC_STATE_TOLERANCE = 1e-6
 
@@ -43,6 +41,14 @@ EC_PARAMETER_STATE_VALUES = {
     "IThrustReverser_trIsUnlocked_data": (0.0, 1.0),
     "IThrustReverser_trDoorStowStatus_data": (0.0, 1.0),
     "IThrustReverser_trIsDeployed_data": (0.0, 1.0),
+}
+
+EC_BINARY_PARAMETERS = {
+    "IThrustReverser_trArmed_data",
+    "IThrustReverser_trInTransit_data",
+    "IThrustReverser_trIsUnlocked_data",
+    "IThrustReverser_trDoorStowStatus_data",
+    "IThrustReverser_trIsDeployed_data",
 }
 
 EC_LABELS = {
@@ -137,6 +143,8 @@ def _ec_format_value(value):
     value = _ec_scalar(value)
     if isinstance(value, (bool, np.bool_)):
         return "1" if bool(value) else "0"
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return "1" if value.strip().lower() == "true" else "0"
     number = _ec_number(value)
     if number is not None:
         if np.isclose(number, round(number), rtol=0.0, atol=1e-12):
@@ -176,6 +184,29 @@ def _ec_recognized_state(value, base):
     return recognized
 
 
+def _ec_extreme_channel_conflict(ac_value, bc_value, base, is_boolean):
+    if base == "IThrustReverser_trDoorDeplStatus_data":
+        return F.lit(False)
+    ac_number = ac_value.cast("double")
+    bc_number = bc_value.cast("double")
+    both_present = ac_number.isNotNull() & bc_number.isNotNull()
+
+    def near(value, target):
+        return F.abs(value - F.lit(float(target))) <= F.lit(EC_STATE_TOLERANCE)
+
+    if base in EC_BINARY_PARAMETERS or is_boolean:
+        opposite_endpoints = (
+            (near(ac_number, 0.0) & near(bc_number, 1.0))
+            | (near(ac_number, 1.0) & near(bc_number, 0.0))
+        )
+    else:
+        opposite_endpoints = (
+            (near(ac_number, 0.0) & near(bc_number, 100.0))
+            | (near(ac_number, 100.0) & near(bc_number, 0.0))
+        )
+    return both_present & opposite_endpoints
+
+
 def _ec_build_event_df(source, parameters):
     order_window = Window.partitionBy("AssetIdentifier").orderBy("Timestamp")
     state_window = order_window.rowsBetween(Window.unboundedPreceding, Window.currentRow)
@@ -190,6 +221,7 @@ def _ec_build_event_df(source, parameters):
         if not available:
             continue
         data_type = _ec_scan_type_by_name[available[0]]
+        is_boolean = isinstance(data_type, BooleanType)
         is_numeric = isinstance(data_type, (NumericType, BooleanType))
         ac_raw = (
             _ec_quote(ac_column)
@@ -222,6 +254,7 @@ def _ec_build_event_df(source, parameters):
                 "disagreement": f"_ec_disagreement_{index}",
                 "recognized": f"_ec_recognized_{index}",
                 "tracked": f"_ec_tracked_{index}",
+                "is_boolean": is_boolean,
                 "is_numeric": is_numeric,
             }
         )
@@ -231,15 +264,15 @@ def _ec_build_event_df(source, parameters):
         ac_state = F.col(metadata["ac"])
         bc_state = F.col(metadata["bc"])
         current = F.coalesce(ac_state, bc_state)
-        both_present = ac_state.isNotNull() & bc_state.isNotNull()
         if metadata["is_numeric"]:
-            ac_number = ac_state.cast("double")
-            bc_number = bc_state.cast("double")
-            difference = F.abs(ac_number - bc_number)
-            scale = F.greatest(F.abs(ac_number), F.abs(bc_number), F.lit(1e-12))
-            disagreement = both_present & ((difference / scale) >= F.lit(EC_DIVERGENCE_THRESHOLD))
+            disagreement = _ec_extreme_channel_conflict(
+                ac_state,
+                bc_state,
+                metadata["base"],
+                metadata["is_boolean"],
+            )
         else:
-            disagreement = both_present & (ac_state != bc_state)
+            disagreement = F.lit(False)
         recognized = (
             _ec_recognized_state(current, metadata["base"])
             if metadata["is_numeric"]
@@ -286,7 +319,7 @@ def _ec_build_event_df(source, parameters):
         )
         event_condition = current.isNotNull() & (
             recognized_transition
-            | (disagreement != previous_disagreement)
+            | (disagreement & ~previous_disagreement)
         )
         event_expressions.append(
             F.when(
@@ -352,57 +385,11 @@ def _ec_events_from_spark_frame(frame, engines):
     return events_by_engine
 
 
-def _ec_format_lag(milliseconds):
-    absolute = abs(milliseconds)
-    if np.isclose(absolute, round(absolute), rtol=0.0, atol=1e-6):
-        return f"{int(round(absolute)):,} ms"
-    return f"{absolute:,.3f}".rstrip("0").rstrip(".") + " ms"
-
-
-def _ec_match_lags(events_by_engine, engines):
-    first_engine, second_engine = engines
-    first_events = events_by_engine[first_engine]
-    second_events = events_by_engine[second_engine]
-    candidates_by_key = {}
-    for index, event in enumerate(second_events):
-        key = (event["parameter"], event["value_key"])
-        candidates_by_key.setdefault(key, []).append((index, event))
-    used_second_indices = set()
-    lag_by_row = {}
-    for first_event in first_events:
-        key = (first_event["parameter"], first_event["value_key"])
-        candidates = [
-            (index, event)
-            for index, event in candidates_by_key.get(key, [])
-            if index not in used_second_indices
-            and abs((event["timestamp"] - first_event["timestamp"]).total_seconds()) <= EC_MAX_LAG_SECONDS
-        ]
-        if not candidates:
-            continue
-        second_index, second_event = min(
-            candidates,
-            key=lambda item: abs((item[1]["timestamp"] - first_event["timestamp"]).total_seconds()),
-        )
-        used_second_indices.add(second_index)
-        milliseconds = (second_event["timestamp"] - first_event["timestamp"]).total_seconds() * 1000.0
-        if np.isclose(milliseconds, 0.0, rtol=0.0, atol=1e-9):
-            row_key = (first_event["timestamp"], first_event["parameter"])
-            lag_by_row[row_key] = "0 ms"
-        elif milliseconds > 0:
-            row_key = (second_event["timestamp"], second_event["parameter"])
-            lag_by_row[row_key] = f"{_ec_format_lag(milliseconds)} ({second_engine} later)"
-        else:
-            row_key = (first_event["timestamp"], first_event["parameter"])
-            lag_by_row[row_key] = f"{_ec_format_lag(milliseconds)} ({first_engine} later)"
-    return lag_by_row
-
-
 def _ec_timestamp_text(timestamp):
     return pd.Timestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
 
 
-def _ec_render_table(events_by_engine, engines, parameters, context_text):
-    lag_by_row = _ec_match_lags(events_by_engine, engines)
+def _ec_render_table(events_by_engine, engines, parameters):
     rows = {}
     for engine in engines:
         for event in events_by_engine[engine]:
@@ -443,32 +430,27 @@ def _ec_render_table(events_by_engine, engines, parameters, context_text):
             value_cells.append(
                 f'<td class="ec-value" style="{style}">{html.escape(value)}</td>'
             )
-        lag = lag_by_row.get((row["timestamp"], base), "")
         body.append(
             "<tr>"
             f'<td class="ec-time">{_ec_timestamp_text(row["timestamp"])}</td>'
             + "".join(value_cells)
-            + f'<td class="ec-lag">{html.escape(lag)}</td>'
             + "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="4" class="ec-empty">No value changes were found.</td></tr>')
+        body.append('<tr><td colspan="3" class="ec-empty">No value changes were found.</td></tr>')
     return f"""
     <style>
       .ec-wrap {{ width:100%; max-height:760px; overflow:auto; border:1px solid #555; background:#fff; }}
-      .ec-context {{ margin:6px 0 10px; font-size:13px; color:#333; }}
-      .ec-table {{ width:100%; min-width:920px; border-collapse:collapse; table-layout:fixed; font-size:13px; color:#111; }}
+      .ec-table {{ width:100%; min-width:720px; border-collapse:collapse; table-layout:fixed; font-size:13px; color:#111; }}
       .ec-table th {{ position:sticky; top:0; z-index:3; background:#efefef; border:1px solid #333; padding:7px 8px; text-align:center; font-weight:700; }}
       .ec-table td {{ border:1px solid #333; padding:5px 7px; vertical-align:middle; }}
       .ec-time {{ width:150px; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
-      .ec-value {{ width:34%; overflow-wrap:anywhere; }}
-      .ec-lag {{ width:190px; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
+      .ec-value {{ width:calc((100% - 150px) / 2); overflow-wrap:anywhere; }}
       .ec-empty {{ text-align:center; color:#666; font-style:italic; padding:18px !important; }}
     </style>
-    <div class="ec-context">{html.escape(context_text)} Change rows only; lag pairs match the same signal and resulting value within {EC_MAX_LAG_SECONDS:g} seconds.</div>
     <div class="ec-wrap">
       <table class="ec-table">
-        <thead><tr><th>Time</th><th>{html.escape(engines[0])}</th><th>{html.escape(engines[1])}</th><th>Lag</th></tr></thead>
+        <thead><tr><th>Time</th><th>{html.escape(engines[0])}</th><th>{html.escape(engines[1])}</th></tr></thead>
         <tbody>{''.join(body)}</tbody>
       </table>
     </div>
@@ -758,18 +740,9 @@ def _ec_load_comparison(_):
             raise ValueError("No populated signal states were found for the selected flight and engines.")
         ec_progress_widget.value = "<b>Rendering the transition table…</b>"
         events_by_engine = _ec_events_from_spark_frame(event_frame, engines)
-        context = (
-            f"Aircraft {aircraft} | Flight {flight_date} "
-            f"{_ec_timestamp_text(start_time)}–{_ec_timestamp_text(end_time)} | "
-            f"{len(event_frame):,} qualifying engine events | "
-            "recognized state transitions only | "
-            f"AC primary, BC fallback | AC/BC divergence threshold {EC_DIVERGENCE_THRESHOLD:.0%}."
-        )
         with ec_table_output:
-            ipy_display(HTML(_ec_render_table(events_by_engine, engines, parameters, context)))
-        ec_progress_widget.value = (
-            f"<span style='color:#137333'><b>Loaded {len(event_frame):,} qualifying events.</b></span>"
-        )
+            ipy_display(HTML(_ec_render_table(events_by_engine, engines, parameters)))
+        ec_progress_widget.value = ""
     except Exception as exc:
         ec_progress_widget.value = (
             "<span style='color:#b3261e'><b>Comparison failed.</b></span>"
@@ -801,3 +774,4 @@ ec_controls = widgets.VBox(
 ipy_display(ec_controls)
 _ec_refresh_parameter_search()
 _ec_refresh_flights(raise_errors=True)
+
