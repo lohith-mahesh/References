@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 from IPython.display import HTML, clear_output, display as ipy_display
 from pyspark.sql import functions as F
+from pyspark.sql import Window
+from pyspark.sql.types import BooleanType, NumericType
 
 EC_ASSET_TABLE = "ehm_fleetstore_prd1eun82719_internal.assetmanagement.aircraftengine"
 EC_MASTER_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousmaster-aircraftengine-cda`"
@@ -15,7 +17,6 @@ EC_PARAMETER_PREFIX = "Parameter:EVHMU_EEC_"
 EC_CHANNELS = ("AC", "BC")
 EC_DIVERGENCE_THRESHOLD = 0.25
 EC_MAX_LAG_SECONDS = 5.0
-EC_MAX_PANDAS_ROWS = 1_000_000
 EC_MAX_EVENT_ROWS = 5_000
 
 EC_DEFAULT_PARAMETERS = [
@@ -92,15 +93,6 @@ def _ec_full_column(channel, base):
     return f"{EC_PARAMETER_PREFIX}{channel}_{base}"
 
 
-def _ec_is_missing(value):
-    if value is None:
-        return True
-    try:
-        return bool(pd.isna(value))
-    except Exception:
-        return False
-
-
 def _ec_scalar(value):
     return value.item() if isinstance(value, np.generic) else value
 
@@ -117,14 +109,6 @@ def _ec_number(value):
         return numeric if np.isfinite(numeric) else None
     except Exception:
         return None
-
-
-def _ec_values_equal(left, right):
-    left_number = _ec_number(left)
-    right_number = _ec_number(right)
-    if left_number is not None and right_number is not None:
-        return bool(np.isclose(left_number, right_number, rtol=0.0, atol=1e-12))
-    return _ec_scalar(left) == _ec_scalar(right)
 
 
 def _ec_value_key(value):
@@ -145,56 +129,6 @@ def _ec_format_value(value):
             return str(int(round(number)))
         return f"{number:.9g}"
     return str(value)
-
-
-def _ec_parameter_is_discrete(frame, base, available_columns):
-    observed = []
-    for channel in EC_CHANNELS:
-        column = _ec_full_column(channel, base)
-        if column in available_columns:
-            observed.extend(frame[column].dropna().tolist())
-    if not observed:
-        return False
-    if all(isinstance(_ec_scalar(value), (bool, np.bool_)) for value in observed):
-        return True
-    numeric = [_ec_number(value) for value in observed]
-    if any(value is None for value in numeric):
-        return len({str(_ec_scalar(value)) for value in observed}) <= 16
-    values = np.asarray(numeric, dtype=float)
-    return len(np.unique(values)) <= 16 and np.allclose(values, np.round(values))
-
-
-def _ec_resolve_channels(ac_value, bc_value, is_discrete):
-    ac_missing = _ec_is_missing(ac_value)
-    bc_missing = _ec_is_missing(bc_value)
-    if ac_missing and bc_missing:
-        return None
-    if ac_missing:
-        value = _ec_scalar(bc_value)
-        return {"value": value, "key": _ec_value_key(value), "disagreement": False}
-    if bc_missing:
-        value = _ec_scalar(ac_value)
-        return {"value": value, "key": _ec_value_key(value), "disagreement": False}
-    ac_value = _ec_scalar(ac_value)
-    bc_value = _ec_scalar(bc_value)
-    if _ec_values_equal(ac_value, bc_value):
-        return {"value": ac_value, "key": _ec_value_key(ac_value), "disagreement": False}
-    ac_number = _ec_number(ac_value)
-    bc_number = _ec_number(bc_value)
-    if is_discrete or ac_number is None or bc_number is None:
-        disagreement = True
-    else:
-        scale = max(abs(ac_number), abs(bc_number), 1e-12)
-        disagreement = abs(ac_number - bc_number) / scale >= EC_DIVERGENCE_THRESHOLD
-    if disagreement:
-        return {
-            "value": ac_value,
-            "ac": ac_value,
-            "bc": bc_value,
-            "key": ("ACBC", _ec_value_key(ac_value), _ec_value_key(bc_value)),
-            "disagreement": True,
-        }
-    return {"value": ac_value, "key": _ec_value_key(ac_value), "disagreement": False}
 
 
 def _ec_truthy(value):
@@ -218,50 +152,206 @@ def _ec_event_text(base, resolved):
     return f"{label}={_ec_format_value(value)}"
 
 
-def _ec_extract_events(frame, engine, parameters, available_columns, discrete_by_parameter):
-    engine_frame = frame.loc[
-        frame["AssetIdentifier"].astype("string") == str(engine)
-    ].copy()
-    engine_frame = engine_frame.dropna(subset=["Timestamp"]).sort_values("Timestamp", kind="stable")
-    channel_state = {}
-    resolved_state = {}
-    events = []
-    parameter_order = {base: index for index, base in enumerate(parameters)}
-    for timestamp, timestamp_frame in engine_frame.groupby("Timestamp", sort=True):
-        touched = set()
-        for base in parameters:
-            for channel in EC_CHANNELS:
-                column = _ec_full_column(channel, base)
-                if column not in available_columns:
-                    continue
-                populated = timestamp_frame[column].dropna()
-                if not populated.empty:
-                    channel_state[(base, channel)] = populated.iloc[-1]
-                    touched.add(base)
-        for base in parameters:
-            if base not in touched:
-                continue
-            resolved = _ec_resolve_channels(
-                channel_state.get((base, "AC")),
-                channel_state.get((base, "BC")),
-                discrete_by_parameter[base],
+def _ec_spark_large_change(current, previous, absolute_threshold, relative_threshold):
+    current_number = current.cast("double")
+    previous_number = previous.cast("double")
+    difference = F.abs(current_number - previous_number)
+    scale = F.greatest(F.abs(current_number), F.abs(previous_number), F.lit(1e-12))
+    return (
+        current_number.isNotNull()
+        & previous_number.isNotNull()
+        & (difference >= F.lit(float(absolute_threshold)))
+        & ((difference / scale) >= F.lit(float(relative_threshold)))
+    )
+
+
+def _ec_build_event_df(source, parameters, absolute_threshold, relative_threshold):
+    order_window = Window.partitionBy("AssetIdentifier").orderBy("Timestamp")
+    state_window = order_window.rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    state_expressions = []
+    parameter_metadata = []
+    for index, base in enumerate(parameters):
+        ac_column = _ec_full_column("AC", base)
+        bc_column = _ec_full_column("BC", base)
+        available = [
+            column for column in (ac_column, bc_column) if column in _ec_scan_schema_set
+        ]
+        if not available:
+            continue
+        data_type = _ec_scan_type_by_name[available[0]]
+        is_numeric = isinstance(data_type, (NumericType, BooleanType))
+        ac_raw = (
+            _ec_quote(ac_column)
+            if ac_column in _ec_scan_schema_set
+            else F.lit(None).cast(data_type)
+        )
+        bc_raw = (
+            _ec_quote(bc_column)
+            if bc_column in _ec_scan_schema_set
+            else F.lit(None).cast(data_type)
+        )
+        if is_numeric:
+            ac_raw = F.when(F.isnan(ac_raw.cast("double")), F.lit(None).cast(data_type)).otherwise(ac_raw)
+            bc_raw = F.when(F.isnan(bc_raw.cast("double")), F.lit(None).cast(data_type)).otherwise(bc_raw)
+        ac_state = f"_ec_ac_{index}"
+        bc_state = f"_ec_bc_{index}"
+        state_expressions.extend(
+            [
+                F.last(ac_raw, ignorenulls=True).over(state_window).alias(ac_state),
+                F.last(bc_raw, ignorenulls=True).over(state_window).alias(bc_state),
+            ]
+        )
+        parameter_metadata.append(
+            {
+                "index": index,
+                "base": base,
+                "ac": ac_state,
+                "bc": bc_state,
+                "value": f"_ec_value_{index}",
+                "disagreement": f"_ec_disagreement_{index}",
+                "is_numeric": is_numeric,
+            }
+        )
+    state_df = source.select("Timestamp", "AssetIdentifier", *state_expressions)
+    resolved_expressions = []
+    for metadata in parameter_metadata:
+        ac_state = F.col(metadata["ac"])
+        bc_state = F.col(metadata["bc"])
+        current = F.coalesce(ac_state, bc_state)
+        both_present = ac_state.isNotNull() & bc_state.isNotNull()
+        if metadata["is_numeric"]:
+            ac_number = ac_state.cast("double")
+            bc_number = bc_state.cast("double")
+            difference = F.abs(ac_number - bc_number)
+            scale = F.greatest(F.abs(ac_number), F.abs(bc_number), F.lit(1e-12))
+            disagreement = both_present & ((difference / scale) >= F.lit(EC_DIVERGENCE_THRESHOLD))
+        else:
+            disagreement = both_present & (ac_state != bc_state)
+        resolved_expressions.extend(
+            [
+                current.alias(metadata["value"]),
+                F.coalesce(disagreement, F.lit(False)).alias(metadata["disagreement"]),
+            ]
+        )
+    resolved_df = state_df.select("*", *resolved_expressions)
+    previous_expressions = []
+    for metadata in parameter_metadata:
+        previous_expressions.extend(
+            [
+                F.lag(metadata["value"]).over(order_window).alias(f"_ec_previous_value_{metadata['index']}"),
+                F.lag(metadata["disagreement"]).over(order_window).alias(f"_ec_previous_disagreement_{metadata['index']}"),
+                F.lag(metadata["ac"]).over(order_window).alias(f"_ec_previous_ac_{metadata['index']}"),
+                F.lag(metadata["bc"]).over(order_window).alias(f"_ec_previous_bc_{metadata['index']}"),
+            ]
+        )
+    comparison_df = resolved_df.select("*", *previous_expressions)
+    event_expressions = []
+    for metadata in parameter_metadata:
+        index = metadata["index"]
+        current = F.col(metadata["value"])
+        previous = F.col(f"_ec_previous_value_{index}")
+        disagreement = F.col(metadata["disagreement"])
+        previous_disagreement = F.coalesce(
+            F.col(f"_ec_previous_disagreement_{index}"),
+            F.lit(False),
+        )
+        if metadata["is_numeric"]:
+            primary_change = _ec_spark_large_change(
+                current,
+                previous,
+                absolute_threshold,
+                relative_threshold,
             )
-            if resolved is None:
-                continue
-            if resolved_state.get(base) == resolved["key"]:
-                continue
-            resolved_state[base] = resolved["key"]
-            events.append(
-                {
-                    "timestamp": pd.Timestamp(timestamp),
-                    "engine": str(engine),
-                    "parameter": base,
-                    "parameter_order": parameter_order[base],
-                    "value_key": resolved["key"],
-                    "text": _ec_event_text(base, resolved),
-                }
+            ac_change = _ec_spark_large_change(
+                F.col(metadata["ac"]),
+                F.col(f"_ec_previous_ac_{index}"),
+                absolute_threshold,
+                relative_threshold,
             )
-    return events
+            bc_change = _ec_spark_large_change(
+                F.col(metadata["bc"]),
+                F.col(f"_ec_previous_bc_{index}"),
+                absolute_threshold,
+                relative_threshold,
+            )
+        else:
+            primary_change = current != previous
+            ac_change = F.col(metadata["ac"]) != F.col(f"_ec_previous_ac_{index}")
+            bc_change = F.col(metadata["bc"]) != F.col(f"_ec_previous_bc_{index}")
+        event_condition = current.isNotNull() & (
+            previous.isNull()
+            | F.coalesce(primary_change, F.lit(False))
+            | (disagreement != previous_disagreement)
+            | (
+                disagreement
+                & (
+                    F.coalesce(ac_change, F.lit(False))
+                    | F.coalesce(bc_change, F.lit(False))
+                )
+            )
+        )
+        event_expressions.append(
+            F.when(
+                event_condition,
+                F.struct(
+                    F.lit(metadata["base"]).alias("parameter"),
+                    F.lit(index).alias("parameter_order"),
+                    F.col(metadata["ac"]).cast("string").alias("ac_value"),
+                    F.col(metadata["bc"]).cast("string").alias("bc_value"),
+                    current.cast("string").alias("value"),
+                    disagreement.alias("disagreement"),
+                ),
+            )
+        )
+    return (
+        comparison_df.select(
+            "Timestamp",
+            F.col("AssetIdentifier").cast("string").alias("AssetIdentifier"),
+            F.explode(F.array(*event_expressions)).alias("event"),
+        )
+        .where(F.col("event").isNotNull())
+        .select("Timestamp", "AssetIdentifier", "event.*")
+    )
+
+
+def _ec_events_from_spark_frame(frame, engines):
+    events_by_engine = {engine: [] for engine in engines}
+    if frame.empty:
+        return events_by_engine
+    frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], errors="coerce")
+    frame = frame.dropna(subset=["Timestamp"]).sort_values(
+        ["Timestamp", "parameter_order"],
+        kind="stable",
+    )
+    for row in frame.itertuples(index=False):
+        engine = str(row.AssetIdentifier)
+        if engine not in events_by_engine:
+            continue
+        if bool(row.disagreement):
+            resolved = {
+                "value": row.value,
+                "ac": row.ac_value,
+                "bc": row.bc_value,
+                "key": ("ACBC", _ec_value_key(row.ac_value), _ec_value_key(row.bc_value)),
+                "disagreement": True,
+            }
+        else:
+            resolved = {
+                "value": row.value,
+                "key": _ec_value_key(row.value),
+                "disagreement": False,
+            }
+        events_by_engine[engine].append(
+            {
+                "timestamp": pd.Timestamp(row.Timestamp),
+                "engine": engine,
+                "parameter": row.parameter,
+                "parameter_order": int(row.parameter_order),
+                "value_key": resolved["key"],
+                "text": _ec_event_text(row.parameter, resolved),
+            }
+        )
+    return events_by_engine
 
 
 def _ec_format_lag(milliseconds):
@@ -410,8 +500,10 @@ _ec_aircraft_options = [row.AircraftIdentifier for row in _ec_asset_rows]
 if not _ec_aircraft_options:
     raise RuntimeError(f"No aircraft were found for engine type {EC_ENGINE_TYPE_CODE}.")
 
-_ec_scan_schema_columns = spark.table(EC_SCAN_TABLE).columns
+_ec_scan_table = spark.table(EC_SCAN_TABLE)
+_ec_scan_schema_columns = _ec_scan_table.columns
 _ec_scan_schema_set = set(_ec_scan_schema_columns)
+_ec_scan_type_by_name = {field.name: field.dataType for field in _ec_scan_table.schema.fields}
 _ec_parameter_bases = set()
 for _ec_column in _ec_scan_schema_columns:
     for _ec_channel in EC_CHANNELS:
@@ -479,11 +571,28 @@ ec_remove_parameter_button = widgets.Button(
     button_style="danger",
     icon="trash",
 )
+ec_absolute_change_widget = widgets.BoundedFloatText(
+    value=0.5,
+    min=0.0,
+    max=1_000_000_000.0,
+    step=0.1,
+    description="Min change:",
+    layout=widgets.Layout(width="260px"),
+)
+ec_relative_change_widget = widgets.BoundedFloatText(
+    value=25.0,
+    min=0.0,
+    max=100.0,
+    step=5.0,
+    description="Min change %:",
+    layout=widgets.Layout(width="260px"),
+)
 ec_load_button = widgets.Button(
     description="Load comparison",
     button_style="success",
     layout=widgets.Layout(width="190px"),
 )
+ec_progress_widget = widgets.HTML()
 ec_status_output = widgets.Output()
 ec_table_output = widgets.Output()
 
@@ -574,114 +683,124 @@ def _ec_refresh_flights(_=None, raise_errors=False):
 
 def _ec_load_comparison(_):
     ec_load_button.disabled = True
+    ec_progress_widget.value = "<b>Preparing the selected flight…</b>"
     try:
         with ec_table_output:
             clear_output(wait=True)
-            aircraft = ec_aircraft_widget.value
-            flight_date = ec_date_widget.value
-            start_time = ec_flight_widget.value
-            parameters = _ec_selected_parameters()
-            if flight_date is None or start_time is None:
-                raise ValueError("Choose a date and flight before loading the comparison.")
-            if not parameters:
-                raise ValueError("Select at least one signal.")
-            calendar_id = int(flight_date.strftime("%Y%m%d"))
-            master_rows = (
-                spark.table(EC_MASTER_TABLE)
-                .where(
-                    (F.col("AircraftIdentifier").cast("string") == aircraft)
-                    & (F.col("CalendarId") == calendar_id)
-                    & (F.col("StartDatetime") == F.lit(start_time))
-                )
-                .select(
-                    F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
-                    "AircraftId",
-                    "EndDatetime",
-                )
-                .where(
-                    F.col("EngineSerialNumber").isNotNull()
-                    & F.col("AircraftId").isNotNull()
-                    & F.col("EndDatetime").isNotNull()
-                )
-                .collect()
+        aircraft = ec_aircraft_widget.value
+        flight_date = ec_date_widget.value
+        start_time = ec_flight_widget.value
+        parameters = _ec_selected_parameters()
+        absolute_threshold = float(ec_absolute_change_widget.value)
+        relative_threshold = float(ec_relative_change_widget.value) / 100.0
+        if flight_date is None or start_time is None:
+            raise ValueError("Choose a date and flight before loading the comparison.")
+        if not parameters:
+            raise ValueError("Select at least one signal.")
+        calendar_id = int(flight_date.strftime("%Y%m%d"))
+        master_rows = (
+            spark.table(EC_MASTER_TABLE)
+            .where(
+                (F.col("AircraftIdentifier").cast("string") == aircraft)
+                & (F.col("CalendarId") == calendar_id)
+                & (F.col("StartDatetime") == F.lit(start_time))
             )
-            engine_metadata = {}
-            for row in master_rows:
-                metadata = engine_metadata.setdefault(
-                    row.EngineSerialNumber,
-                    {"aircraft_ids": set(), "end_times": []},
-                )
-                metadata["aircraft_ids"].add(row.AircraftId)
-                metadata["end_times"].append(row.EndDatetime)
-            engines = sorted(engine_metadata)
-            if len(engines) != 2:
-                raise ValueError(
-                    f"Expected exactly two engines for this flight; found {len(engines)}: {engines}"
-                )
-            end_time = max(
-                end
+            .select(
+                F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
+                "AircraftId",
+                "EndDatetime",
+            )
+            .where(
+                F.col("EngineSerialNumber").isNotNull()
+                & F.col("AircraftId").isNotNull()
+                & F.col("EndDatetime").isNotNull()
+            )
+            .collect()
+        )
+        engine_metadata = {}
+        for row in master_rows:
+            metadata = engine_metadata.setdefault(
+                row.EngineSerialNumber,
+                {"aircraft_ids": set(), "end_times": []},
+            )
+            metadata["aircraft_ids"].add(row.AircraftId)
+            metadata["end_times"].append(row.EndDatetime)
+        engines = sorted(engine_metadata)
+        if len(engines) != 2:
+            raise ValueError(
+                f"Expected exactly two engines for this flight; found {len(engines)}: {engines}"
+            )
+        end_time = max(
+            end
+            for engine in engines
+            for end in engine_metadata[engine]["end_times"]
+        )
+        aircraft_ids = list(
+            {
+                aircraft_id
                 for engine in engines
-                for end in engine_metadata[engine]["end_times"]
-            )
-            aircraft_ids = list(
-                {
-                    aircraft_id
-                    for engine in engines
-                    for aircraft_id in engine_metadata[engine]["aircraft_ids"]
-                }
-            )
-            selected_columns = ["Timestamp", "AssetIdentifier"]
-            for base in parameters:
-                for channel in EC_CHANNELS:
-                    column = _ec_full_column(channel, base)
-                    if column in _ec_scan_schema_set:
-                        selected_columns.append(column)
-            selected_columns = list(dict.fromkeys(selected_columns))
-            source = (
-                spark.table(EC_SCAN_TABLE)
-                .where(
-                    F.col("AircraftId").isin(aircraft_ids)
-                    & F.col("AssetIdentifier").cast("string").isin(engines)
-                    & (F.col("StartDatetime") == F.lit(start_time))
-                    & F.col("Timestamp").between(F.lit(start_time), F.lit(end_time))
-                    & _ec_month_filter(start_time, end_time)
-                )
-                .select(*[_ec_quote(column).alias(column) for column in selected_columns])
-                .orderBy("Timestamp")
-            )
-            row_count = source.count()
-            if row_count == 0:
-                raise ValueError("No scan samples were found for the selected flight and engines.")
-            if row_count > EC_MAX_PANDAS_ROWS:
-                raise RuntimeError(
-                    f"The flight contains {row_count:,} samples, above the {EC_MAX_PANDAS_ROWS:,}-row safety limit."
-                )
-            frame = source.toPandas()
-            frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], errors="coerce")
-            available_columns = set(frame.columns)
-            discrete_by_parameter = {
-                base: _ec_parameter_is_discrete(frame, base, available_columns)
-                for base in parameters
+                for aircraft_id in engine_metadata[engine]["aircraft_ids"]
             }
-            events_by_engine = {
-                engine: _ec_extract_events(
-                    frame,
-                    engine,
-                    parameters,
-                    available_columns,
-                    discrete_by_parameter,
-                )
-                for engine in engines
-            }
-            context = (
-                f"Aircraft {aircraft} | Flight {flight_date} "
-                f"{_ec_timestamp_text(start_time)}–{_ec_timestamp_text(end_time)} | "
-                f"{row_count:,} samples | AC primary, BC fallback | "
-                f"AC/BC divergence threshold {EC_DIVERGENCE_THRESHOLD:.0%}."
+        )
+        selected_columns = ["Timestamp", "AssetIdentifier"]
+        for base in parameters:
+            for channel in EC_CHANNELS:
+                column = _ec_full_column(channel, base)
+                if column in _ec_scan_schema_set:
+                    selected_columns.append(column)
+        selected_columns = list(dict.fromkeys(selected_columns))
+        populated_signal = F.lit(False)
+        for column in selected_columns[2:]:
+            populated_signal = populated_signal | _ec_quote(column).isNotNull()
+        source = (
+            _ec_scan_table.where(
+                F.col("AircraftId").isin(aircraft_ids)
+                & F.col("AssetIdentifier").cast("string").isin(engines)
+                & (F.col("StartDatetime") == F.lit(start_time))
+                & F.col("Timestamp").between(F.lit(start_time), F.lit(end_time))
+                & _ec_month_filter(start_time, end_time)
+                & populated_signal
             )
-            ipy_display(HTML(_ec_render_table(events_by_engine, engines, parameters, context)))
-    except Exception as exc:
+            .select(*[_ec_quote(column).alias(column) for column in selected_columns])
+        )
+        ec_progress_widget.value = "<b>Detecting large transitions in Spark…</b>"
+        event_frame = (
+            _ec_build_event_df(
+                source,
+                parameters,
+                absolute_threshold,
+                relative_threshold,
+            )
+            .limit(EC_MAX_EVENT_ROWS + 1)
+            .toPandas()
+        )
+        if len(event_frame) > EC_MAX_EVENT_ROWS:
+            raise RuntimeError(
+                f"More than {EC_MAX_EVENT_ROWS:,} qualifying events were found. "
+                "Increase the change thresholds or select fewer signals."
+            )
+        if event_frame.empty:
+            raise ValueError("No populated signal states were found for the selected flight and engines.")
+        ec_progress_widget.value = "<b>Rendering the transition table…</b>"
+        events_by_engine = _ec_events_from_spark_frame(event_frame, engines)
+        context = (
+            f"Aircraft {aircraft} | Flight {flight_date} "
+            f"{_ec_timestamp_text(start_time)}–{_ec_timestamp_text(end_time)} | "
+            f"{len(event_frame):,} qualifying engine events | "
+            f"numeric changes ≥{absolute_threshold:g} and ≥{relative_threshold:.0%} | "
+            f"AC primary, BC fallback | AC/BC divergence threshold {EC_DIVERGENCE_THRESHOLD:.0%}."
+        )
         with ec_table_output:
+            ipy_display(HTML(_ec_render_table(events_by_engine, engines, parameters, context)))
+        ec_progress_widget.value = (
+            f"<span style='color:#137333'><b>Loaded {len(event_frame):,} qualifying events.</b></span>"
+        )
+    except Exception as exc:
+        ec_progress_widget.value = (
+            "<span style='color:#b3261e'><b>Comparison failed.</b></span>"
+        )
+        with ec_table_output:
+            clear_output(wait=True)
             print(f"Unable to load comparison: {exc}")
     finally:
         ec_load_button.disabled = False
@@ -698,7 +817,9 @@ ec_controls = widgets.VBox(
         ec_flight_widget,
         ec_parameter_search,
         ec_parameter_widget,
+        widgets.HBox([ec_absolute_change_widget, ec_relative_change_widget]),
         widgets.HBox([ec_remove_parameter_button, ec_load_button]),
+        ec_progress_widget,
         ec_status_output,
         ec_table_output,
     ]
