@@ -1,13 +1,12 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import ipywidgets as widgets
-from IPython.display import clear_output, display
+from IPython.display import clear_output, display as ipy_display
 from pyspark.sql import functions as F
 
 CDA_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousscan-cda`"
-PARAMETER_PREFIX = "Parameter:EVHMU_EEC_"
 CHANNELS = ("AC", "BC")
-
+PARAMETER_PREFIX = "Parameter:EVHMU_EEC_"
 THRUST_REVERSER_SUFFIXES = [
     "IAcThrustReverser_tcmIntlV_data",
     "IAcThrustReverser_trLeftDoorSwLocked_LOWER__data",
@@ -61,132 +60,67 @@ THRUST_REVERSER_SUFFIXES = [
     "IThrustReverser_upOwnTRLVTRngFlt_data",
 ]
 
-flight_no_widget = widgets.Text(
-    description="Flight No.:",
-    placeholder="Enter Flight No.",
-    layout=widgets.Layout(width="400px"),
-)
+THRUST_REVERSER_COLUMNS = [
+    f"{PARAMETER_PREFIX}{channel}_{suffix}"
+    for channel in CHANNELS
+    for suffix in THRUST_REVERSER_SUFFIXES
+]
+OUTPUT_IDENTIFIER_COLUMNS = ["ParentAssetIdentifier", "AssetIdentifier", "Timestamp"]
 
-start_date_widget = widgets.DatePicker(
-    description="Start Date:",
-    layout=widgets.Layout(width="300px"),
-)
+cda_catalog = spark.table(CDA_TABLE)
+cda_schema = set(cda_catalog.columns)
+missing_identifiers = [column for column in OUTPUT_IDENTIFIER_COLUMNS if column not in cda_schema]
+if missing_identifiers:
+    raise ValueError(f"The CDA table is missing required columns: {missing_identifiers}")
 
-end_date_widget = widgets.DatePicker(
-    description="End Date:",
-    layout=widgets.Layout(width="300px"),
-)
+available_thrust_reverser_columns = [column for column in THRUST_REVERSER_COLUMNS if column in cda_schema]
+missing_thrust_reverser_columns = [column for column in THRUST_REVERSER_COLUMNS if column not in cda_schema]
+if not available_thrust_reverser_columns:
+    raise ValueError("None of the requested AC/BC thrust-reverser parameters exist in the CDA table.")
 
-filter_button = widgets.Button(
-    description="Filter Data",
-    button_style="primary",
-    layout=widgets.Layout(width="150px"),
-)
+flight_no_widget = widgets.Text(description="Flight No.:", layout=widgets.Layout(width="420px"))
+start_date_widget = widgets.DatePicker(description="Start date:", layout=widgets.Layout(width="300px"))
+end_date_widget = widgets.DatePicker(description="End date:", layout=widgets.Layout(width="300px"))
+filter_button = widgets.Button(description="Filter CDA", button_style="primary", layout=widgets.Layout(width="160px"))
+filter_output = widgets.Output()
 
-output = widgets.Output()
+filtered_cda_df = None
 
-def filter_cda(_):
-    global filtered_df
-
-    with output:
+def _filter_cda(_):
+    global filtered_cda_df
+    with filter_output:
         clear_output(wait=True)
-
         flight_no = flight_no_widget.value.strip()
         start_date = start_date_widget.value
         end_date = end_date_widget.value
 
         if not flight_no:
             raise ValueError("Flight No. is required.")
-
         if start_date is None or end_date is None:
             raise ValueError("Both Start Date and End Date are required.")
-
         if start_date > end_date:
             raise ValueError("Start Date must not be later than End Date.")
 
-        start_datetime = datetime.combine(start_date, datetime.min.time())
-        end_datetime_exclusive = datetime.combine(
-            end_date + timedelta(days=1),
-            datetime.min.time(),
-        )
+        start_timestamp = datetime.combine(start_date, datetime.min.time())
+        end_timestamp_exclusive = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
 
-        cda = spark.table(CDA_TABLE)
-        cda_columns = set(cda.columns)
-
-        required_columns = [
-            "ParentAssetIdentifier",
-            "AssetIdentifier",
-            "Timestamp",
-        ]
-
-        missing_required_columns = [
-            column for column in required_columns
-            if column not in cda_columns
-        ]
-
-        if missing_required_columns:
-            raise ValueError(
-                f"CDA table is missing required columns: {missing_required_columns}"
-            )
-
-        thrust_reverser_columns = [
-            f"{PARAMETER_PREFIX}{channel}_{suffix}"
-            for channel in CHANNELS
-            for suffix in THRUST_REVERSER_SUFFIXES
-        ]
-
-        available_thrust_reverser_columns = [
-            column for column in thrust_reverser_columns
-            if column in cda_columns
-        ]
-
-        missing_thrust_reverser_columns = [
-            column for column in thrust_reverser_columns
-            if column not in cda_columns
-        ]
-
-        if not available_thrust_reverser_columns:
-            raise ValueError(
-                "None of the requested AC/BC Thrust Reverser parameters exist in the CDA table."
-            )
-
-        filtered_df = (
-            cda
+        filtered_cda_df = (
+            cda_catalog
             .where(
                 (F.col("ParentAssetIdentifier").cast("string") == flight_no)
-                & (F.col("Timestamp") >= F.lit(start_datetime))
-                & (F.col("Timestamp") < F.lit(end_datetime_exclusive))
+                & (F.col("Timestamp") >= F.lit(start_timestamp))
+                & (F.col("Timestamp") < F.lit(end_timestamp_exclusive))
             )
-            .select(
-                "ParentAssetIdentifier",
-                "AssetIdentifier",
-                "Timestamp",
-                *available_thrust_reverser_columns,
-            )
-            .orderBy(
-                F.col("Timestamp"),
-                F.col("AssetIdentifier"),
-            )
+            .select(*(OUTPUT_IDENTIFIER_COLUMNS + available_thrust_reverser_columns))
+            .orderBy(F.col("Timestamp").asc(), F.col("AssetIdentifier").cast("string").asc())
         )
 
         print(f"Flight No.: {flight_no}")
         print(f"Date range: {start_date} through {end_date}")
-        print(f"Thrust Reverser parameters selected: {len(available_thrust_reverser_columns)} / {len(thrust_reverser_columns)}")
-
+        print(f"Thrust-reverser columns returned: {len(available_thrust_reverser_columns)} / {len(THRUST_REVERSER_COLUMNS)}")
         if missing_thrust_reverser_columns:
-            print(f"Thrust Reverser parameters unavailable in schema: {len(missing_thrust_reverser_columns)}")
+            print(f"Requested thrust-reverser columns absent from the CDA schema: {len(missing_thrust_reverser_columns)}")
+        display(filtered_cda_df)
 
-        display(filtered_df)
-
-filter_button.on_click(filter_cda)
-
-display(
-    widgets.VBox(
-        [
-            flight_no_widget,
-            widgets.HBox([start_date_widget, end_date_widget]),
-            filter_button,
-            output,
-        ]
-    )
-)
+filter_button.on_click(_filter_cda)
+ipy_display(widgets.VBox([flight_no_widget, widgets.HBox([start_date_widget, end_date_widget]), filter_button, filter_output]))
