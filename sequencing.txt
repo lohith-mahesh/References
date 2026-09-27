@@ -1,12 +1,13 @@
 from datetime import date, datetime
-import html
 
 import ipywidgets as widgets
 import numpy as np
 import pandas as pd
-from IPython.display import HTML, clear_output, display as ipy_display
-from pyspark.sql import functions as F
+import plotly.graph_objects as go
+from IPython.display import clear_output, display as ipy_display
+from plotly.subplots import make_subplots
 from pyspark.sql import Window
+from pyspark.sql import functions as F
 from pyspark.sql.types import BooleanType, NumericType
 
 EC_ASSET_TABLE = "ehm_fleetstore_prd1eun82719_internal.assetmanagement.aircraftengine"
@@ -14,7 +15,7 @@ EC_MASTER_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucont
 EC_SCAN_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousscan-cda`"
 EC_ENGINE_TYPE_CODE = "Pearl 700"
 EC_PARAMETER_PREFIX = "Parameter:EVHMU_EEC_"
-EC_CHANNELS = ("AC", "BC")
+EC_CHANNEL = "AC"
 EC_MAX_EVENT_ROWS = 5_000
 EC_STATE_TOLERANCE = 1e-6
 EC_LVT_LOW_THRESHOLD = 1.0
@@ -45,14 +46,6 @@ EC_PARAMETER_STATE_VALUES = {
     "IThrustReverser_trIsDeployed_data": (0.0, 1.0),
 }
 
-EC_BINARY_PARAMETERS = {
-    "IThrustReverser_trArmed_data",
-    "IThrustReverser_trInTransit_data",
-    "IThrustReverser_trIsUnlocked_data",
-    "IThrustReverser_trDoorStowStatus_data",
-    "IThrustReverser_trIsDeployed_data",
-}
-
 EC_ANALOG_LVT_PARAMETERS = {
     "IThrustReverser_trLVTPosVCtrl_data",
     "IThrustReverser_loOwnTRLVTRaw_data",
@@ -71,35 +64,33 @@ EC_LABELS = {
     "IThrustReverser_trIsDeployed_data": "IsDeployed",
 }
 
-EC_COLORS = {
-    "IThrustReverser_trLVTPosVCtrl_data": "#f4cccc",
-    "IThrustReverser_loOwnTRLVTRaw_data": "#bf9000",
-    "IThrustReverser_upOwnTRLVTRaw_data": "#6666cc",
-    "IThrustReverser_trDoorDeplStatus_data": "#fff2cc",
-    "IThrustReverser_trArmed_data": "#00b050",
-    "IThrustReverser_trInTransit_data": "#74dfe5",
-    "IThrustReverser_trIsUnlocked_data": "#d9d9d9",
-    "IThrustReverser_trDoorStowStatus_data": "#f4a300",
-    "IThrustReverser_trIsDeployed_data": "#319c95",
+EC_PARAMETER_COLORS = {
+    "IThrustReverser_trLVTPosVCtrl_data": "#c85f70",
+    "IThrustReverser_loOwnTRLVTRaw_data": "#a77700",
+    "IThrustReverser_upOwnTRLVTRaw_data": "#5555c9",
+    "IThrustReverser_trDoorDeplStatus_data": "#b89b2e",
+    "IThrustReverser_trArmed_data": "#00a33c",
+    "IThrustReverser_trInTransit_data": "#27aeb7",
+    "IThrustReverser_trIsUnlocked_data": "#767676",
+    "IThrustReverser_trDoorStowStatus_data": "#d48600",
+    "IThrustReverser_trIsDeployed_data": "#168b83",
 }
 
-EC_EXTRA_COLORS = [
-    "#cfe2f3",
-    "#d9ead3",
-    "#ead1dc",
-    "#fce5cd",
-    "#d0e0e3",
-    "#fff2cc",
-    "#c9daf8",
-    "#d9d2e9",
-    "#b6d7a8",
-    "#f9cb9c",
+EC_ENGINE_STYLES = [
+    {"color": "#1565c0", "dash": "solid", "symbol": "circle"},
+    {"color": "#d84315", "dash": "dash", "symbol": "diamond"},
 ]
 
-EC_ON_OFF_PARAMETERS = {
-    "IThrustReverser_trArmed_data",
-    "IThrustReverser_trInTransit_data",
-    "IThrustReverser_trIsUnlocked_data",
+EC_Y_AXIS_STATES = {
+    "IThrustReverser_trLVTPosVCtrl_data": ([0.0, 100.0], ["0", "100"]),
+    "IThrustReverser_loOwnTRLVTRaw_data": ([0.0, 100.0], ["0", "100"]),
+    "IThrustReverser_upOwnTRLVTRaw_data": ([0.0, 100.0], ["0", "100"]),
+    "IThrustReverser_trDoorDeplStatus_data": ([0.0, 1.0, 2.0, 3.0], ["0", "1", "2", "3"]),
+    "IThrustReverser_trArmed_data": ([0.0, 1.0], ["OFF", "ARMED"]),
+    "IThrustReverser_trInTransit_data": ([0.0, 1.0], ["OFF", "ON"]),
+    "IThrustReverser_trIsUnlocked_data": ([0.0, 1.0], ["LOCKED", "UNLOCKED"]),
+    "IThrustReverser_trDoorStowStatus_data": ([0.0, 1.0], ["OPEN", "CLOSE"]),
+    "IThrustReverser_trIsDeployed_data": ([0.0, 1.0], ["0", "1"]),
 }
 
 
@@ -117,21 +108,15 @@ def _ec_parameter_label(base):
     return label
 
 
-def _ec_full_column(channel, base):
-    return f"{EC_PARAMETER_PREFIX}{channel}_{base}"
-
-
-def _ec_scalar(value):
-    return value.item() if isinstance(value, np.generic) else value
+def _ec_full_column(base):
+    return f"{EC_PARAMETER_PREFIX}{EC_CHANNEL}_{base}"
 
 
 def _ec_number(value):
-    value = _ec_scalar(value)
+    if isinstance(value, np.generic):
+        value = value.item()
     if isinstance(value, (bool, np.bool_)):
         return float(bool(value))
-    if isinstance(value, (int, float, np.integer, np.floating)):
-        numeric = float(value)
-        return numeric if np.isfinite(numeric) else None
     try:
         numeric = float(value)
         return numeric if np.isfinite(numeric) else None
@@ -139,47 +124,13 @@ def _ec_number(value):
         return None
 
 
-def _ec_value_key(value):
-    value = _ec_scalar(value)
-    number = _ec_number(value)
-    if number is not None:
-        return ("number", round(number, 9))
-    return ("text", str(value))
-
-
 def _ec_format_value(value):
-    value = _ec_scalar(value)
-    if isinstance(value, (bool, np.bool_)):
-        return "1" if bool(value) else "0"
-    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
-        return "1" if value.strip().lower() == "true" else "0"
     number = _ec_number(value)
-    if number is not None:
-        if np.isclose(number, round(number), rtol=0.0, atol=1e-12):
-            return str(int(round(number)))
-        return f"{number:.9g}"
-    return str(value)
-
-
-def _ec_truthy(value):
-    number = _ec_number(value)
-    if number is not None:
-        return not np.isclose(number, 0.0, rtol=0.0, atol=1e-12)
-    return str(value).strip().lower() in {"true", "on", "yes", "open", "1"}
-
-
-def _ec_event_text(base, resolved):
-    label = _ec_parameter_label(base)
-    if resolved["disagreement"]:
-        return f"{label} AC={_ec_format_value(resolved['ac'])} | BC={_ec_format_value(resolved['bc'])}"
-    value = resolved["value"]
-    if base in EC_ON_OFF_PARAMETERS:
-        return f"{label} {'ON' if _ec_truthy(value) else 'OFF'}"
-    if base == "IThrustReverser_trDoorStowStatus_data":
-        return f"{label} {'Close' if _ec_truthy(value) else 'Open'}"
-    if isinstance(_ec_scalar(value), (bool, np.bool_)):
-        return f"{label} {'ON' if bool(value) else 'OFF'}"
-    return f"{label}={_ec_format_value(value)}"
+    if number is None:
+        return str(value)
+    if np.isclose(number, round(number), rtol=0.0, atol=1e-12):
+        return str(int(round(number)))
+    return f"{number:.9g}"
 
 
 def _ec_recognized_state(value, base):
@@ -199,79 +150,35 @@ def _ec_recognized_state(value, base):
     return recognized
 
 
-def _ec_extreme_channel_conflict(ac_value, bc_value, base, is_boolean):
-    if base == "IThrustReverser_trDoorDeplStatus_data":
-        return F.lit(False)
-    ac_number = ac_value.cast("double")
-    bc_number = bc_value.cast("double")
-    both_present = ac_number.isNotNull() & bc_number.isNotNull()
-
-    def near(value, target):
-        return F.abs(value - F.lit(float(target))) <= F.lit(EC_STATE_TOLERANCE)
-
-    if base in EC_BINARY_PARAMETERS or is_boolean:
-        opposite_endpoints = (
-            (near(ac_number, 0.0) & near(bc_number, 1.0))
-            | (near(ac_number, 1.0) & near(bc_number, 0.0))
-        )
-    else:
-        opposite_endpoints = (
-            (near(ac_number, 0.0) & near(bc_number, 100.0))
-            | (near(ac_number, 100.0) & near(bc_number, 0.0))
-        )
-    return both_present & opposite_endpoints
-
-
 def _ec_build_event_df(source, parameters):
     order_window = Window.partitionBy("AssetIdentifier").orderBy("Timestamp")
     state_window = order_window.rowsBetween(Window.unboundedPreceding, Window.currentRow)
     state_expressions = []
     parameter_metadata = []
     for index, base in enumerate(parameters):
-        ac_column = _ec_full_column("AC", base)
-        bc_column = _ec_full_column("BC", base)
-        available = [
-            column for column in (ac_column, bc_column) if column in _ec_scan_schema_set
-        ]
-        if not available:
+        column = _ec_full_column(base)
+        if column not in _ec_scan_schema_set:
             continue
-        data_type = _ec_scan_type_by_name[available[0]]
+        data_type = _ec_scan_type_by_name[column]
         is_boolean = isinstance(data_type, BooleanType)
         is_numeric = isinstance(data_type, (NumericType, BooleanType))
-        ac_raw = (
-            _ec_quote(ac_column)
-            if ac_column in _ec_scan_schema_set
-            else F.lit(None).cast(data_type)
-        )
-        bc_raw = (
-            _ec_quote(bc_column)
-            if bc_column in _ec_scan_schema_set
-            else F.lit(None).cast(data_type)
-        )
+        raw_value = _ec_quote(column)
         if is_numeric:
-            ac_raw = F.when(F.isnan(ac_raw.cast("double")), F.lit(None).cast(data_type)).otherwise(ac_raw)
-            bc_raw = F.when(F.isnan(bc_raw.cast("double")), F.lit(None).cast(data_type)).otherwise(bc_raw)
-        ac_state = f"_ec_ac_{index}"
-        bc_state = f"_ec_bc_{index}"
-        state_expressions.extend(
-            [
-                F.last(ac_raw, ignorenulls=True).over(state_window).alias(ac_state),
-                F.last(bc_raw, ignorenulls=True).over(state_window).alias(bc_state),
-            ]
+            raw_value = F.when(
+                F.isnan(raw_value.cast("double")),
+                F.lit(None).cast(data_type),
+            ).otherwise(raw_value)
+        state_name = f"_ec_state_{index}"
+        state_expressions.append(
+            F.last(raw_value, ignorenulls=True).over(state_window).alias(state_name)
         )
         parameter_metadata.append(
             {
                 "index": index,
                 "base": base,
-                "ac": ac_state,
-                "bc": bc_state,
-                "disagreement": f"_ec_disagreement_{index}",
-                "ac_recognized": f"_ec_ac_recognized_{index}",
-                "bc_recognized": f"_ec_bc_recognized_{index}",
-                "ac_tracked": f"_ec_ac_tracked_{index}",
-                "bc_tracked": f"_ec_bc_tracked_{index}",
-                "candidate": f"_ec_candidate_{index}",
-                "candidate_tracked": f"_ec_candidate_tracked_{index}",
+                "state": state_name,
+                "recognized": f"_ec_recognized_{index}",
+                "tracked": f"_ec_tracked_{index}",
                 "is_boolean": is_boolean,
                 "is_numeric": is_numeric,
             }
@@ -279,109 +186,49 @@ def _ec_build_event_df(source, parameters):
     state_df = source.select("Timestamp", "AssetIdentifier", *state_expressions)
     recognized_expressions = []
     for metadata in parameter_metadata:
-        ac_state = F.col(metadata["ac"])
-        bc_state = F.col(metadata["bc"])
-        if metadata["is_numeric"]:
-            disagreement = _ec_extreme_channel_conflict(
-                ac_state,
-                bc_state,
-                metadata["base"],
-                metadata["is_boolean"],
+        state = F.col(metadata["state"])
+        if metadata["is_boolean"]:
+            recognized = (
+                F.when(state == F.lit(True), F.lit(1.0))
+                .when(state == F.lit(False), F.lit(0.0))
+                .otherwise(F.lit(None).cast("double"))
             )
-            ac_recognized = _ec_recognized_state(ac_state, metadata["base"])
-            bc_recognized = _ec_recognized_state(bc_state, metadata["base"])
+        elif metadata["is_numeric"]:
+            recognized = _ec_recognized_state(state, metadata["base"])
         else:
-            disagreement = F.lit(False)
-            ac_recognized = ac_state
-            bc_recognized = bc_state
-        recognized_expressions.extend(
-            [
-                F.coalesce(disagreement, F.lit(False)).alias(metadata["disagreement"]),
-                ac_recognized.alias(metadata["ac_recognized"]),
-                bc_recognized.alias(metadata["bc_recognized"]),
-            ]
-        )
+            recognized = state
+        recognized_expressions.append(recognized.alias(metadata["recognized"]))
     recognized_df = state_df.select("*", *recognized_expressions)
-    tracked_expressions = [
-        expression
-        for metadata in parameter_metadata
-        for expression in (
-            F.last(F.col(metadata["ac_recognized"]), ignorenulls=True)
+    tracked_df = recognized_df.select(
+        "*",
+        *[
+            F.last(F.col(metadata["recognized"]), ignorenulls=True)
             .over(state_window)
-            .alias(metadata["ac_tracked"]),
-            F.last(F.col(metadata["bc_recognized"]), ignorenulls=True)
-            .over(state_window)
-            .alias(metadata["bc_tracked"]),
-        )
-    ]
-    tracked_df = recognized_df.select("*", *tracked_expressions)
-    previous_expressions = []
-    for metadata in parameter_metadata:
-        previous_expressions.extend(
-            [
-                F.lag(metadata["ac_tracked"])
-                .over(order_window)
-                .alias(f"_ec_previous_ac_tracked_{metadata['index']}"),
-                F.lag(metadata["bc_tracked"])
-                .over(order_window)
-                .alias(f"_ec_previous_bc_tracked_{metadata['index']}"),
-            ]
-        )
-    channel_comparison_df = tracked_df.select("*", *previous_expressions)
-    candidate_expressions = []
-    for metadata in parameter_metadata:
-        index = metadata["index"]
-        ac_recognized = F.col(metadata["ac_recognized"])
-        bc_recognized = F.col(metadata["bc_recognized"])
-        ac_tracked = F.col(metadata["ac_tracked"])
-        bc_tracked = F.col(metadata["bc_tracked"])
-        previous_ac = F.col(f"_ec_previous_ac_tracked_{index}")
-        previous_bc = F.col(f"_ec_previous_bc_tracked_{index}")
-        ac_transition = ac_recognized.isNotNull() & (
-            previous_ac.isNull() | (ac_tracked != previous_ac)
-        )
-        bc_transition = bc_recognized.isNotNull() & (
-            previous_bc.isNull() | (bc_tracked != previous_bc)
-        )
-        candidate_expressions.append(
-            F.when(ac_transition, ac_tracked)
-            .when(bc_transition, bc_tracked)
-            .alias(metadata["candidate"])
-        )
-    candidate_df = channel_comparison_df.select("*", *candidate_expressions)
-    candidate_tracked_expressions = [
-        F.last(F.col(metadata["candidate"]), ignorenulls=True)
-        .over(state_window)
-        .alias(metadata["candidate_tracked"])
-        for metadata in parameter_metadata
-    ]
-    candidate_tracked_df = candidate_df.select("*", *candidate_tracked_expressions)
-    previous_candidate_expressions = [
-        F.lag(metadata["candidate_tracked"])
-        .over(order_window)
-        .alias(f"_ec_previous_candidate_{metadata['index']}")
-        for metadata in parameter_metadata
-    ]
-    comparison_df = candidate_tracked_df.select("*", *previous_candidate_expressions)
+            .alias(metadata["tracked"])
+            for metadata in parameter_metadata
+        ],
+    )
+    comparison_df = tracked_df.select(
+        "*",
+        *[
+            F.lag(metadata["tracked"])
+            .over(order_window)
+            .alias(f"_ec_previous_{metadata['index']}")
+            for metadata in parameter_metadata
+        ],
+    )
     event_expressions = []
     for metadata in parameter_metadata:
-        index = metadata["index"]
-        candidate = F.col(metadata["candidate"])
-        candidate_tracked = F.col(metadata["candidate_tracked"])
-        previous_candidate = F.col(f"_ec_previous_candidate_{index}")
-        event_condition = candidate.isNotNull() & (
-            previous_candidate.isNull() | (candidate_tracked != previous_candidate)
-        )
+        tracked = F.col(metadata["tracked"])
+        previous = F.col(f"_ec_previous_{metadata['index']}")
+        changed = tracked.isNotNull() & (previous.isNull() | (tracked != previous))
         event_expressions.append(
             F.when(
-                event_condition,
+                changed,
                 F.struct(
                     F.lit(metadata["base"]).alias("parameter"),
-                    F.lit(index).alias("parameter_order"),
-                    F.col(metadata["ac"]).cast("string").alias("ac_value"),
-                    F.col(metadata["bc"]).cast("string").alias("bc_value"),
-                    candidate_tracked.cast("string").alias("value"),
-                    F.col(metadata["disagreement"]).alias("disagreement"),
+                    F.lit(metadata["index"]).alias("parameter_order"),
+                    tracked.cast("string").alias("value"),
                 ),
             )
         )
@@ -396,116 +243,191 @@ def _ec_build_event_df(source, parameters):
     )
 
 
-def _ec_events_from_spark_frame(frame, engines):
-    events_by_engine = {engine: [] for engine in engines}
-    if frame.empty:
-        return events_by_engine
+def _ec_timestamp_text(value):
+    return pd.Timestamp(value).strftime("%H:%M:%S.%f")[:-3]
+
+
+def _ec_axis_definition(base, frame):
+    if base in EC_Y_AXIS_STATES:
+        values, labels = EC_Y_AXIS_STATES[base]
+        numeric = pd.to_numeric(frame["value"], errors="coerce")
+        span = max(values) - min(values)
+        padding = max(span * 0.08, 0.15)
+        return numeric.astype(float), values, labels, [min(values) - padding, max(values) + padding]
+    numeric = pd.to_numeric(frame["value"], errors="coerce")
+    if numeric.notna().all():
+        values = sorted(numeric.astype(float).unique().tolist())
+        if len(values) == 1:
+            padding = max(abs(values[0]) * 0.08, 1.0)
+        else:
+            padding = max((max(values) - min(values)) * 0.08, 0.1)
+        labels = [_ec_format_value(value) for value in values]
+        return numeric.astype(float), values, labels, [min(values) - padding, max(values) + padding]
+    categories = list(dict.fromkeys(frame["value"].astype(str).tolist()))
+    mapping = {value: index for index, value in enumerate(categories)}
+    plotted = frame["value"].astype(str).map(mapping).astype(float)
+    values = list(range(len(categories)))
+    upper = max(values) if values else 0
+    return plotted, values, categories, [-0.4, upper + 0.4]
+
+
+def _ec_build_timeline(event_frame, engines, parameters, start_time, engine_end_times, aircraft):
+    frame = event_frame.copy()
     frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], errors="coerce")
     frame = frame.dropna(subset=["Timestamp"]).sort_values(
-        ["Timestamp", "parameter_order"],
+        ["Timestamp", "parameter_order", "AssetIdentifier"],
         kind="stable",
     )
-    for row in frame.itertuples(index=False):
-        engine = str(row.AssetIdentifier)
-        if engine not in events_by_engine:
-            continue
-        if bool(row.disagreement):
-            resolved = {
-                "value": row.value,
-                "ac": row.ac_value,
-                "bc": row.bc_value,
-                "key": ("ACBC", _ec_value_key(row.ac_value), _ec_value_key(row.bc_value)),
-                "disagreement": True,
-            }
-        else:
-            resolved = {
-                "value": row.value,
-                "key": _ec_value_key(row.value),
-                "disagreement": False,
-            }
-        events_by_engine[engine].append(
-            {
-                "timestamp": pd.Timestamp(row.Timestamp),
-                "engine": engine,
-                "parameter": row.parameter,
-                "parameter_order": int(row.parameter_order),
-                "value_key": resolved["key"],
-                "text": _ec_event_text(row.parameter, resolved),
-            }
-        )
-    return events_by_engine
-
-
-def _ec_timestamp_text(timestamp):
-    return pd.Timestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
-
-
-def _ec_render_table(events_by_engine, engines, parameters):
-    rows = {}
-    for engine in engines:
-        for event in events_by_engine[engine]:
-            key = (event["timestamp"], event["parameter"])
-            row = rows.setdefault(
-                key,
-                {
-                    "timestamp": event["timestamp"],
-                    "parameter": event["parameter"],
-                    "parameter_order": event["parameter_order"],
-                    "values": {},
-                },
-            )
-            row["values"][engine] = event["text"]
-    ordered_rows = sorted(
-        rows.values(),
-        key=lambda row: (row["timestamp"], row["parameter_order"]),
+    active_parameters = [
+        base for base in parameters if bool((frame["parameter"] == base).any())
+    ]
+    if not active_parameters:
+        raise ValueError("No AC endpoint or status transitions were found for the selected flight.")
+    row_count = len(active_parameters)
+    figure = make_subplots(
+        rows=row_count,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=min(0.025, 0.16 / max(row_count, 1)),
+        subplot_titles=[_ec_parameter_label(base) for base in active_parameters],
     )
-    if len(ordered_rows) > EC_MAX_EVENT_ROWS:
-        raise RuntimeError(
-            f"The selected parameters generated {len(ordered_rows):,} change rows. "
-            f"Reduce the parameter selection below {EC_MAX_EVENT_ROWS:,} rows."
-        )
-    color_map = dict(EC_COLORS)
-    extra_index = 0
-    for base in parameters:
-        if base not in color_map:
-            color_map[base] = EC_EXTRA_COLORS[extra_index % len(EC_EXTRA_COLORS)]
-            extra_index += 1
-    body = []
-    for row in ordered_rows:
-        base = row["parameter"]
-        color = color_map[base]
-        value_cells = []
-        for engine in engines:
-            value = row["values"].get(engine, "")
-            style = f"background:{color};" if value else ""
-            value_cells.append(
-                f'<td class="ec-value" style="{style}">{html.escape(value)}</td>'
+    for row_index, base in enumerate(active_parameters, start=1):
+        parameter_frame = frame.loc[frame["parameter"] == base].copy()
+        plotted, tick_values, tick_labels, y_range = _ec_axis_definition(base, parameter_frame)
+        parameter_frame["_plot_value"] = plotted.to_numpy()
+        for engine_index, engine in enumerate(engines):
+            engine_frame = parameter_frame.loc[
+                parameter_frame["AssetIdentifier"].astype(str) == str(engine)
+            ].sort_values("Timestamp", kind="stable")
+            if engine_frame.empty:
+                continue
+            style = EC_ENGINE_STYLES[engine_index]
+            event_times = engine_frame["Timestamp"].tolist()
+            event_values = engine_frame["_plot_value"].astype(float).tolist()
+            line_times = list(event_times)
+            line_values = list(event_values)
+            engine_end = pd.Timestamp(engine_end_times[engine])
+            if line_times[-1] < engine_end:
+                line_times.append(engine_end)
+                line_values.append(line_values[-1])
+            figure.add_trace(
+                go.Scatter(
+                    x=line_times,
+                    y=line_values,
+                    mode="lines",
+                    name=str(engine),
+                    legendgroup=str(engine),
+                    showlegend=row_index == 1,
+                    hoverinfo="skip",
+                    line={"color": style["color"], "width": 2.2, "dash": style["dash"], "shape": "hv"},
+                ),
+                row=row_index,
+                col=1,
             )
-        body.append(
-            "<tr>"
-            f'<td class="ec-time">{_ec_timestamp_text(row["timestamp"])}</td>'
-            + "".join(value_cells)
-            + "</tr>"
+            custom_data = np.array(
+                [
+                    [str(engine), _ec_parameter_label(base), _ec_format_value(value)]
+                    for value in engine_frame["value"].tolist()
+                ],
+                dtype=object,
+            )
+            figure.add_trace(
+                go.Scatter(
+                    x=event_times,
+                    y=event_values,
+                    mode="markers",
+                    name=str(engine),
+                    legendgroup=str(engine),
+                    showlegend=False,
+                    customdata=custom_data,
+                    marker={
+                        "color": style["color"],
+                        "size": 8,
+                        "symbol": style["symbol"],
+                        "line": {"color": "#ffffff", "width": 1},
+                    },
+                    hovertemplate=(
+                        "<b>Engine %{customdata[0]}</b><br>"
+                        "%{customdata[1]}: %{customdata[2]}<br>"
+                        "%{x|%H:%M:%S.%L}<extra></extra>"
+                    ),
+                ),
+                row=row_index,
+                col=1,
+            )
+        figure.update_yaxes(
+            tickmode="array",
+            tickvals=tick_values,
+            ticktext=tick_labels,
+            range=y_range,
+            fixedrange=False,
+            showgrid=True,
+            gridcolor="rgba(100,100,100,0.16)",
+            zeroline=False,
+            row=row_index,
+            col=1,
         )
-    if not body:
-        body.append('<tr><td colspan="3" class="ec-empty">No value changes were found.</td></tr>')
-    return f"""
-    <style>
-      .ec-wrap {{ width:100%; max-height:760px; overflow:auto; border:1px solid #555; background:#fff; }}
-      .ec-table {{ width:100%; min-width:720px; border-collapse:collapse; table-layout:fixed; font-size:13px; color:#111; }}
-      .ec-table th {{ position:sticky; top:0; z-index:3; background:#efefef; border:1px solid #333; padding:7px 8px; text-align:center; font-weight:700; }}
-      .ec-table td {{ border:1px solid #333; padding:5px 7px; vertical-align:middle; }}
-      .ec-time {{ width:150px; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
-      .ec-value {{ width:calc((100% - 150px) / 2); overflow-wrap:anywhere; }}
-      .ec-empty {{ text-align:center; color:#666; font-style:italic; padding:18px !important; }}
-    </style>
-    <div class="ec-wrap">
-      <table class="ec-table">
-        <thead><tr><th>Time</th><th>{html.escape(engines[0])}</th><th>{html.escape(engines[1])}</th></tr></thead>
-        <tbody>{''.join(body)}</tbody>
-      </table>
-    </div>
-    """
+    end_time = max(pd.Timestamp(value) for value in engine_end_times.values())
+    tick_stops = [
+        {"dtickrange": [None, 1_000], "value": "%H:%M:%S.%L"},
+        {"dtickrange": [1_000, 60_000], "value": "%H:%M:%S.%L"},
+        {"dtickrange": [60_000, 3_600_000], "value": "%H:%M:%S"},
+        {"dtickrange": [3_600_000, None], "value": "%H:%M"},
+    ]
+    figure.update_xaxes(
+        type="date",
+        range=[pd.Timestamp(start_time), end_time],
+        tickformatstops=tick_stops,
+        hoverformat="%H:%M:%S.%L",
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikethickness=1,
+        spikedash="dot",
+        spikecolor="#555555",
+        showgrid=True,
+        gridcolor="rgba(100,100,100,0.12)",
+    )
+    figure.update_xaxes(
+        title_text="Flight timeline — drag to zoom; millisecond ticks appear automatically",
+        rangeslider={"visible": True, "thickness": 0.06},
+        row=row_count,
+        col=1,
+    )
+    figure.update_layout(
+        title={
+            "text": (
+                f"{aircraft} · AC thrust-reverser transitions · "
+                f"{_ec_timestamp_text(start_time)}–{_ec_timestamp_text(end_time)}"
+            ),
+            "x": 0.01,
+            "xanchor": "left",
+        },
+        template="plotly_white",
+        height=max(720, 155 * row_count),
+        margin={"l": 92, "r": 35, "t": 105, "b": 95},
+        hovermode="closest",
+        hoverdistance=40,
+        spikedistance=-1,
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.025,
+            "xanchor": "right",
+            "x": 1.0,
+            "groupclick": "togglegroup",
+            "title": {"text": "Engines"},
+        },
+        dragmode="zoom",
+        uirevision=f"{aircraft}-{pd.Timestamp(start_time).isoformat()}",
+    )
+    for annotation, base in zip(figure.layout.annotations, active_parameters):
+        annotation.update(
+            x=0.0,
+            xanchor="left",
+            font={"color": EC_PARAMETER_COLORS.get(base, "#333333"), "size": 13},
+        )
+    return figure
 
 
 def _ec_month_filter(start_time, end_time):
@@ -513,8 +435,14 @@ def _ec_month_filter(start_time, end_time):
     final = date(end_time.year, end_time.month, 1)
     expression = F.lit(False)
     while current <= final:
-        expression = expression | ((F.col("year") == current.year) & (F.col("Month") == current.month))
-        current = date(current.year + (current.month == 12), 1 if current.month == 12 else current.month + 1, 1)
+        expression = expression | (
+            (F.col("year") == current.year) & (F.col("Month") == current.month)
+        )
+        current = date(
+            current.year + (current.month == 12),
+            1 if current.month == 12 else current.month + 1,
+            1,
+        )
     return expression
 
 
@@ -535,13 +463,15 @@ _ec_scan_table = spark.table(EC_SCAN_TABLE)
 _ec_scan_schema_columns = _ec_scan_table.columns
 _ec_scan_schema_set = set(_ec_scan_schema_columns)
 _ec_scan_type_by_name = {field.name: field.dataType for field in _ec_scan_table.schema.fields}
-_ec_parameter_bases = set()
-for _ec_column in _ec_scan_schema_columns:
-    for _ec_channel in EC_CHANNELS:
-        _ec_prefix = f"{EC_PARAMETER_PREFIX}{_ec_channel}_"
-        if _ec_column.startswith(_ec_prefix):
-            _ec_parameter_bases.add(_ec_column[len(_ec_prefix):])
-_ec_parameter_bases = sorted(_ec_parameter_bases, key=lambda base: (_ec_parameter_label(base).lower(), base.lower()))
+_ec_prefix = f"{EC_PARAMETER_PREFIX}{EC_CHANNEL}_"
+_ec_parameter_bases = sorted(
+    {
+        column[len(_ec_prefix):]
+        for column in _ec_scan_schema_columns
+        if column.startswith(_ec_prefix)
+    },
+    key=lambda base: (_ec_parameter_label(base).lower(), base.lower()),
+)
 _ec_default_parameters = [base for base in EC_DEFAULT_PARAMETERS if base in _ec_parameter_bases]
 
 
@@ -583,19 +513,19 @@ ec_find_flights_button = widgets.Button(
 ec_flight_widget = widgets.Dropdown(
     options=[],
     description="Flight:",
-    layout=widgets.Layout(width="740px"),
+    layout=widgets.Layout(width="760px"),
 )
 ec_parameter_search = widgets.Combobox(
     options=list(_ec_search_to_base),
-    placeholder="Search and add a parameter",
+    placeholder="Search and add an AC parameter",
     description="Add signal:",
     ensure_option=True,
-    layout=widgets.Layout(width="760px"),
+    layout=widgets.Layout(width="780px"),
 )
 ec_parameter_widget = widgets.SelectMultiple(
     options=[(_ec_parameter_label(base), base) for base in _ec_default_parameters],
     description="Signals:",
-    layout=widgets.Layout(width="760px", height="230px"),
+    layout=widgets.Layout(width="780px", height="230px"),
 )
 ec_remove_parameter_button = widgets.Button(
     description="Remove highlighted",
@@ -603,13 +533,13 @@ ec_remove_parameter_button = widgets.Button(
     icon="trash",
 )
 ec_load_button = widgets.Button(
-    description="Load comparison",
+    description="Load timeline",
     button_style="success",
     layout=widgets.Layout(width="190px"),
 )
 ec_progress_widget = widgets.HTML()
 ec_status_output = widgets.Output()
-ec_table_output = widgets.Output()
+ec_chart_output = widgets.Output()
 
 
 def _ec_selected_parameters():
@@ -628,7 +558,9 @@ def _ec_add_parameter(change):
     base = _ec_search_to_base.get(label)
     if base is None or base in _ec_selected_parameters():
         return
-    ec_parameter_widget.options = tuple(ec_parameter_widget.options) + ((_ec_parameter_label(base), base),)
+    ec_parameter_widget.options = tuple(ec_parameter_widget.options) + (
+        (_ec_parameter_label(base), base),
+    )
     ec_parameter_search.value = ""
     _ec_refresh_parameter_search()
 
@@ -674,10 +606,10 @@ def _ec_refresh_flights(_=None, raise_errors=False):
             )
             options = []
             for row in rows:
-                engine_count = len([engine for engine in row.Engines if engine is not None])
+                engines = [engine for engine in row.Engines if engine is not None]
                 label = (
-                    f"{row.StartDatetime.strftime('%H:%M:%S.%f')[:-3]} – "
-                    f"{row.EndDatetime.strftime('%H:%M:%S.%f')[:-3]} | {engine_count} engines"
+                    f"{_ec_timestamp_text(row.StartDatetime)} – "
+                    f"{_ec_timestamp_text(row.EndDatetime)} | {len(engines)} engines"
                 )
                 options.append((label, row.StartDatetime))
             ec_flight_widget.options = options
@@ -696,18 +628,18 @@ def _ec_refresh_flights(_=None, raise_errors=False):
         ec_find_flights_button.disabled = False
 
 
-def _ec_load_comparison(_):
+def _ec_load_timeline(_):
     ec_load_button.disabled = True
     ec_progress_widget.value = "<b>Preparing the selected flight…</b>"
     try:
-        with ec_table_output:
+        with ec_chart_output:
             clear_output(wait=True)
         aircraft = ec_aircraft_widget.value
         flight_date = ec_date_widget.value
         start_time = ec_flight_widget.value
         parameters = _ec_selected_parameters()
         if flight_date is None or start_time is None:
-            raise ValueError("Choose a date and flight before loading the comparison.")
+            raise ValueError("Choose a date and flight before loading the timeline.")
         if not parameters:
             raise ValueError("Select at least one signal.")
         calendar_id = int(flight_date.strftime("%Y%m%d"))
@@ -759,10 +691,9 @@ def _ec_load_comparison(_):
         end_time = max(window["end_time"] for window in engine_windows.values())
         selected_columns = ["Timestamp", "AssetIdentifier"]
         for base in parameters:
-            for channel in EC_CHANNELS:
-                column = _ec_full_column(channel, base)
-                if column in _ec_scan_schema_set:
-                    selected_columns.append(column)
+            column = _ec_full_column(base)
+            if column in _ec_scan_schema_set:
+                selected_columns.append(column)
         selected_columns = list(dict.fromkeys(selected_columns))
         populated_signal = F.lit(False)
         for column in selected_columns[2:]:
@@ -787,31 +718,48 @@ def _ec_load_comparison(_):
             )
             .select(*[_ec_quote(column).alias(column) for column in selected_columns])
         )
-        ec_progress_widget.value = "<b>Detecting large transitions in Spark…</b>"
+        ec_progress_widget.value = "<b>Detecting AC endpoint and status transitions…</b>"
         event_frame = (
             _ec_build_event_df(source, parameters)
+            .orderBy("Timestamp", "AssetIdentifier", "parameter_order")
             .limit(EC_MAX_EVENT_ROWS + 1)
             .toPandas()
         )
         if len(event_frame) > EC_MAX_EVENT_ROWS:
             raise RuntimeError(
-                f"More than {EC_MAX_EVENT_ROWS:,} qualifying events were found. "
-                "Select fewer signals."
+                f"More than {EC_MAX_EVENT_ROWS:,} transitions were found. Select fewer signals."
             )
         if event_frame.empty:
-            raise ValueError("No populated signal states were found for the selected flight and engines.")
-        ec_progress_widget.value = "<b>Rendering the transition table…</b>"
-        events_by_engine = _ec_events_from_spark_frame(event_frame, engines)
-        with ec_table_output:
-            ipy_display(HTML(_ec_render_table(events_by_engine, engines, parameters)))
-        ec_progress_widget.value = ""
+            raise ValueError("No AC endpoint or status transitions were found for this flight.")
+        ec_progress_widget.value = "<b>Building the interactive millisecond timeline…</b>"
+        figure = _ec_build_timeline(
+            event_frame,
+            engines,
+            parameters,
+            start_time,
+            {engine: engine_windows[engine]["end_time"] for engine in engines},
+            aircraft,
+        )
+        with ec_chart_output:
+            figure.show(
+                config={
+                    "displaylogo": False,
+                    "scrollZoom": True,
+                    "responsive": True,
+                    "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+                }
+            )
+        ec_progress_widget.value = (
+            f"<span style='color:#137333'><b>Loaded {len(event_frame):,} AC transitions. "
+            "Drag over any interval to zoom to milliseconds; double-click to reset.</b></span>"
+        )
     except Exception as exc:
         ec_progress_widget.value = (
-            "<span style='color:#b3261e'><b>Comparison failed.</b></span>"
+            "<span style='color:#b3261e'><b>Timeline failed.</b></span>"
         )
-        with ec_table_output:
+        with ec_chart_output:
             clear_output(wait=True)
-            print(f"Unable to load comparison: {exc}")
+            print(f"Unable to load timeline: {exc}")
     finally:
         ec_load_button.disabled = False
 
@@ -819,7 +767,7 @@ def _ec_load_comparison(_):
 ec_parameter_search.observe(_ec_add_parameter, names="value")
 ec_remove_parameter_button.on_click(_ec_remove_parameters)
 ec_find_flights_button.on_click(_ec_refresh_flights)
-ec_load_button.on_click(_ec_load_comparison)
+ec_load_button.on_click(_ec_load_timeline)
 
 ec_controls = widgets.VBox(
     [
@@ -830,7 +778,7 @@ ec_controls = widgets.VBox(
         widgets.HBox([ec_remove_parameter_button, ec_load_button]),
         ec_progress_widget,
         ec_status_output,
-        ec_table_output,
+        ec_chart_output,
     ]
 )
 ipy_display(ec_controls)
