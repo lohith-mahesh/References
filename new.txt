@@ -1,0 +1,51 @@
+scan_alias = scan.alias("scan")
+window_alias = F.broadcast(flight_windows).alias("flight")
+
+join_condition = (
+    (scan_alias["AircraftId"] == window_alias["AircraftId"])
+    & (
+        scan_alias["AssetIdentifier"].cast("string")
+        == window_alias["EngineSerialNumber"].cast("string")
+    )
+    & (
+        scan_alias["StartDatetime"]
+        == window_alias["StartDatetime"]
+    )
+    & (
+        scan_alias["Timestamp"]
+        >= window_alias["StartDatetime"]
+    )
+    & (
+        scan_alias["Timestamp"]
+        <= window_alias["EndDatetime"]
+    )
+)
+
+cda = (
+    scan_alias
+    .join(
+        window_alias,
+        join_condition,
+        "inner"
+    )
+    .select(
+        F.col("scan.Timestamp").alias("Timestamp"),
+        F.col("scan.StartDatetime").alias("StartDatetime"),
+        F.col("flight.EndDatetime").alias("EndDatetime"),
+        F.col("flight.AircraftIdentifier").alias("AircraftIdentifier"),
+        F.col("flight.EngineSerialNumber").alias("EngineSerialNumber"),
+        *[
+            F.col(f"scan.`{column}`").alias(column)
+            for column in available_tr_columns
+        ]
+    )
+    .orderBy(
+        "StartDatetime",
+        "EngineSerialNumber",
+        "Timestamp"
+    )
+)
+
+print(f"CDA rows: {cda.count():,}")
+
+display(cda)
