@@ -742,6 +742,7 @@ def _ec_load_timeline(_):
         )
         with ec_chart_output:
             figure.show(
+                renderer="notebook",
                 config={
                     "displaylogo": False,
                     "scrollZoom": True,
