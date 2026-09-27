@@ -1,51 +1,224 @@
-scan_alias = scan.alias("scan")
-window_alias = F.broadcast(flight_windows).alias("flight")
+from datetime import date
+
+from pyspark.sql import functions as F
+
+MASTER_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousmaster-aircraftengine-cda`"
+SCAN_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousscan-cda`"
+
+FLIGHT_NO = 87024
+START_DATE = date(2026, 4, 6)
+END_DATE = date(2026, 4, 15)
+
+CHANNELS = ("AC", "BC")
+PARAMETER_PREFIX = "Parameter:EVHMU_EEC_"
+
+THRUST_REVERSER_SUFFIXES = [
+    "IAcThrustReverser_tcmIntlV_data",
+    "IAcThrustReverser_trLeftDoorSwLocked_LOWER__data",
+    "IAcThrustReverser_trLeftDoorSwLocked_UPPER__data",
+    "IAcThrustReverser_trLwrDoorLeftSwLocked_data",
+    "IAcThrustReverser_trLwrDoorRightSwLocked_data",
+    "IAcThrustReverser_trLwrDoorRightSwLocked_flt",
+    "IAcThrustReverser_trRightDoorSwLocked_LOWER__data",
+    "IAcThrustReverser_trRightDoorSwLocked_UPPER__data",
+    "IAcThrustReverser_trUprDoorLeftSwLocked_data",
+    "IAcThrustReverser_trUprDoorLeftSwLocked_flt",
+    "IAcThrustReverser_trUprDoorRightSwLocked_data",
+    "IAcThrustReverser_trUprDoorRightSwLocked_flt",
+    "IOSThrustReverser_mainTestEnabled_data",
+    "IOSThrustReverser_trDoorPosVa_data",
+    "IOSThrustReverser_trDoorPosVb_data",
+    "IOSThrustReverser_trDoorPosVex_data",
+    "IOSThrustReverser_trDoorPosVex_extflt",
+    "IOSThrustReverser_trDoorPosVex_intflt",
+    "IOSThrustReverser_trLoSwRaw_data",
+    "IOSThrustReverser_trUpSwRaw_data",
+    "IOtherProcThrustReverser_trLoLVTSelected_data",
+    "IOtherProcThrustReverser_trUpLVTSelected_data",
+    "IThrustReverser_loOwnTRLVTRaw_data",
+    "IThrustReverser_loOwnTRLVTRngFlt_data",
+    "IThrustReverser_trAnomaly_data",
+    "IThrustReverser_trArmed_data",
+    "IThrustReverser_trDeploySelected_data",
+    "IThrustReverser_trDoorDeplStatus_data",
+    "IThrustReverser_trDoorPosLost_data",
+    "IThrustReverser_trDoorStowStatus_data",
+    "IThrustReverser_trInTransit_data",
+    "IThrustReverser_trInadvDeploy_data",
+    "IThrustReverser_trIsDeployed_data",
+    "IThrustReverser_trIsUnlocked_data",
+    "IThrustReverser_trJam_data",
+    "IThrustReverser_trLVTPosVCtrl_data",
+    "IThrustReverser_trLegalDeployCmd_data",
+    "IThrustReverser_trLessDeplPos_data",
+    "IThrustReverser_trLoLVTSelected_data",
+    "IThrustReverser_trLoLVTSelected_flt",
+    "IThrustReverser_trMTESTimeExpired_data",
+    "IThrustReverser_trMTESV_data",
+    "IThrustReverser_trMoreDeplPos_data",
+    "IThrustReverser_trUnavailable_data",
+    "IThrustReverser_trUpLVTSelected_data",
+    "IThrustReverser_trUpLVTSelected_flt",
+    "IThrustReverser_trVPrSwVFlt_data",
+    "IThrustReverser_trVPrSwV_data",
+    "IThrustReverser_upOwnTRLVTRaw_data",
+    "IThrustReverser_upOwnTRLVTRngFlt_data",
+]
+
+start_calendar_id = int(START_DATE.strftime("%Y%m%d"))
+end_calendar_id = int(END_DATE.strftime("%Y%m%d"))
+
+master_table = spark.table(MASTER_TABLE)
+
+flightno_candidates = [
+    c for c in master_table.columns
+    if c.lower() in {"flightno", "flightnumber", "flight_no", "flight_number"}
+]
+
+if not flightno_candidates:
+    raise ValueError(
+        "Could not find a FlightNo column in the CDA master table. "
+        f"Available columns: {master_table.columns}"
+    )
+
+FLIGHTNO_COLUMN = flightno_candidates[0]
+
+master_flights = (
+    master_table
+    .where(
+        (F.col(FLIGHTNO_COLUMN).cast("string") == str(FLIGHT_NO))
+        & F.col("CalendarId").between(start_calendar_id, end_calendar_id)
+    )
+)
+
+flight_windows = (
+    master_flights
+    .select(
+        "AircraftIdentifier",
+        "AircraftId",
+        "EngineSerialNumber",
+        "EngineId",
+        "StartDatetime",
+        "EndDatetime",
+        "CalendarId",
+        F.col(FLIGHTNO_COLUMN).alias("FlightNo"),
+    )
+    .where(
+        F.col("StartDatetime").isNotNull()
+        & F.col("EndDatetime").isNotNull()
+        & (F.col("EndDatetime") >= F.col("StartDatetime"))
+    )
+    .dropDuplicates()
+)
+
+flight_rows = flight_windows.collect()
+
+if not flight_rows:
+    raise ValueError(
+        f"No CDA master records found for FlightNo {FLIGHT_NO} "
+        f"between {START_DATE} and {END_DATE}."
+    )
+
+print(
+    f"FlightNo {FLIGHT_NO}: {len(flight_rows)} engine/flight window(s) found "
+    f"from {START_DATE} through {END_DATE}"
+)
+
+display(
+    flight_windows.orderBy(
+        "StartDatetime",
+        "EngineSerialNumber",
+    )
+)
+
+scan_table = spark.table(SCAN_TABLE)
+scan_schema = set(scan_table.columns)
+
+requested_tr_columns = [
+    f"{PARAMETER_PREFIX}{channel}_{suffix}"
+    for channel in CHANNELS
+    for suffix in THRUST_REVERSER_SUFFIXES
+]
+
+available_tr_columns = [
+    c for c in requested_tr_columns
+    if c in scan_schema
+]
+
+missing_tr_columns = [
+    c for c in requested_tr_columns
+    if c not in scan_schema
+]
+
+if not available_tr_columns:
+    raise ValueError(
+        "None of the requested AC/BC thrust-reverser parameters "
+        "exist in the CDA scan table."
+    )
+
+print(f"Thrust-reverser columns available: {len(available_tr_columns)}")
+print(f"Thrust-reverser columns unavailable: {len(missing_tr_columns)}")
+
+windows_for_join = (
+    flight_windows
+    .select(
+        F.col("AircraftId").alias("_AircraftId"),
+        F.col("EngineSerialNumber").cast("string").alias("_ESN"),
+        F.col("StartDatetime").alias("_FlightStart"),
+        F.col("EndDatetime").alias("_FlightEnd"),
+        F.col("FlightNo").alias("_FlightNo"),
+    )
+    .dropDuplicates()
+)
+
+scan = (
+    scan_table
+    .where(
+        (F.col("year") == 2026)
+        & (F.col("Month") == 4)
+    )
+    .alias("scan")
+)
+
+windows = F.broadcast(windows_for_join).alias("window")
 
 join_condition = (
-    (scan_alias["AircraftId"] == window_alias["AircraftId"])
-    & (
-        scan_alias["AssetIdentifier"].cast("string")
-        == window_alias["EngineSerialNumber"].cast("string")
-    )
-    & (
-        scan_alias["StartDatetime"]
-        == window_alias["StartDatetime"]
-    )
-    & (
-        scan_alias["Timestamp"]
-        >= window_alias["StartDatetime"]
-    )
-    & (
-        scan_alias["Timestamp"]
-        <= window_alias["EndDatetime"]
+    (scan["AircraftId"] == windows["_AircraftId"])
+    & (scan["AssetIdentifier"].cast("string") == windows["_ESN"])
+    & (scan["StartDatetime"] == windows["_FlightStart"])
+    & scan["Timestamp"].between(
+        windows["_FlightStart"],
+        windows["_FlightEnd"],
     )
 )
 
 cda = (
-    scan_alias
-    .join(
-        window_alias,
-        join_condition,
-        "inner"
-    )
+    scan
+    .join(windows, join_condition, "inner")
     .select(
-        F.col("scan.Timestamp").alias("Timestamp"),
-        F.col("scan.StartDatetime").alias("StartDatetime"),
-        F.col("flight.EndDatetime").alias("EndDatetime"),
-        F.col("flight.AircraftIdentifier").alias("AircraftIdentifier"),
-        F.col("flight.EngineSerialNumber").alias("EngineSerialNumber"),
-        *[
-            F.col(f"scan.`{column}`").alias(column)
-            for column in available_tr_columns
-        ]
+        scan["Timestamp"],
+        windows["_FlightNo"].alias("FlightNo"),
+        scan["AircraftId"],
+        scan["ParentAssetIdentifier"],
+        scan["AssetIdentifier"].alias("EngineSerialNumber"),
+        windows["_FlightStart"].alias("FlightStartDatetime"),
+        windows["_FlightEnd"].alias("FlightEndDatetime"),
+        *[scan[c] for c in available_tr_columns],
     )
     .orderBy(
-        "StartDatetime",
+        "FlightStartDatetime",
         "EngineSerialNumber",
-        "Timestamp"
+        "Timestamp",
     )
 )
 
-print(f"CDA rows: {cda.count():,}")
+row_count = cda.count()
+
+print()
+print(f"FlightNo: {FLIGHT_NO}")
+print(f"Date range: {START_DATE} to {END_DATE}")
+print(f"CDA rows loaded: {row_count:,}")
+print(f"Thrust-reverser parameters loaded: {len(available_tr_columns)}")
+print(f"AC/BC channels retained separately.")
 
 display(cda)
