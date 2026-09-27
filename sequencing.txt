@@ -1,787 +1,421 @@
-from datetime import date, datetime
+import html
+from datetime import datetime, timedelta
 
 import ipywidgets as widgets
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from IPython.display import clear_output, display as ipy_display
-from plotly.subplots import make_subplots
-from pyspark.sql import Window
+from IPython.display import HTML, clear_output, display as ipy_display
 from pyspark.sql import functions as F
-from pyspark.sql.types import BooleanType, NumericType
+from pyspark.sql.window import Window
 
-EC_ASSET_TABLE = "ehm_fleetstore_prd1eun82719_internal.assetmanagement.aircraftengine"
-EC_MASTER_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousmaster-aircraftengine-cda`"
-EC_SCAN_TABLE = "ehm_fleetstore_prd1eun82719_internal.`g700-pearl700`.`emucontinuousscan-cda`"
-EC_ENGINE_TYPE_CODE = "Pearl 700"
-EC_PARAMETER_PREFIX = "Parameter:EVHMU_EEC_"
-EC_CHANNEL = "AC"
-EC_MAX_EVENT_ROWS = 5_000
-EC_STATE_TOLERANCE = 1e-6
-EC_LVT_LOW_THRESHOLD = 1.0
-EC_LVT_HIGH_THRESHOLD = 99.0
-
-EC_DEFAULT_PARAMETERS = [
-    "IThrustReverser_trLVTPosVCtrl_data",
-    "IThrustReverser_loOwnTRLVTRaw_data",
-    "IThrustReverser_upOwnTRLVTRaw_data",
-    "IThrustReverser_trDoorDeplStatus_data",
-    "IThrustReverser_trArmed_data",
-    "IThrustReverser_trInTransit_data",
-    "IThrustReverser_trIsUnlocked_data",
-    "IThrustReverser_trDoorStowStatus_data",
-    "IThrustReverser_trIsDeployed_data",
+TR_EVENT_SIGNALS = [
+    ("LVTPosVCntrl", "IThrustReverser_trLVTPosVCtrl_data", "analog"),
+    ("Low TRLVT Raw", "IThrustReverser_loOwnTRLVTRaw_data", "analog"),
+    ("Up TRLVT Raw", "IThrustReverser_upOwnTRLVTRaw_data", "analog"),
+    ("TR Armed", "IThrustReverser_trArmed_data", "discrete"),
+    ("DoorDep Status", "IThrustReverser_trDoorDeplStatus_data", "discrete"),
+    ("In Transit", "IThrustReverser_trInTransit_data", "discrete"),
+    ("Is Unlocked", "IThrustReverser_trIsUnlocked_data", "discrete"),
+    ("Door Stow", "IThrustReverser_trDoorStowStatus_data", "discrete"),
+    ("Is Deployed", "IThrustReverser_trIsDeployed_data", "discrete"),
 ]
 
-EC_GENERIC_STATE_VALUES = (0.0, 1.0, 100.0)
-EC_PARAMETER_STATE_VALUES = {
-    "IThrustReverser_trLVTPosVCtrl_data": (0.0, 100.0),
-    "IThrustReverser_loOwnTRLVTRaw_data": (0.0, 100.0),
-    "IThrustReverser_upOwnTRLVTRaw_data": (0.0, 100.0),
-    "IThrustReverser_trDoorDeplStatus_data": (0.0, 1.0, 2.0, 3.0),
-    "IThrustReverser_trArmed_data": (0.0, 1.0),
-    "IThrustReverser_trInTransit_data": (0.0, 1.0),
-    "IThrustReverser_trIsUnlocked_data": (0.0, 1.0),
-    "IThrustReverser_trDoorStowStatus_data": (0.0, 1.0),
-    "IThrustReverser_trIsDeployed_data": (0.0, 1.0),
-}
+existing_tr_event_date_widget = globals().get("tr_event_date_widget")
+previous_tr_event_date = getattr(existing_tr_event_date_widget, "value", None)
 
-EC_ANALOG_LVT_PARAMETERS = {
-    "IThrustReverser_trLVTPosVCtrl_data",
-    "IThrustReverser_loOwnTRLVTRaw_data",
-    "IThrustReverser_upOwnTRLVTRaw_data",
-}
+if previous_tr_event_date is None:
+    previous_tr_event_date = getattr(globals().get("end_date_widget"), "value", None)
 
-EC_LABELS = {
-    "IThrustReverser_trLVTPosVCtrl_data": "LVTPosVCntrl",
-    "IThrustReverser_loOwnTRLVTRaw_data": "low TRLVT Raw",
-    "IThrustReverser_upOwnTRLVTRaw_data": "Up TRLVT Raw",
-    "IThrustReverser_trDoorDeplStatus_data": "DoorDep Status",
-    "IThrustReverser_trArmed_data": "TR Armed",
-    "IThrustReverser_trInTransit_data": "In Transit",
-    "IThrustReverser_trIsUnlocked_data": "Is Unlocked",
-    "IThrustReverser_trDoorStowStatus_data": "Door Stow",
-    "IThrustReverser_trIsDeployed_data": "IsDeployed",
-}
+if previous_tr_event_date is None:
+    previous_tr_event_date = date.today()
 
-EC_PARAMETER_COLORS = {
-    "IThrustReverser_trLVTPosVCtrl_data": "#c85f70",
-    "IThrustReverser_loOwnTRLVTRaw_data": "#a77700",
-    "IThrustReverser_upOwnTRLVTRaw_data": "#5555c9",
-    "IThrustReverser_trDoorDeplStatus_data": "#b89b2e",
-    "IThrustReverser_trArmed_data": "#00a33c",
-    "IThrustReverser_trInTransit_data": "#27aeb7",
-    "IThrustReverser_trIsUnlocked_data": "#767676",
-    "IThrustReverser_trDoorStowStatus_data": "#d48600",
-    "IThrustReverser_trIsDeployed_data": "#168b83",
-}
-
-EC_ENGINE_STYLES = [
-    {"color": "#1565c0", "dash": "solid", "symbol": "circle"},
-    {"color": "#d84315", "dash": "dash", "symbol": "diamond"},
-]
-
-EC_Y_AXIS_STATES = {
-    "IThrustReverser_trLVTPosVCtrl_data": ([0.0, 100.0], ["0", "100"]),
-    "IThrustReverser_loOwnTRLVTRaw_data": ([0.0, 100.0], ["0", "100"]),
-    "IThrustReverser_upOwnTRLVTRaw_data": ([0.0, 100.0], ["0", "100"]),
-    "IThrustReverser_trDoorDeplStatus_data": ([0.0, 1.0, 2.0, 3.0], ["0", "1", "2", "3"]),
-    "IThrustReverser_trArmed_data": ([0.0, 1.0], ["OFF", "ARMED"]),
-    "IThrustReverser_trInTransit_data": ([0.0, 1.0], ["OFF", "ON"]),
-    "IThrustReverser_trIsUnlocked_data": ([0.0, 1.0], ["LOCKED", "UNLOCKED"]),
-    "IThrustReverser_trDoorStowStatus_data": ([0.0, 1.0], ["OPEN", "CLOSE"]),
-    "IThrustReverser_trIsDeployed_data": ([0.0, 1.0], ["0", "1"]),
-}
-
-
-def _ec_quote(name):
-    return F.col(f"`{name.replace('`', '``')}`")
-
-
-def _ec_parameter_label(base):
-    if base in EC_LABELS:
-        return EC_LABELS[base]
-    label = base
-    for ending in ("_data", "_flt"):
-        if label.endswith(ending):
-            label = label[:-len(ending)]
-    return label
-
-
-def _ec_full_column(base):
-    return f"{EC_PARAMETER_PREFIX}{EC_CHANNEL}_{base}"
-
-
-def _ec_number(value):
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, (bool, np.bool_)):
-        return float(bool(value))
-    try:
-        numeric = float(value)
-        return numeric if np.isfinite(numeric) else None
-    except Exception:
-        return None
-
-
-def _ec_format_value(value):
-    number = _ec_number(value)
-    if number is None:
-        return str(value)
-    if np.isclose(number, round(number), rtol=0.0, atol=1e-12):
-        return str(int(round(number)))
-    return f"{number:.9g}"
-
-
-def _ec_recognized_state(value, base):
-    if base in EC_ANALOG_LVT_PARAMETERS:
-        numeric = value.cast("double")
-        return (
-            F.when(numeric <= F.lit(EC_LVT_LOW_THRESHOLD), F.lit(0.0))
-            .when(numeric >= F.lit(EC_LVT_HIGH_THRESHOLD), F.lit(100.0))
-            .otherwise(F.lit(None).cast("double"))
-        )
-    recognized = F.lit(None).cast("double")
-    for state in EC_PARAMETER_STATE_VALUES.get(base, EC_GENERIC_STATE_VALUES):
-        recognized = F.when(
-            F.abs(value.cast("double") - F.lit(float(state))) <= F.lit(EC_STATE_TOLERANCE),
-            F.lit(float(state)),
-        ).otherwise(recognized)
-    return recognized
-
-
-def _ec_build_event_df(source, parameters):
-    order_window = Window.partitionBy("AssetIdentifier").orderBy("Timestamp")
-    state_window = order_window.rowsBetween(Window.unboundedPreceding, Window.currentRow)
-    state_expressions = []
-    parameter_metadata = []
-    for index, base in enumerate(parameters):
-        column = _ec_full_column(base)
-        if column not in _ec_scan_schema_set:
-            continue
-        data_type = _ec_scan_type_by_name[column]
-        is_boolean = isinstance(data_type, BooleanType)
-        is_numeric = isinstance(data_type, (NumericType, BooleanType))
-        raw_value = _ec_quote(column)
-        if is_numeric:
-            raw_value = F.when(
-                F.isnan(raw_value.cast("double")),
-                F.lit(None).cast(data_type),
-            ).otherwise(raw_value)
-        state_name = f"_ec_state_{index}"
-        state_expressions.append(
-            F.last(raw_value, ignorenulls=True).over(state_window).alias(state_name)
-        )
-        parameter_metadata.append(
-            {
-                "index": index,
-                "base": base,
-                "state": state_name,
-                "recognized": f"_ec_recognized_{index}",
-                "tracked": f"_ec_tracked_{index}",
-                "is_boolean": is_boolean,
-                "is_numeric": is_numeric,
-            }
-        )
-    state_df = source.select("Timestamp", "AssetIdentifier", *state_expressions)
-    recognized_expressions = []
-    for metadata in parameter_metadata:
-        state = F.col(metadata["state"])
-        if metadata["is_boolean"]:
-            recognized = (
-                F.when(state == F.lit(True), F.lit(1.0))
-                .when(state == F.lit(False), F.lit(0.0))
-                .otherwise(F.lit(None).cast("double"))
-            )
-        elif metadata["is_numeric"]:
-            recognized = _ec_recognized_state(state, metadata["base"])
-        else:
-            recognized = state
-        recognized_expressions.append(recognized.alias(metadata["recognized"]))
-    recognized_df = state_df.select("*", *recognized_expressions)
-    tracked_df = recognized_df.select(
-        "*",
-        *[
-            F.last(F.col(metadata["recognized"]), ignorenulls=True)
-            .over(state_window)
-            .alias(metadata["tracked"])
-            for metadata in parameter_metadata
-        ],
-    )
-    comparison_df = tracked_df.select(
-        "*",
-        *[
-            F.lag(metadata["tracked"])
-            .over(order_window)
-            .alias(f"_ec_previous_{metadata['index']}")
-            for metadata in parameter_metadata
-        ],
-    )
-    event_expressions = []
-    for metadata in parameter_metadata:
-        tracked = F.col(metadata["tracked"])
-        previous = F.col(f"_ec_previous_{metadata['index']}")
-        changed = tracked.isNotNull() & (previous.isNull() | (tracked != previous))
-        event_expressions.append(
-            F.when(
-                changed,
-                F.struct(
-                    F.lit(metadata["base"]).alias("parameter"),
-                    F.lit(metadata["index"]).alias("parameter_order"),
-                    tracked.cast("string").alias("value"),
-                ),
-            )
-        )
-    return (
-        comparison_df.select(
-            "Timestamp",
-            F.col("AssetIdentifier").cast("string").alias("AssetIdentifier"),
-            F.explode(F.array(*event_expressions)).alias("event"),
-        )
-        .where(F.col("event").isNotNull())
-        .select("Timestamp", "AssetIdentifier", "event.*")
-    )
-
-
-def _ec_timestamp_text(value):
-    return pd.Timestamp(value).strftime("%H:%M:%S.%f")[:-3]
-
-
-def _ec_axis_definition(base, frame):
-    if base in EC_Y_AXIS_STATES:
-        values, labels = EC_Y_AXIS_STATES[base]
-        numeric = pd.to_numeric(frame["value"], errors="coerce")
-        span = max(values) - min(values)
-        padding = max(span * 0.08, 0.15)
-        return numeric.astype(float), values, labels, [min(values) - padding, max(values) + padding]
-    numeric = pd.to_numeric(frame["value"], errors="coerce")
-    if numeric.notna().all():
-        values = sorted(numeric.astype(float).unique().tolist())
-        if len(values) == 1:
-            padding = max(abs(values[0]) * 0.08, 1.0)
-        else:
-            padding = max((max(values) - min(values)) * 0.08, 0.1)
-        labels = [_ec_format_value(value) for value in values]
-        return numeric.astype(float), values, labels, [min(values) - padding, max(values) + padding]
-    categories = list(dict.fromkeys(frame["value"].astype(str).tolist()))
-    mapping = {value: index for index, value in enumerate(categories)}
-    plotted = frame["value"].astype(str).map(mapping).astype(float)
-    values = list(range(len(categories)))
-    upper = max(values) if values else 0
-    return plotted, values, categories, [-0.4, upper + 0.4]
-
-
-def _ec_build_timeline(event_frame, engines, parameters, start_time, engine_end_times, aircraft):
-    frame = event_frame.copy()
-    frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], errors="coerce")
-    frame = frame.dropna(subset=["Timestamp"]).sort_values(
-        ["Timestamp", "parameter_order", "AssetIdentifier"],
-        kind="stable",
-    )
-    active_parameters = [
-        base for base in parameters if bool((frame["parameter"] == base).any())
-    ]
-    if not active_parameters:
-        raise ValueError("No AC endpoint or status transitions were found for the selected flight.")
-    row_count = len(active_parameters)
-    figure = make_subplots(
-        rows=row_count,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=min(0.025, 0.16 / max(row_count, 1)),
-        subplot_titles=[_ec_parameter_label(base) for base in active_parameters],
-    )
-    for row_index, base in enumerate(active_parameters, start=1):
-        parameter_frame = frame.loc[frame["parameter"] == base].copy()
-        plotted, tick_values, tick_labels, y_range = _ec_axis_definition(base, parameter_frame)
-        parameter_frame["_plot_value"] = plotted.to_numpy()
-        for engine_index, engine in enumerate(engines):
-            engine_frame = parameter_frame.loc[
-                parameter_frame["AssetIdentifier"].astype(str) == str(engine)
-            ].sort_values("Timestamp", kind="stable")
-            if engine_frame.empty:
-                continue
-            style = EC_ENGINE_STYLES[engine_index]
-            event_times = engine_frame["Timestamp"].tolist()
-            event_values = engine_frame["_plot_value"].astype(float).tolist()
-            line_times = list(event_times)
-            line_values = list(event_values)
-            engine_end = pd.Timestamp(engine_end_times[engine])
-            if line_times[-1] < engine_end:
-                line_times.append(engine_end)
-                line_values.append(line_values[-1])
-            figure.add_trace(
-                go.Scatter(
-                    x=line_times,
-                    y=line_values,
-                    mode="lines",
-                    name=str(engine),
-                    legendgroup=str(engine),
-                    showlegend=row_index == 1,
-                    hoverinfo="skip",
-                    line={"color": style["color"], "width": 2.2, "dash": style["dash"], "shape": "hv"},
-                ),
-                row=row_index,
-                col=1,
-            )
-            custom_data = np.array(
-                [
-                    [str(engine), _ec_parameter_label(base), _ec_format_value(value)]
-                    for value in engine_frame["value"].tolist()
-                ],
-                dtype=object,
-            )
-            figure.add_trace(
-                go.Scatter(
-                    x=event_times,
-                    y=event_values,
-                    mode="markers",
-                    name=str(engine),
-                    legendgroup=str(engine),
-                    showlegend=False,
-                    customdata=custom_data,
-                    marker={
-                        "color": style["color"],
-                        "size": 8,
-                        "symbol": style["symbol"],
-                        "line": {"color": "#ffffff", "width": 1},
-                    },
-                    hovertemplate=(
-                        "<b>Engine %{customdata[0]}</b><br>"
-                        "%{customdata[1]}: %{customdata[2]}<br>"
-                        "%{x|%H:%M:%S.%L}<extra></extra>"
-                    ),
-                ),
-                row=row_index,
-                col=1,
-            )
-        figure.update_yaxes(
-            tickmode="array",
-            tickvals=tick_values,
-            ticktext=tick_labels,
-            range=y_range,
-            fixedrange=False,
-            showgrid=True,
-            gridcolor="rgba(100,100,100,0.16)",
-            zeroline=False,
-            row=row_index,
-            col=1,
-        )
-    end_time = max(pd.Timestamp(value) for value in engine_end_times.values())
-    tick_stops = [
-        {"dtickrange": [None, 1_000], "value": "%H:%M:%S.%L"},
-        {"dtickrange": [1_000, 60_000], "value": "%H:%M:%S.%L"},
-        {"dtickrange": [60_000, 3_600_000], "value": "%H:%M:%S"},
-        {"dtickrange": [3_600_000, None], "value": "%H:%M"},
-    ]
-    figure.update_xaxes(
-        type="date",
-        range=[pd.Timestamp(start_time), end_time],
-        tickformatstops=tick_stops,
-        hoverformat="%H:%M:%S.%L",
-        showspikes=True,
-        spikemode="across",
-        spikesnap="cursor",
-        spikethickness=1,
-        spikedash="dot",
-        spikecolor="#555555",
-        showgrid=True,
-        gridcolor="rgba(100,100,100,0.12)",
-    )
-    figure.update_xaxes(
-        title_text="Flight timeline — drag to zoom; millisecond ticks appear automatically",
-        rangeslider={"visible": True, "thickness": 0.06},
-        row=row_count,
-        col=1,
-    )
-    figure.update_layout(
-        title={
-            "text": (
-                f"{aircraft} · AC thrust-reverser transitions · "
-                f"{_ec_timestamp_text(start_time)}–{_ec_timestamp_text(end_time)}"
-            ),
-            "x": 0.01,
-            "xanchor": "left",
-        },
-        template="plotly_white",
-        height=max(720, 155 * row_count),
-        margin={"l": 92, "r": 35, "t": 105, "b": 95},
-        hovermode="closest",
-        hoverdistance=40,
-        spikedistance=-1,
-        legend={
-            "orientation": "h",
-            "yanchor": "bottom",
-            "y": 1.025,
-            "xanchor": "right",
-            "x": 1.0,
-            "groupclick": "togglegroup",
-            "title": {"text": "Engines"},
-        },
-        dragmode="zoom",
-        uirevision=f"{aircraft}-{pd.Timestamp(start_time).isoformat()}",
-    )
-    for annotation, base in zip(figure.layout.annotations, active_parameters):
-        annotation.update(
-            x=0.0,
-            xanchor="left",
-            font={"color": EC_PARAMETER_COLORS.get(base, "#333333"), "size": 13},
-        )
-    return figure
-
-
-def _ec_month_filter(start_time, end_time):
-    current = date(start_time.year, start_time.month, 1)
-    final = date(end_time.year, end_time.month, 1)
-    expression = F.lit(False)
-    while current <= final:
-        expression = expression | (
-            (F.col("year") == current.year) & (F.col("Month") == current.month)
-        )
-        current = date(
-            current.year + (current.month == 12),
-            1 if current.month == 12 else current.month + 1,
-            1,
-        )
-    return expression
-
-
-_ec_asset_rows = (
-    spark.table(EC_ASSET_TABLE)
-    .where(F.col("EngineTypeCode") == EC_ENGINE_TYPE_CODE)
-    .select(F.col("LatestAircraftLatestIdentifier").cast("string").alias("AircraftIdentifier"))
-    .where(F.col("AircraftIdentifier").isNotNull())
-    .distinct()
-    .orderBy("AircraftIdentifier")
-    .collect()
-)
-_ec_aircraft_options = [row.AircraftIdentifier for row in _ec_asset_rows]
-if not _ec_aircraft_options:
-    raise RuntimeError(f"No aircraft were found for engine type {EC_ENGINE_TYPE_CODE}.")
-
-_ec_scan_table = spark.table(EC_SCAN_TABLE)
-_ec_scan_schema_columns = _ec_scan_table.columns
-_ec_scan_schema_set = set(_ec_scan_schema_columns)
-_ec_scan_type_by_name = {field.name: field.dataType for field in _ec_scan_table.schema.fields}
-_ec_prefix = f"{EC_PARAMETER_PREFIX}{EC_CHANNEL}_"
-_ec_parameter_bases = sorted(
-    {
-        column[len(_ec_prefix):]
-        for column in _ec_scan_schema_columns
-        if column.startswith(_ec_prefix)
-    },
-    key=lambda base: (_ec_parameter_label(base).lower(), base.lower()),
-)
-_ec_default_parameters = [base for base in EC_DEFAULT_PARAMETERS if base in _ec_parameter_bases]
-
-
-def _ec_search_label(base):
-    return f"{_ec_parameter_label(base)} — {base}"
-
-
-_ec_search_to_base = {_ec_search_label(base): base for base in _ec_parameter_bases}
-_ec_default_aircraft = _ec_aircraft_options[0]
-_ec_latest_row = (
-    spark.table(EC_MASTER_TABLE)
-    .where(F.col("AircraftIdentifier").cast("string") == _ec_default_aircraft)
-    .agg(F.max("CalendarId").alias("LatestCalendarId"))
-    .first()
-)
-_ec_latest_calendar = _ec_latest_row.LatestCalendarId if _ec_latest_row else None
-_ec_default_date = (
-    datetime.strptime(str(int(_ec_latest_calendar)), "%Y%m%d").date()
-    if _ec_latest_calendar is not None
-    else date.today()
-)
-
-ec_aircraft_widget = widgets.Dropdown(
-    options=_ec_aircraft_options,
-    value=_ec_default_aircraft,
-    description="Aircraft:",
-    layout=widgets.Layout(width="430px"),
-)
-ec_date_widget = widgets.DatePicker(
-    value=_ec_default_date,
-    description="Flight date:",
+tr_event_date_widget = widgets.DatePicker(
+    value=previous_tr_event_date,
+    description="Event date:",
     layout=widgets.Layout(width="300px"),
 )
-ec_find_flights_button = widgets.Button(
-    description="Find flights",
-    button_style="info",
-    layout=widgets.Layout(width="150px"),
+
+tr_event_button = widgets.Button(
+    description="Show AC transitions",
+    button_style="primary",
+    layout=widgets.Layout(width="200px"),
 )
-ec_flight_widget = widgets.Dropdown(
-    options=[],
-    description="Flight:",
-    layout=widgets.Layout(width="760px"),
-)
-ec_parameter_search = widgets.Combobox(
-    options=list(_ec_search_to_base),
-    placeholder="Search and add an AC parameter",
-    description="Add signal:",
-    ensure_option=True,
-    layout=widgets.Layout(width="780px"),
-)
-ec_parameter_widget = widgets.SelectMultiple(
-    options=[(_ec_parameter_label(base), base) for base in _ec_default_parameters],
-    description="Signals:",
-    layout=widgets.Layout(width="780px", height="230px"),
-)
-ec_remove_parameter_button = widgets.Button(
-    description="Remove highlighted",
-    button_style="danger",
-    icon="trash",
-)
-ec_load_button = widgets.Button(
-    description="Load timeline",
-    button_style="success",
-    layout=widgets.Layout(width="190px"),
-)
-ec_progress_widget = widgets.HTML()
-ec_status_output = widgets.Output()
-ec_chart_output = widgets.Output()
+
+tr_event_output = widgets.Output()
 
 
-def _ec_selected_parameters():
-    return [value for _, value in ec_parameter_widget.options]
+def _tr_event_format_value(value):
+    if value is None:
+        return ""
+    value = float(value)
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:g}"
 
 
-def _ec_refresh_parameter_search():
-    selected = set(_ec_selected_parameters())
-    ec_parameter_search.options = [
-        label for label, base in _ec_search_to_base.items() if base not in selected
-    ]
-
-
-def _ec_add_parameter(change):
-    label = change["new"]
-    base = _ec_search_to_base.get(label)
-    if base is None or base in _ec_selected_parameters():
+def _tr_event_render_table(events, chosen_aircraft, chosen_engine, chosen_date):
+    if not events:
+        ipy_display(
+            HTML(
+                f"<b>No AC thrust-reverser transitions found</b><br>"
+                f"Aircraft: {html.escape(str(chosen_aircraft))} &nbsp;|&nbsp; "
+                f"Engine: {html.escape(str(chosen_engine))} &nbsp;|&nbsp; "
+                f"Date: {html.escape(str(chosen_date))}"
+            )
+        )
         return
-    ec_parameter_widget.options = tuple(ec_parameter_widget.options) + (
-        (_ec_parameter_label(base), base),
-    )
-    ec_parameter_search.value = ""
-    _ec_refresh_parameter_search()
+
+    signal_styles = {
+        "LVTPosVCntrl": ("#eadfe8", "#000000"),
+        "Low TRLVT Raw": ("#d4a900", "#000000"),
+        "Up TRLVT Raw": ("#2e3192", "#ffffff"),
+        "TR Armed": ("#009b35", "#000000"),
+        "DoorDep Status": ("#d8c784", "#000000"),
+        "In Transit": ("#5fd0d4", "#000000"),
+        "Is Unlocked": ("#b7b7b7", "#000000"),
+        "Door Stow": ("#f0a000", "#000000"),
+        "Is Deployed": ("#269b91", "#000000"),
+    }
+
+    rows = []
+    for event in events:
+        bg, fg = signal_styles[event["Signal"]]
+        timestamp_text = event["Timestamp"].strftime("%H:%M:%S.%f")[:-3]
+        event_text = (
+            f"{html.escape(event['Signal'])} = "
+            f"{html.escape(_tr_event_format_value(event['Value']))}"
+        )
+        rows.append(
+            "<tr>"
+            f"<td class='tr-time'>{timestamp_text}</td>"
+            f"<td class='tr-event' style='background:{bg};color:{fg}'>{event_text}</td>"
+            "</tr>"
+        )
+
+    table_html = f"""
+    <style>
+      .tr-wrap {{
+        display: inline-block;
+        font-family: Arial, Helvetica, sans-serif;
+        margin-top: 8px;
+      }}
+      .tr-meta {{
+        margin: 0 0 8px 0;
+        font-size: 13px;
+      }}
+      .tr-table {{
+        border-collapse: collapse;
+        border: 2px solid #222;
+        font-size: 14px;
+      }}
+      .tr-table th {{
+        border: 1px solid #222;
+        background: #f2f2f2;
+        padding: 4px 7px;
+        text-align: left;
+        font-weight: 600;
+      }}
+      .tr-table td {{
+        border: 1px solid #222;
+        padding: 2px 6px;
+        line-height: 1.2;
+      }}
+      .tr-time {{
+        white-space: nowrap;
+        background: #ffffff;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }}
+      .tr-event {{
+        min-width: 220px;
+        white-space: nowrap;
+      }}
+    </style>
+    <div class="tr-wrap">
+      <div class="tr-meta">
+        Aircraft: <b>{html.escape(str(chosen_aircraft))}</b>
+        &nbsp;|&nbsp;
+        Engine: <b>{html.escape(str(chosen_engine))}</b>
+        &nbsp;|&nbsp;
+        Channel: <b>AC</b>
+        &nbsp;|&nbsp;
+        Date: <b>{html.escape(str(chosen_date))}</b>
+        &nbsp;|&nbsp;
+        Transitions: <b>{len(events)}</b>
+      </div>
+      <table class="tr-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>{html.escape(str(chosen_engine))} — AC</th>
+          </tr>
+        </thead>
+        <tbody>
+          {''.join(rows)}
+        </tbody>
+      </table>
+    </div>
+    """
+
+    ipy_display(HTML(table_html))
 
 
-def _ec_remove_parameters(_):
-    removed = set(ec_parameter_widget.value)
-    ec_parameter_widget.options = tuple(
-        option for option in ec_parameter_widget.options if option[1] not in removed
-    )
-    _ec_refresh_parameter_search()
+def _run_tr_event_view(_):
+    tr_event_button.disabled = True
 
-
-def _ec_refresh_flights(_=None, raise_errors=False):
-    ec_find_flights_button.disabled = True
     try:
-        with ec_status_output:
+        with tr_event_output:
             clear_output(wait=True)
-            aircraft = ec_aircraft_widget.value
-            flight_date = ec_date_widget.value
-            if flight_date is None:
-                raise ValueError("Choose a flight date.")
-            calendar_id = int(flight_date.strftime("%Y%m%d"))
-            rows = (
-                spark.table(EC_MASTER_TABLE)
+
+            chosen_date = tr_event_date_widget.value
+            chosen_aircraft = aircraft_widget.value
+            chosen_engine = engine_widget.value
+
+            if chosen_date is None:
+                raise ValueError("Select an event date.")
+
+            if chosen_aircraft not in aircraft_ids_by_identifier:
+                raise ValueError(f"Unknown aircraft: {chosen_aircraft}")
+
+            if chosen_engine not in engine_ids_by_aircraft.get(chosen_aircraft, {}):
+                raise ValueError(
+                    f"Engine {chosen_engine} is not mapped to aircraft {chosen_aircraft}."
+                )
+
+            internal_ids = aircraft_ids_by_identifier[chosen_aircraft]
+            if len(internal_ids) != 1:
+                raise ValueError(
+                    f"Aircraft {chosen_aircraft} does not map to exactly one internal aircraft ID."
+                )
+
+            chosen_internal_aircraft_id = next(iter(internal_ids))
+            chosen_calendar_id = int(chosen_date.strftime("%Y%m%d"))
+
+            master_day_df = (
+                spark.table(MASTER_TABLE)
                 .where(
-                    (F.col("AircraftIdentifier").cast("string") == aircraft)
-                    & (F.col("CalendarId") == calendar_id)
+                    (F.col("AircraftIdentifier").cast("string") == chosen_aircraft)
+                    & (F.col("EngineSerialNumber").cast("string") == chosen_engine)
+                    & (F.col("CalendarId") == chosen_calendar_id)
                 )
-                .select(
-                    "StartDatetime",
-                    "EndDatetime",
-                    F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
+            )
+
+            day_windows_df = (
+                master_day_df
+                .select("StartDatetime", "EndDatetime")
+                .where(
+                    F.col("StartDatetime").isNotNull()
+                    & F.col("EndDatetime").isNotNull()
                 )
-                .where(F.col("StartDatetime").isNotNull() & F.col("EndDatetime").isNotNull())
                 .groupBy("StartDatetime")
-                .agg(
-                    F.max("EndDatetime").alias("EndDatetime"),
-                    F.sort_array(F.collect_set("EngineSerialNumber")).alias("Engines"),
-                )
+                .agg(F.max("EndDatetime").alias("EndDatetime"))
                 .where(F.col("EndDatetime") >= F.col("StartDatetime"))
+            )
+
+            day_windows = (
+                day_windows_df
                 .orderBy("StartDatetime")
                 .collect()
             )
-            options = []
-            for row in rows:
-                engines = [engine for engine in row.Engines if engine is not None]
-                label = (
-                    f"{_ec_timestamp_text(row.StartDatetime)} – "
-                    f"{_ec_timestamp_text(row.EndDatetime)} | {len(engines)} engines"
+
+            if not day_windows:
+                print(
+                    f"No flight windows found for aircraft {chosen_aircraft}, "
+                    f"engine {chosen_engine}, on {chosen_date}."
                 )
-                options.append((label, row.StartDatetime))
-            ec_flight_widget.options = options
-            if options:
-                ec_flight_widget.value = options[0][1]
-                print(f"Found {len(options)} flights for {aircraft} on {flight_date}.")
-            else:
-                print(f"No flights were found for {aircraft} on {flight_date}.")
-    except Exception as exc:
-        ec_flight_widget.options = []
-        with ec_status_output:
-            print(f"Unable to find flights: {exc}")
-        if raise_errors:
-            raise
-    finally:
-        ec_find_flights_button.disabled = False
+                return
 
+            scan_schema = spark.table(SCAN_TABLE)
+            scan_columns = set(scan_schema.columns)
 
-def _ec_load_timeline(_):
-    ec_load_button.disabled = True
-    ec_progress_widget.value = "<b>Preparing the selected flight…</b>"
-    try:
-        with ec_chart_output:
-            clear_output(wait=True)
-        aircraft = ec_aircraft_widget.value
-        flight_date = ec_date_widget.value
-        start_time = ec_flight_widget.value
-        parameters = _ec_selected_parameters()
-        if flight_date is None or start_time is None:
-            raise ValueError("Choose a date and flight before loading the timeline.")
-        if not parameters:
-            raise ValueError("Select at least one signal.")
-        calendar_id = int(flight_date.strftime("%Y%m%d"))
-        master_rows = (
-            spark.table(EC_MASTER_TABLE)
-            .where(
-                (F.col("AircraftIdentifier").cast("string") == aircraft)
-                & (F.col("CalendarId") == calendar_id)
-                & (F.col("StartDatetime") == F.lit(start_time))
-            )
-            .select(
-                F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
-                "AircraftId",
-                "StartDatetime",
-                "EndDatetime",
-            )
-            .where(
-                F.col("EngineSerialNumber").isNotNull()
-                & F.col("AircraftId").isNotNull()
-                & F.col("EndDatetime").isNotNull()
-                & (F.col("EndDatetime") >= F.col("StartDatetime"))
-            )
-            .collect()
-        )
-        engine_metadata = {}
-        for row in master_rows:
-            metadata = engine_metadata.setdefault(
-                row.EngineSerialNumber,
-                {"aircraft_ids": set(), "end_times": []},
-            )
-            metadata["aircraft_ids"].add(row.AircraftId)
-            metadata["end_times"].append(row.EndDatetime)
-        engines = sorted(engine_metadata)
-        if len(engines) != 2:
-            raise ValueError(
-                f"Expected exactly two engines for this flight; found {len(engines)}: {engines}"
-            )
-        engine_windows = {}
-        for engine in engines:
-            aircraft_ids = engine_metadata[engine]["aircraft_ids"]
-            if len(aircraft_ids) != 1:
+            signal_specs = []
+            missing_columns = []
+
+            for display_name, suffix, signal_type in TR_EVENT_SIGNALS:
+                full_column = f"{PARAMETER_PREFIX}AC_{suffix}"
+                if full_column not in scan_columns:
+                    missing_columns.append(full_column)
+                else:
+                    signal_specs.append(
+                        (display_name, full_column, signal_type)
+                    )
+
+            if missing_columns:
                 raise ValueError(
-                    f"Engine {engine} maps to {len(aircraft_ids)} aircraft IDs for this flight."
+                    "Required AC columns are missing from the scan schema:\n"
+                    + "\n".join(missing_columns)
                 )
-            engine_windows[engine] = {
-                "aircraft_id": next(iter(aircraft_ids)),
-                "end_time": max(engine_metadata[engine]["end_times"]),
-            }
-        end_time = max(window["end_time"] for window in engine_windows.values())
-        selected_columns = ["Timestamp", "AssetIdentifier"]
-        for base in parameters:
-            column = _ec_full_column(base)
-            if column in _ec_scan_schema_set:
-                selected_columns.append(column)
-        selected_columns = list(dict.fromkeys(selected_columns))
-        populated_signal = F.lit(False)
-        for column in selected_columns[2:]:
-            populated_signal = populated_signal | _ec_quote(column).isNotNull()
-        exact_engine_window = F.lit(False)
-        for engine in engines:
-            engine_window = engine_windows[engine]
-            exact_engine_window = exact_engine_window | (
-                (F.col("AircraftId") == F.lit(engine_window["aircraft_id"]))
-                & (F.col("AssetIdentifier").cast("string") == F.lit(engine))
-                & F.col("Timestamp").between(
-                    F.lit(start_time),
-                    F.lit(engine_window["end_time"]),
+
+            range_start = min(row.StartDatetime for row in day_windows)
+            range_end = max(row.EndDatetime for row in day_windows)
+
+            partition_filter = F.lit(False)
+            for partition_year, partition_month in _month_partitions_between_dates(
+                range_start.date(),
+                range_end.date(),
+            ):
+                partition_filter = partition_filter | (
+                    (F.col("year") == partition_year)
+                    & (F.col("Month") == partition_month)
+                )
+
+            scan_alias = (
+                spark.table(SCAN_TABLE)
+                .where(
+                    (F.col("AircraftId") == chosen_internal_aircraft_id)
+                    & (F.col("AssetIdentifier").cast("string") == chosen_engine)
+                    & partition_filter
+                )
+                .alias("scan")
+            )
+
+            window_alias = F.broadcast(day_windows_df).alias("window")
+
+            joined_df = (
+                scan_alias
+                .join(
+                    window_alias,
+                    (
+                        (scan_alias["StartDatetime"] == window_alias["StartDatetime"])
+                        & scan_alias["Timestamp"].between(
+                            window_alias["StartDatetime"],
+                            window_alias["EndDatetime"],
+                        )
+                    ),
+                    "inner",
+                )
+                .select(
+                    scan_alias["Timestamp"].alias("Timestamp"),
+                    scan_alias["StartDatetime"].alias("FlightStartDatetime"),
+                    *[
+                        scan_alias[column].alias(column)
+                        for _, column, _ in signal_specs
+                    ],
                 )
             )
-        source = (
-            _ec_scan_table.where(
-                (F.col("StartDatetime") == F.lit(start_time))
-                & _ec_month_filter(start_time, end_time)
-                & exact_engine_window
-                & populated_signal
+
+            event_frames = []
+
+            for signal_order, (display_name, column_name, signal_type) in enumerate(signal_specs):
+                value_column = F.col(f"`{column_name}`").cast("double")
+
+                if signal_type == "analog":
+                    normalized_value = (
+                        F.when(
+                            value_column.between(0.0, 3.0),
+                            F.lit(0.0),
+                        )
+                        .when(
+                            value_column.between(97.0, 100.0),
+                            F.lit(100.0),
+                        )
+                    )
+
+                    normalized_df = (
+                        joined_df
+                        .select(
+                            "FlightStartDatetime",
+                            "Timestamp",
+                            normalized_value.alias("EventValue"),
+                        )
+                        .where(F.col("EventValue").isNotNull())
+                    )
+                else:
+                    normalized_df = (
+                        joined_df
+                        .select(
+                            "FlightStartDatetime",
+                            "Timestamp",
+                            value_column.alias("EventValue"),
+                        )
+                        .where(F.col("EventValue").isNotNull())
+                    )
+
+                transition_window = (
+                    Window
+                    .partitionBy("FlightStartDatetime")
+                    .orderBy(F.col("Timestamp"))
+                )
+
+                transition_df = (
+                    normalized_df
+                    .withColumn(
+                        "PreviousValue",
+                        F.lag("EventValue").over(transition_window),
+                    )
+                    .where(
+                        F.col("PreviousValue").isNotNull()
+                        & (F.col("EventValue") != F.col("PreviousValue"))
+                    )
+                    .select(
+                        "Timestamp",
+                        F.lit(display_name).alias("Signal"),
+                        "EventValue",
+                        F.lit(signal_order).alias("SignalOrder"),
+                    )
+                )
+
+                event_frames.append(transition_df)
+
+            if not event_frames:
+                _tr_event_render_table(
+                    [],
+                    chosen_aircraft,
+                    chosen_engine,
+                    chosen_date,
+                )
+                return
+
+            events_df = event_frames[0]
+            for event_df in event_frames[1:]:
+                events_df = events_df.unionByName(event_df)
+
+            event_rows = (
+                events_df
+                .orderBy(
+                    F.col("Timestamp"),
+                    F.col("SignalOrder"),
+                )
+                .collect()
             )
-            .select(*[_ec_quote(column).alias(column) for column in selected_columns])
-        )
-        ec_progress_widget.value = "<b>Detecting AC endpoint and status transitions…</b>"
-        event_frame = (
-            _ec_build_event_df(source, parameters)
-            .orderBy("Timestamp", "AssetIdentifier", "parameter_order")
-            .limit(EC_MAX_EVENT_ROWS + 1)
-            .toPandas()
-        )
-        if len(event_frame) > EC_MAX_EVENT_ROWS:
-            raise RuntimeError(
-                f"More than {EC_MAX_EVENT_ROWS:,} transitions were found. Select fewer signals."
-            )
-        if event_frame.empty:
-            raise ValueError("No AC endpoint or status transitions were found for this flight.")
-        ec_progress_widget.value = "<b>Building the interactive millisecond timeline…</b>"
-        figure = _ec_build_timeline(
-            event_frame,
-            engines,
-            parameters,
-            start_time,
-            {engine: engine_windows[engine]["end_time"] for engine in engines},
-            aircraft,
-        )
-        with ec_chart_output:
-            figure.show(
-                renderer="notebook",
-                config={
-                    "displaylogo": False,
-                    "scrollZoom": True,
-                    "responsive": True,
-                    "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+
+            events = [
+                {
+                    "Timestamp": row.Timestamp,
+                    "Signal": row.Signal,
+                    "Value": row.EventValue,
                 }
+                for row in event_rows
+            ]
+
+            _tr_event_render_table(
+                events,
+                chosen_aircraft,
+                chosen_engine,
+                chosen_date,
             )
-        ec_progress_widget.value = (
-            f"<span style='color:#137333'><b>Loaded {len(event_frame):,} AC transitions. "
-            "Drag over any interval to zoom to milliseconds; double-click to reset.</b></span>"
-        )
-    except Exception as exc:
-        ec_progress_widget.value = (
-            "<span style='color:#b3261e'><b>Timeline failed.</b></span>"
-        )
-        with ec_chart_output:
-            clear_output(wait=True)
-            print(f"Unable to load timeline: {exc}")
+
     finally:
-        ec_load_button.disabled = False
+        tr_event_button.disabled = False
 
 
-ec_parameter_search.observe(_ec_add_parameter, names="value")
-ec_remove_parameter_button.on_click(_ec_remove_parameters)
-ec_find_flights_button.on_click(_ec_refresh_flights)
-ec_load_button.on_click(_ec_load_timeline)
+tr_event_button.on_click(_run_tr_event_view)
 
-ec_controls = widgets.VBox(
-    [
-        widgets.HBox([ec_aircraft_widget, ec_date_widget, ec_find_flights_button]),
-        ec_flight_widget,
-        ec_parameter_search,
-        ec_parameter_widget,
-        widgets.HBox([ec_remove_parameter_button, ec_load_button]),
-        ec_progress_widget,
-        ec_status_output,
-        ec_chart_output,
-    ]
+ipy_display(
+    widgets.VBox(
+        [
+            widgets.HTML(
+                "<b>AC thrust-reverser transition timeline</b><br>"
+                "<span style='font-size:12px'>"
+                "Uses the aircraft and engine selected above. "
+                "LVT signals retain only 0–3 → 0 and 97–100 → 100; "
+                "4–96 is ignored."
+                "</span>"
+            ),
+            widgets.HBox(
+                [
+                    tr_event_date_widget,
+                    tr_event_button,
+                ]
+            ),
+            tr_event_output,
+        ]
+    )
 )
-ipy_display(ec_controls)
-_ec_refresh_parameter_search()
-_ec_refresh_flights(raise_errors=True)
