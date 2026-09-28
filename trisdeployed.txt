@@ -3,31 +3,54 @@ TR_IS_DEPLOYED_COLUMNS = {
     for channel in CHANNELS
 }
 
-existing_comparison_date_widget = globals().get("comparison_date_widget")
-previous_comparison_date = getattr(existing_comparison_date_widget, "value", None)
-comparison_date_widget = widgets.DatePicker(
-    value=previous_comparison_date or end_date_widget.value,
-    description="Compare day:",
-    layout=widgets.Layout(width="300px"),
+TRU_TRANSITION_PARAMETERS = OrderedDict(
+    [
+        ("trIsDeployed", {"suffix": "IThrustReverser_trIsDeployed_data", "mode": "state"}),
+        ("trArmed", {"suffix": "IThrustReverser_trArmed_data", "mode": "state"}),
+        ("trDoorDeplStatus", {"suffix": "IThrustReverser_trDoorDeplStatus_data", "mode": "state"}),
+        ("trDoorStowStatus", {"suffix": "IThrustReverser_trDoorStowStatus_data", "mode": "state"}),
+        ("trInTransit", {"suffix": "IThrustReverser_trInTransit_data", "mode": "state"}),
+        ("loOwnTRLVTRaw", {"suffix": "IThrustReverser_loOwnTRLVTRaw_data", "mode": "endpoint"}),
+        ("upOwnTRLVTRaw", {"suffix": "IThrustReverser_upOwnTRLVTRaw_data", "mode": "endpoint"}),
+        ("trLVTPosVCtrl", {"suffix": "IThrustReverser_trLVTPosVCtrl_data", "mode": "endpoint"}),
+    ]
 )
-run_transition_btn = widgets.Button(
-    description="Build transition table",
-    button_style="primary",
-    layout=widgets.Layout(width="230px"),
-)
-transition_output = widgets.Output()
+
+TRU_ENDPOINT_LOW_MAX = 5.0
+TRU_ENDPOINT_HIGH_MIN = 95.0
+TRU_TRANSITION_COLUMNS = {
+    parameter: {
+        channel: f"{PARAMETER_PREFIX}{channel}_{specification['suffix']}"
+        for channel in CHANNELS
+    }
+    for parameter, specification in TRU_TRANSITION_PARAMETERS.items()
+}
 
 
-def _normalized_state_expression(column_name):
+def _normalized_transition_expression(column_name, mode):
     raw_column = F.col(f"`{column_name}`")
-    raw_text = F.lower(F.trim(raw_column.cast("string")))
-    numeric_value = raw_column.cast("double")
+    raw_text = F.trim(raw_column.cast("string"))
+    folded_text = F.lower(raw_text)
+    numeric_value = F.expr(f"try_cast(`{column_name}` as double)")
+    numeric_nonfinite = F.isnan(numeric_value) | numeric_value.isin(float("inf"), float("-inf"))
+    if mode == "endpoint":
+        return (
+            F.when(
+                raw_column.isNull() | numeric_value.isNull() | numeric_nonfinite,
+                F.lit(None).cast("string"),
+            )
+            .when(numeric_value <= F.lit(TRU_ENDPOINT_LOW_MAX), F.lit("0"))
+            .when(numeric_value >= F.lit(TRU_ENDPOINT_HIGH_MIN), F.lit("100"))
+            .otherwise(F.lit(None).cast("string"))
+        )
     return (
-        F.when(raw_text.isin("true", "on", "yes"), F.lit(1))
-        .when(raw_text.isin("false", "off", "no"), F.lit(0))
-        .when(numeric_value == F.lit(1.0), F.lit(1))
-        .when(numeric_value == F.lit(0.0), F.lit(0))
-        .otherwise(F.lit(None).cast("integer"))
+        F.when(raw_column.isNull() | (raw_text == ""), F.lit(None).cast("string"))
+        .when(folded_text.isin("true", "on", "yes"), F.lit("1"))
+        .when(folded_text.isin("false", "off", "no"), F.lit("0"))
+        .when(numeric_nonfinite, F.lit(None).cast("string"))
+        .when(numeric_value == F.lit(1.0), F.lit("1"))
+        .when(numeric_value == F.lit(0.0), F.lit("0"))
+        .otherwise(folded_text)
     )
 
 
@@ -36,225 +59,313 @@ def _millisecond_timestamp(value):
     return timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
+def _raw_value_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value]
+    if hasattr(value, "tolist") and not isinstance(value, str):
+        converted = value.tolist()
+        if isinstance(converted, list):
+            return [str(item) for item in converted]
+    try:
+        if pd.isna(value):
+            return []
+    except (TypeError, ValueError):
+        pass
+    return [str(value)]
+
+
 def _render_coverage_table(coverage_records):
-    header = "".join(
-        f"<th>{html.escape(column)}</th>"
-        for column in (
-            "ESN",
-            "Position",
-            "Channel",
-            "Rows",
-            "Non-null",
-            "Invalid",
-            "Initializations",
-            "Transitions",
-            "Conflicts",
-            "First sample",
-            "Last sample",
-        )
+    columns = (
+        "ESN",
+        "Position",
+        "Channel",
+        "Parameter",
+        "Source type",
+        "Rows",
+        "Non-null",
+        "Accepted",
+        "Ignored",
+        "Invalid",
+        "Initializations",
+        "Transitions",
+        "Conflicts",
+        "First sample",
+        "Last sample",
     )
+    header = "".join(f"<th>{html.escape(column)}</th>" for column in columns)
     rows = []
     for record in coverage_records:
-        values = [
-            record["ESN"],
-            record["Position"],
-            record["Channel"],
-            f"{record['Rows']:,}",
-            f"{record['Non-null']:,}",
-            f"{record['Invalid']:,}",
-            f"{record['Initializations']:,}",
-            f"{record['Transitions']:,}",
-            f"{record['Conflicts']:,}",
-            record["First sample"],
-            record["Last sample"],
-        ]
-        rows.append("<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in values) + "</tr>")
+        values = []
+        for column in columns:
+            value = record[column]
+            values.append(f"{value:,}" if isinstance(value, int) else str(value))
+        rows.append(
+            "<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in values) + "</tr>"
+        )
+    return """
+    <style>
+      .tru-coverage-scroll {width:100%;max-height:360px;overflow:auto;border:1px solid #cbd5e1;border-radius:8px;background:#ffffff}
+      .tru-coverage {width:100%;border-collapse:separate;border-spacing:0;font-size:12px;color:#1e293b}
+      .tru-coverage th {position:sticky;top:0;z-index:2;background:#f8fafc;color:#0f172a;border-bottom:2px solid #94a3b8;padding:7px 9px;text-align:left;white-space:nowrap}
+      .tru-coverage td {border-bottom:1px solid #e2e8f0;padding:6px 9px;text-align:left;white-space:nowrap}
+      .tru-coverage tbody tr:hover td {background:#f8fafc}
+    </style>
+    <div class="tru-coverage-scroll"><table class="tru-coverage"><thead><tr>
+    """ + header + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+
+
+def _event_badge(event):
+    parameter = str(event["Parameter"])
+    mode = str(event["Mode"])
+    event_type = str(event["EventType"])
+    state = "" if event.get("State") is None else str(event.get("State"))
+    raw_values = _raw_value_list(event.get("RawValues"))
+    raw_label = " / ".join(raw_values) if raw_values else "no value"
+    exact_time = pd.Timestamp(event["Timestamp"]).isoformat()
+    if event_type == "conflict":
+        label = f"{parameter}: conflict [{raw_label}]"
+        value_class = "value-conflict"
+    elif mode == "endpoint":
+        label = f"{parameter}={raw_label} (≈{state})"
+        value_class = "endpoint-low" if state == "0" else "endpoint-high"
+    else:
+        label = f"{parameter}={raw_label}"
+        if state == "1":
+            value_class = "state-one"
+        elif state == "0":
+            value_class = "state-zero"
+        else:
+            value_class = "state-categorical"
+    initial_class = " event-initial" if event_type == "initialization" else ""
+    initial_tag = "<span class='event-tag'>initial</span>" if event_type == "initialization" else ""
     return (
-        "<div style='overflow:auto;max-height:320px;border:1px solid #ccc'>"
-        "<table class='coverage-table' style='width:100%;border-collapse:collapse;font-size:12px'>"
-        "<thead><tr>" + header + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
-        "<style>.coverage-table th,.coverage-table td{padding:6px 8px;border-bottom:1px solid #ddd;text-align:left}"
-        ".coverage-table th{position:sticky;top:0;background:#f5f5f5;z-index:2}</style>"
+        f"<div class='event-badge {value_class}{initial_class}' title='{html.escape(exact_time)}'>"
+        f"{html.escape(label)}{initial_tag}</div>"
     )
 
 
-def _render_transition_table(event_rows, esns):
-    columns = [(esn, channel) for esn in esns for channel in CHANNELS]
-    rows_by_timestamp = OrderedDict()
+def _render_transition_table(event_rows, esns, positions):
+    columns = [(str(esn), channel) for esn in esns for channel in CHANNELS]
+    rows_by_millisecond = OrderedDict()
     for event in event_rows:
         timestamp = pd.Timestamp(event["Timestamp"])
-        row = rows_by_timestamp.setdefault(timestamp, {column: [] for column in columns})
+        millisecond = timestamp.floor("ms")
+        row = rows_by_millisecond.setdefault(millisecond, {column: [] for column in columns})
         key = (str(event["ESN"]), str(event["Channel"]))
-        if key not in row:
-            continue
-        if event["EventType"] == "conflict":
-            raw_values = ", ".join(str(value) for value in event.get("RawValues", []))
-            label = f"Conflict: {raw_values}"
-        else:
-            label = f"IsDeployed={int(event['State'])}"
-        row[key].append((label, event["EventType"], event.get("State")))
-
-    header_cells = ["<th>Timestamp</th>"] + [
-        f"<th>ESN {html.escape(str(esn))} {channel}</th>" for esn, channel in columns
-    ]
+        if key in row:
+            row[key].append(event)
+    header_cells = ["<th class='timestamp-header'>Timestamp</th>"]
+    for esn, channel in columns:
+        position = positions.get(esn) or ""
+        position_label = f" · {html.escape(str(position))}" if position else ""
+        channel_class = "channel-ac" if channel == "AC" else "channel-bc"
+        header_cells.append(
+            f"<th class='{channel_class}'>ESN {html.escape(esn)}{position_label}<br>{html.escape(channel)}</th>"
+        )
     body_rows = []
-    for timestamp, values in rows_by_timestamp.items():
+    for millisecond, values in rows_by_millisecond.items():
         cells = [
-            f"<td class='transition-time' title='{html.escape(timestamp.isoformat())}'>"
-            f"{html.escape(_millisecond_timestamp(timestamp))}</td>"
+            f"<td class='transition-time' title='{html.escape(millisecond.isoformat())}'>"
+            f"{html.escape(_millisecond_timestamp(millisecond))}</td>"
         ]
         for column in columns:
-            entries = values[column]
-            if not entries:
-                cells.append("<td></td>")
-                continue
-            fragments = []
-            classes = []
-            for label, event_type, state in entries:
-                fragments.append(html.escape(label))
-                if event_type == "conflict":
-                    classes.append("state-conflict")
-                elif state == 1:
-                    classes.append("state-one")
-                else:
-                    classes.append("state-zero")
-                if event_type == "initialization":
-                    classes.append("state-initial")
-            cells.append(f"<td class='{' '.join(sorted(set(classes)))}'>{'<br>'.join(fragments)}</td>")
+            badges = "".join(_event_badge(event) for event in values[column])
+            cells.append(f"<td class='event-cell'>{badges}</td>")
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
-
     return """
     <style>
-      .transition-scroll {width:100%;max-height:720px;overflow:auto;border:1px solid #999;background:white}
-      .transition-ledger {width:100%;min-width:1000px;border-collapse:collapse;font-size:13px}
-      .transition-ledger th {position:sticky;top:0;z-index:3;background:#f3f3f3;border:1px solid #aaa;padding:7px;text-align:left}
-      .transition-ledger td {border:1px solid #bbb;padding:6px 8px;white-space:nowrap}
-      .transition-time {font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#fafafa}
-      .state-one {background:#c6efce;color:#145a24;font-weight:700}
-      .state-zero {background:#e7e6e6;color:#333;font-weight:700}
-      .state-initial {box-shadow:inset 4px 0 0 #f9a825}
-      .state-conflict {background:#ffc7ce;color:#9c0006;font-weight:800}
+      .transition-scroll {width:100%;max-height:760px;overflow:auto;border:1px solid #94a3b8;border-radius:8px;background:#ffffff}
+      .transition-ledger {width:100%;min-width:1100px;border-collapse:separate;border-spacing:0;font-size:13px;color:#0f172a}
+      .transition-ledger th {position:sticky;top:0;z-index:4;border-right:1px solid #cbd5e1;border-bottom:2px solid #64748b;padding:9px 10px;text-align:left;white-space:nowrap}
+      .transition-ledger .timestamp-header {left:0;z-index:6;background:#f8fafc;color:#0f172a}
+      .transition-ledger .channel-ac {background:#dbeafe;color:#1e3a8a}
+      .transition-ledger .channel-bc {background:#ede9fe;color:#4c1d95}
+      .transition-ledger td {border-right:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0;padding:6px 8px;vertical-align:top}
+      .transition-ledger tbody tr:nth-child(even) td {background:#fafcff}
+      .transition-ledger tbody tr:hover td {background:#f1f5f9}
+      .transition-ledger .transition-time {position:sticky;left:0;z-index:2;min-width:186px;background:#ffffff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:600;color:#334155;white-space:nowrap}
+      .transition-ledger tbody tr:nth-child(even) .transition-time {background:#f8fafc}
+      .transition-ledger .event-cell {min-width:225px}
+      .event-badge {display:block;margin:2px 0;padding:5px 7px;border:1px solid;border-radius:6px;line-height:1.25;white-space:normal;overflow-wrap:anywhere;font-weight:650}
+      .state-one {background:#dbeafe;border-color:#60a5fa;color:#1e3a8a}
+      .state-zero {background:#f1f5f9;border-color:#cbd5e1;color:#334155}
+      .state-categorical {background:#f3e8ff;border-color:#c084fc;color:#6b21a8}
+      .endpoint-low {background:#ffedd5;border-color:#fb923c;color:#9a3412}
+      .endpoint-high {background:#ccfbf1;border-color:#2dd4bf;color:#115e59}
+      .value-conflict {background:#fee2e2;border-color:#f87171;color:#991b1b;font-weight:800}
+      .event-initial {box-shadow:inset 4px 0 0 #f59e0b;padding-left:10px}
+      .event-tag {display:inline-block;margin-left:7px;padding:1px 5px;border-radius:999px;background:#fef3c7;color:#92400e;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.03em}
     </style>
     <div class="transition-scroll"><table class="transition-ledger"><thead><tr>
     """ + "".join(header_cells) + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div>"
 
 
-def _build_transition_comparison(_, raise_errors=False):
-    run_transition_btn.disabled = True
+def _build_transition_comparison(chosen_day, raise_errors=False):
     try:
-        with transition_output:
-            clear_output(wait=True)
-            chosen_aircraft = aircraft_widget.value
-            chosen_day = comparison_date_widget.value
-            if chosen_day is None:
-                raise ValueError("A comparison day is required.")
-            day_start, day_end = _calendar_bounds(chosen_day, chosen_day)
-            master_df, windows_df, esns, positions, aircraft_ids = _resolve_engine_windows(
-                chosen_aircraft, day_start, day_end
+        print("Building the TRU transition table...")
+        chosen_aircraft = selected_acid
+        if chosen_day is None:
+            raise ValueError("A comparison day is required.")
+        day_start, day_end = _calendar_bounds(chosen_day, chosen_day)
+        master_df, windows_df, esns, positions, aircraft_ids = _resolve_engine_windows(
+            chosen_aircraft, day_start, day_end
+        )
+        esns = [str(esn) for esn in esns]
+        positions = {str(esn): position for esn, position in positions.items()}
+        if not esns:
+            print(f"WARNING: No engine master records overlap {chosen_day} for aircraft {chosen_aircraft}.")
+            globals().update(
+                {
+                    "transition_event_df": pd.DataFrame(),
+                    "transition_coverage_df": pd.DataFrame(),
+                    "transition_esns": [],
+                }
             )
-            if not esns:
-                print(f"WARNING: No engine master records overlap {chosen_day} for aircraft {chosen_aircraft}.")
-                globals().update(
-                    {
-                        "transition_event_df": pd.DataFrame(),
-                        "transition_coverage_df": pd.DataFrame(),
-                        "transition_esns": [],
-                    }
-                )
-                return
-
-            scan_schema_columns = spark.table(SCAN_TABLE).columns
-            available_channels = {
-                channel: column
-                for channel, column in TR_IS_DEPLOYED_COLUMNS.items()
-                if column in scan_schema_columns
-            }
-            missing_channels = [channel for channel in CHANNELS if channel not in available_channels]
-            for channel in missing_channels:
-                print(f"WARNING: The {channel} trIsDeployed parameter is absent from the scan schema.")
-
-            comparison_scan, _ = _windowed_scan(
-                windows_df,
-                aircraft_ids,
-                esns,
-                requested_columns=list(available_channels.values()),
-                strict_start=day_start,
-                strict_end=day_end,
-            )
-            coverage_expressions = [F.count(F.lit(1)).alias("_Rows")]
-            for channel, column_name in available_channels.items():
+            return
+        scan_source = spark.table(SCAN_TABLE)
+        schema_types = {
+            field.name: field.dataType.simpleString() for field in scan_source.schema.fields
+        }
+        available_columns = {}
+        for parameter, channel_columns in TRU_TRANSITION_COLUMNS.items():
+            for channel, column_name in channel_columns.items():
+                if column_name in schema_types:
+                    available_columns[(parameter, channel)] = column_name
+                else:
+                    print(
+                        f"WARNING: {channel} {parameter} is absent from the scan schema "
+                        f"({column_name})."
+                    )
+        comparison_scan, _ = _windowed_scan(
+            windows_df,
+            aircraft_ids,
+            esns,
+            requested_columns=list(available_columns.values()),
+            strict_start=day_start,
+            strict_end=day_end,
+        )
+        coverage_expressions = [F.count(F.lit(1)).alias("_Rows")]
+        coverage_aliases = {}
+        for parameter_index, (parameter, specification) in enumerate(
+            TRU_TRANSITION_PARAMETERS.items()
+        ):
+            mode = specification["mode"]
+            for channel in CHANNELS:
+                column_name = available_columns.get((parameter, channel))
+                if column_name is None:
+                    continue
+                alias_prefix = f"_P{parameter_index}_{channel}"
+                coverage_aliases[(parameter, channel)] = alias_prefix
                 raw_column = F.col(f"`{column_name}`")
-                normalized_state = _normalized_state_expression(column_name)
+                numeric_value = F.expr(f"try_cast(`{column_name}` as double)")
+                numeric_nonfinite = F.isnan(numeric_value) | numeric_value.isin(
+                    float("inf"), float("-inf")
+                )
+                normalized_value = _normalized_transition_expression(column_name, mode)
+                ignored_condition = (
+                    raw_column.isNotNull()
+                    & numeric_value.isNotNull()
+                    & ~numeric_nonfinite
+                    & (numeric_value > F.lit(TRU_ENDPOINT_LOW_MAX))
+                    & (numeric_value < F.lit(TRU_ENDPOINT_HIGH_MIN))
+                    if mode == "endpoint"
+                    else F.lit(False)
+                )
+                invalid_condition = (
+                    raw_column.isNotNull() & (numeric_value.isNull() | numeric_nonfinite)
+                    if mode == "endpoint"
+                    else raw_column.isNotNull() & normalized_value.isNull()
+                )
                 coverage_expressions.extend(
                     [
-                        F.count(raw_column).alias(f"_{channel}NonNull"),
-                        F.sum(
-                            F.when(raw_column.isNotNull() & normalized_state.isNull(), 1).otherwise(0)
-                        ).alias(f"_{channel}Invalid"),
+                        F.count(raw_column).alias(f"{alias_prefix}_NonNull"),
+                        F.sum(F.when(normalized_value.isNotNull(), 1).otherwise(0)).alias(
+                            f"{alias_prefix}_Accepted"
+                        ),
+                        F.sum(F.when(ignored_condition, 1).otherwise(0)).alias(
+                            f"{alias_prefix}_Ignored"
+                        ),
+                        F.sum(F.when(invalid_condition, 1).otherwise(0)).alias(
+                            f"{alias_prefix}_Invalid"
+                        ),
                         F.min(F.when(raw_column.isNotNull(), F.col("Timestamp"))).alias(
-                            f"_{channel}FirstSample"
+                            f"{alias_prefix}_FirstSample"
                         ),
                         F.max(F.when(raw_column.isNotNull(), F.col("Timestamp"))).alias(
-                            f"_{channel}LastSample"
+                            f"{alias_prefix}_LastSample"
                         ),
                     ]
                 )
-            coverage_rows = (
-                comparison_scan.groupBy(
-                    F.col("AssetIdentifier").cast("string").alias("ESN")
-                )
-                .agg(*coverage_expressions)
-                .collect()
-            )
-            total_rows = sum(int(row["_Rows"] or 0) for row in coverage_rows)
-            print(f"Aircraft {chosen_aircraft} | Day {chosen_day} | ESNs: {', '.join(esns)}")
-            print(f"Strict calendar-day scan rows: {total_rows:,}")
-
-            event_frames = []
-            coverage_lookup = {}
-            for row in coverage_rows:
-                for channel in available_channels:
-                    first_sample = row[f"_{channel}FirstSample"]
-                    last_sample = row[f"_{channel}LastSample"]
-                    coverage_lookup[(str(row.ESN), channel)] = {
-                        "Rows": int(row["_Rows"] or 0),
-                        "Non-null": int(row[f"_{channel}NonNull"] or 0),
-                        "Invalid": int(row[f"_{channel}Invalid"] or 0),
-                        "First sample": _millisecond_timestamp(first_sample) if first_sample else "",
-                        "Last sample": _millisecond_timestamp(last_sample) if last_sample else "",
-                    }
-            for channel, column_name in available_channels.items():
+        coverage_rows = (
+            comparison_scan.groupBy(F.col("AssetIdentifier").cast("string").alias("ESN"))
+            .agg(*coverage_expressions)
+            .collect()
+        )
+        total_rows = sum(int(row["_Rows"] or 0) for row in coverage_rows)
+        print(f"Aircraft {chosen_aircraft} | Day {chosen_day} | ESNs: {', '.join(esns)}")
+        print(f"Strict calendar-day scan rows: {total_rows:,}")
+        coverage_lookup = {}
+        for row in coverage_rows:
+            esn = str(row["ESN"])
+            for parameter, channel in available_columns:
+                alias_prefix = coverage_aliases[(parameter, channel)]
+                first_sample = row[f"{alias_prefix}_FirstSample"]
+                last_sample = row[f"{alias_prefix}_LastSample"]
+                coverage_lookup[(esn, parameter, channel)] = {
+                    "Rows": int(row["_Rows"] or 0),
+                    "Non-null": int(row[f"{alias_prefix}_NonNull"] or 0),
+                    "Accepted": int(row[f"{alias_prefix}_Accepted"] or 0),
+                    "Ignored": int(row[f"{alias_prefix}_Ignored"] or 0),
+                    "Invalid": int(row[f"{alias_prefix}_Invalid"] or 0),
+                    "First sample": _millisecond_timestamp(first_sample) if first_sample else "",
+                    "Last sample": _millisecond_timestamp(last_sample) if last_sample else "",
+                }
+        event_frames = []
+        for parameter_index, (parameter, specification) in enumerate(
+            TRU_TRANSITION_PARAMETERS.items()
+        ):
+            mode = specification["mode"]
+            for channel in CHANNELS:
+                column_name = available_columns.get((parameter, channel))
+                if column_name is None:
+                    continue
                 raw_column = F.col(f"`{column_name}`")
-                normalized_state = _normalized_state_expression(column_name)
-                channel_rows = comparison_scan.select(
+                normalized_value = _normalized_transition_expression(column_name, mode)
+                parameter_rows = comparison_scan.select(
                     F.col("Timestamp"),
                     F.col("StartDatetime"),
                     F.col("AssetIdentifier").cast("string").alias("ESN"),
                     raw_column.cast("string").alias("RawValue"),
-                    normalized_state.alias("State"),
-                )
-                grouped = channel_rows.where(F.col("RawValue").isNotNull()).groupBy(
-                    "Timestamp", "StartDatetime", "ESN"
-                ).agg(
-                    F.collect_set("State").alias("States"),
-                    F.collect_set("RawValue").alias("RawValues"),
+                    normalized_value.alias("State"),
+                ).where(normalized_value.isNotNull())
+                grouped = parameter_rows.groupBy("Timestamp", "StartDatetime", "ESN").agg(
+                    F.sort_array(F.collect_set("State")).alias("States"),
+                    F.sort_array(F.collect_set("RawValue")).alias("RawValues"),
                 )
                 valid_unique = grouped.where(F.size("States") == 1).select(
                     "Timestamp",
                     "StartDatetime",
                     "ESN",
-                    F.element_at("States", 1).cast("integer").alias("State"),
+                    F.element_at("States", 1).cast("string").alias("State"),
                     "RawValues",
                 )
                 sequence_window = Window.partitionBy("ESN", "StartDatetime").orderBy("Timestamp")
-                sequenced = valid_unique.withColumn("PreviousState", F.lag("State").over(sequence_window))
+                sequenced = valid_unique.withColumn(
+                    "PreviousState", F.lag("State").over(sequence_window)
+                )
                 events = sequenced.where(
-                    F.col("PreviousState").isNull() | (F.col("State") != F.col("PreviousState"))
+                    F.col("PreviousState").isNull()
+                    | (F.col("State") != F.col("PreviousState"))
                 ).select(
                     "Timestamp",
                     "StartDatetime",
                     "ESN",
                     F.lit(channel).alias("Channel"),
+                    F.lit(parameter).alias("Parameter"),
+                    F.lit(parameter_index).cast("integer").alias("ParameterOrder"),
+                    F.lit(mode).alias("Mode"),
                     "State",
                     F.when(F.col("PreviousState").isNull(), F.lit("initialization"))
                     .otherwise(F.lit("transition"))
@@ -266,88 +377,143 @@ def _build_transition_comparison(_, raise_errors=False):
                     "StartDatetime",
                     "ESN",
                     F.lit(channel).alias("Channel"),
-                    F.lit(None).cast("integer").alias("State"),
+                    F.lit(parameter).alias("Parameter"),
+                    F.lit(parameter_index).cast("integer").alias("ParameterOrder"),
+                    F.lit(mode).alias("Mode"),
+                    F.lit(None).cast("string").alias("State"),
                     F.lit("conflict").alias("EventType"),
                     "RawValues",
                 )
                 event_frames.extend([events, conflicts])
-
-            if event_frames:
-                all_events = event_frames[0]
-                for frame in event_frames[1:]:
-                    all_events = all_events.unionByName(frame)
-                event_pdf = all_events.orderBy("Timestamp", "ESN", "Channel").toPandas()
-            else:
-                event_pdf = pd.DataFrame(
-                    columns=["Timestamp", "StartDatetime", "ESN", "Channel", "State", "EventType", "RawValues"]
-                )
-
-            event_counts = {}
+        event_columns = [
+            "Timestamp",
+            "StartDatetime",
+            "ESN",
+            "Channel",
+            "Parameter",
+            "ParameterOrder",
+            "Mode",
+            "State",
+            "EventType",
+            "RawValues",
+        ]
+        if event_frames:
+            all_events = event_frames[0]
+            for frame in event_frames[1:]:
+                all_events = all_events.unionByName(frame)
+            event_pdf = all_events.orderBy(
+                "Timestamp", "ESN", "Channel", "ParameterOrder"
+            ).toPandas()
             if not event_pdf.empty:
-                for (esn, channel, event_type), count in event_pdf.groupby(
-                    ["ESN", "Channel", "EventType"], dropna=False
-                ).size().items():
-                    event_counts[(str(esn), str(channel), str(event_type))] = int(count)
-
-            coverage_records = []
-            warnings = []
-            for esn in esns:
-                for channel in CHANNELS:
+                event_pdf["TimestampMs"] = pd.to_datetime(event_pdf["Timestamp"]).dt.floor("ms")
+        else:
+            event_pdf = pd.DataFrame(columns=event_columns + ["TimestampMs"])
+        event_counts = {}
+        if not event_pdf.empty:
+            grouped_counts = event_pdf.groupby(
+                ["ESN", "Parameter", "Channel", "EventType"], dropna=False
+            ).size()
+            for key, count in grouped_counts.items():
+                esn, parameter, channel, event_type = key
+                event_counts[(str(esn), str(parameter), str(channel), str(event_type))] = int(count)
+        coverage_records = []
+        warnings = []
+        for esn in esns:
+            for channel in CHANNELS:
+                for parameter, specification in TRU_TRANSITION_PARAMETERS.items():
+                    column_name = TRU_TRANSITION_COLUMNS[parameter][channel]
                     base = coverage_lookup.get(
-                        (str(esn), channel),
-                        {"Rows": 0, "Non-null": 0, "Invalid": 0, "First sample": "", "Last sample": ""},
+                        (esn, parameter, channel),
+                        {
+                            "Rows": 0,
+                            "Non-null": 0,
+                            "Accepted": 0,
+                            "Ignored": 0,
+                            "Invalid": 0,
+                            "First sample": "",
+                            "Last sample": "",
+                        },
                     )
                     record = {
-                        "ESN": str(esn),
+                        "ESN": esn,
                         "Position": positions.get(esn) or "",
                         "Channel": channel,
+                        "Parameter": parameter,
+                        "Source type": schema_types.get(column_name, "missing"),
                         **base,
-                        "Initializations": event_counts.get((str(esn), channel, "initialization"), 0),
-                        "Transitions": event_counts.get((str(esn), channel, "transition"), 0),
-                        "Conflicts": event_counts.get((str(esn), channel, "conflict"), 0),
+                        "Initializations": event_counts.get(
+                            (esn, parameter, channel, "initialization"), 0
+                        ),
+                        "Transitions": event_counts.get(
+                            (esn, parameter, channel, "transition"), 0
+                        ),
+                        "Conflicts": event_counts.get(
+                            (esn, parameter, channel, "conflict"), 0
+                        ),
                     }
                     coverage_records.append(record)
-                    if channel not in available_channels:
-                        warnings.append(f"ESN {esn} {channel}: parameter missing from schema")
+                    if (parameter, channel) not in available_columns:
+                        warnings.append(f"ESN {esn} {channel} {parameter}: parameter missing from schema")
                     elif record["Non-null"] == 0:
-                        warnings.append(f"ESN {esn} {channel}: no non-null samples")
+                        warnings.append(f"ESN {esn} {channel} {parameter}: no non-null samples")
+                    elif specification["mode"] == "endpoint" and record["Accepted"] == 0:
+                        warnings.append(
+                            f"ESN {esn} {channel} {parameter}: no values reached ≤"
+                            f"{TRU_ENDPOINT_LOW_MAX:g} or ≥{TRU_ENDPOINT_HIGH_MIN:g}"
+                        )
                     if record["Invalid"]:
                         warnings.append(
-                            f"ESN {esn} {channel}: {record['Invalid']:,} values could not be normalized to 0 or 1"
+                            f"ESN {esn} {channel} {parameter}: {record['Invalid']:,} invalid values"
                         )
                     if record["Conflicts"]:
                         warnings.append(
-                            f"ESN {esn} {channel}: {record['Conflicts']:,} timestamps contain conflicting values"
+                            f"ESN {esn} {channel} {parameter}: {record['Conflicts']:,} "
+                            "timestamps contain conflicting values"
                         )
-
-            for warning in warnings:
-                print("WARNING: " + warning)
-            ipy_display(HTML(_render_coverage_table(coverage_records)))
-            if event_pdf.empty:
-                print("WARNING: No initialization or transition events were found for the selected day.")
-            else:
-                event_records = event_pdf.to_dict("records")
-                ipy_display(HTML(_render_transition_table(event_records, esns)))
-                print(f"Transition-ledger timestamps: {event_pdf['Timestamp'].nunique():,}")
-
-            globals().update(
-                {
-                    "transition_event_df": event_pdf,
-                    "transition_coverage_df": pd.DataFrame(coverage_records),
-                    "transition_esns": esns,
-                    "transition_master_df": master_df,
-                    "transition_windows_df": windows_df,
-                }
-            )
+        for warning in warnings:
+            print("WARNING: " + warning)
+        ipy_display(HTML(_render_coverage_table(coverage_records)))
+        if event_pdf.empty:
+            print("WARNING: No initialization or transition events were found for the selected day.")
+        else:
+            ipy_display(HTML(_render_transition_table(event_pdf.to_dict("records"), esns, positions)))
+            print(f"Transition-ledger milliseconds: {event_pdf['TimestampMs'].nunique():,}")
+            print(f"Transition events: {len(event_pdf):,}")
+        globals().update(
+            {
+                "transition_event_df": event_pdf,
+                "transition_coverage_df": pd.DataFrame(coverage_records),
+                "transition_esns": esns,
+                "transition_master_df": master_df,
+                "transition_windows_df": windows_df,
+            }
+        )
     except Exception as exc:
-        with transition_output:
-            print(f"Unable to build the transition table: {exc}")
+        print(f"Unable to build the transition table: {exc}")
         if raise_errors:
             raise
-    finally:
-        run_transition_btn.disabled = False
 
 
-run_transition_btn.on_click(_build_transition_comparison)
-ipy_display(widgets.VBox([widgets.HBox([comparison_date_widget, run_transition_btn]), transition_output]))
-print("Select a date, then click Build transition table.")
+TRANSITION_DATE_WIDGET_NAME = "TransitionComparisonDate"
+transition_widget_created = False
+try:
+    transition_date_value = dbutils.widgets.get(TRANSITION_DATE_WIDGET_NAME)
+except Exception:
+    dbutils.widgets.text(
+        TRANSITION_DATE_WIDGET_NAME,
+        str(window_end_date),
+        "Transition comparison day (YYYY-MM-DD)",
+    )
+    transition_date_value = dbutils.widgets.get(TRANSITION_DATE_WIDGET_NAME)
+    transition_widget_created = True
+
+if transition_widget_created:
+    print("Set TransitionComparisonDate in the notebook toolbar, then rerun this cell.")
+else:
+    try:
+        transition_day = datetime.strptime(
+            transition_date_value.strip(), "%Y-%m-%d"
+        ).date()
+    except Exception as exc:
+        raise ValueError("TransitionComparisonDate must use YYYY-MM-DD format.") from exc
+    _build_transition_comparison(transition_day, raise_errors=True)
