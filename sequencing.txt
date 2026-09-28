@@ -1,236 +1,138 @@
 import ipywidgets as widgets
-import pandas as pd
 from IPython.display import clear_output, display as ipy_display
 
-TR_UNLOCKED_AC_COLUMN = f"{PARAMETER_PREFIX}AC_IThrustReverser_trIsUnlocked_data"
-
-aircraft_engine_map = engine_ids_by_aircraft[selected_acid]
-engine_serials = sorted(aircraft_engine_map.keys())
-
-if len(engine_serials) != 2:
-    raise ValueError(
-        f"Expected exactly 2 engines for aircraft {selected_acid}; found {len(engine_serials)}: {engine_serials}"
-    )
-
-engine_1_esn, engine_2_esn = engine_serials
-
-if TR_UNLOCKED_AC_COLUMN not in cda_cols:
-    raise ValueError(f"Required parameter is missing from the scan table: {TR_UNLOCKED_AC_COLUMN}")
-
-all_engine_master_df = (
-    spark.table(MASTER_TABLE)
-    .where(
-        (F.col("AircraftIdentifier").cast("string") == selected_acid)
-        & (F.col("EngineSerialNumber").cast("string").isin(engine_1_esn, engine_2_esn))
-        & F.col("CalendarId").between(start_calendar_id, end_calendar_id)
-    )
-    .select(
-        F.col("EngineSerialNumber").cast("string").alias("EngineSerialNumber"),
-        "StartDatetime",
-        "EndDatetime",
-    )
-    .where(
-        F.col("StartDatetime").isNotNull()
-        & F.col("EndDatetime").isNotNull()
-    )
-    .groupBy("EngineSerialNumber", "StartDatetime")
-    .agg(F.max("EndDatetime").alias("EndDatetime"))
-    .where(F.col("EndDatetime") >= F.col("StartDatetime"))
+TR_UNLOCKED_AC_COLUMN = (
+    f"{PARAMETER_PREFIX}AC_IThrustReverser_trIsUnlocked_data"
 )
 
-all_engine_windows = all_engine_master_df.collect()
-
-if all_engine_windows:
-    all_engine_range_start = min(row.StartDatetime for row in all_engine_windows)
-    all_engine_range_end = max(row.EndDatetime for row in all_engine_windows)
-
-    partition_filter = F.lit(False)
-    for partition_year, partition_month in _month_partitions_between_dates(
-        all_engine_range_start.date(),
-        all_engine_range_end.date(),
-    ):
-        partition_filter = partition_filter | (
-            (F.col("year") == partition_year)
-            & (F.col("Month") == partition_month)
-        )
-
-    scan_alias = (
-        spark.table(SCAN_TABLE)
-        .where(
-            (F.col("AircraftId") == internal_acid)
-            & (F.col("AssetIdentifier").cast("string").isin(engine_1_esn, engine_2_esn))
-            & partition_filter
-        )
-        .select(
-            F.col("Timestamp"),
-            F.col("StartDatetime"),
-            F.col("AssetIdentifier").cast("string").alias("AssetIdentifier"),
-            F.col(TR_UNLOCKED_AC_COLUMN),
-        )
-        .alias("scan")
+if TR_UNLOCKED_AC_COLUMN not in _data_df.columns:
+    raise ValueError(
+        f"Required AC thrust-reverser unlock parameter is missing: "
+        f"{TR_UNLOCKED_AC_COLUMN}"
     )
 
-    window_alias = F.broadcast(all_engine_master_df).alias("window")
+if _data_df.empty:
+    raise ValueError("No samples are available for state-change analysis.")
 
-    state_change_source_df = (
-        scan_alias.join(
-            window_alias,
-            (
-                (scan_alias["AssetIdentifier"] == window_alias["EngineSerialNumber"])
-                & (scan_alias["StartDatetime"] == window_alias["StartDatetime"])
-                & scan_alias["Timestamp"].between(
-                    window_alias["StartDatetime"],
-                    window_alias["EndDatetime"],
-                )
-            ),
-            "inner",
-        )
-        .select(
-            scan_alias["Timestamp"],
-            scan_alias["AssetIdentifier"],
-            scan_alias[TR_UNLOCKED_AC_COLUMN],
-        )
-        .orderBy("Timestamp", "AssetIdentifier")
-    )
+if "Timestamp" not in _data_df.columns:
+    raise ValueError("Timestamp is missing from the Pandas dataframe.")
 
-    state_change_df = state_change_source_df.toPandas()
-else:
-    state_change_df = pd.DataFrame(
-        columns=["Timestamp", "AssetIdentifier", TR_UNLOCKED_AC_COLUMN]
-    )
+tr_state_df = _data_df[
+    ["Timestamp", TR_UNLOCKED_AC_COLUMN]
+].copy()
 
-state_change_df["Timestamp"] = pd.to_datetime(
-    state_change_df["Timestamp"],
+tr_state_df["Timestamp"] = pd.to_datetime(
+    tr_state_df["Timestamp"],
     errors="coerce",
 )
 
-available_state_dates = sorted(
-    state_change_df["Timestamp"].dropna().dt.date.unique().tolist()
+tr_state_df["_State"] = pd.to_numeric(
+    tr_state_df[TR_UNLOCKED_AC_COLUMN],
+    errors="coerce",
 )
 
-if not available_state_dates:
-    raise RuntimeError("No timestamps are available for the selected aircraft and date range.")
+tr_state_df = tr_state_df[
+    tr_state_df["Timestamp"].notna()
+    & tr_state_df["_State"].isin([0, 1])
+].copy()
 
-state_date_widget = widgets.Dropdown(
-    options=available_state_dates,
-    value=available_state_dates[0],
+tr_state_df = tr_state_df.sort_values(
+    "Timestamp",
+    kind="stable",
+).reset_index(drop=True)
+
+available_tr_dates = sorted(
+    tr_state_df["Timestamp"].dt.date.unique().tolist()
+)
+
+if not available_tr_dates:
+    raise ValueError(
+        "No valid 0/1 trIsUnlocked_data samples are available."
+    )
+
+tr_date_widget = widgets.Dropdown(
+    options=[
+        (selected_date.strftime("%Y-%m-%d"), selected_date)
+        for selected_date in available_tr_dates
+    ],
+    value=available_tr_dates[-1],
     description="Date:",
     layout=widgets.Layout(width="300px"),
 )
 
-state_change_output = widgets.Output()
+tr_state_output = widgets.Output()
 
 
-def _binary_state(series):
-    normalized = series.astype("string").str.strip().str.lower()
-
-    mapped = normalized.map(
-        {
-            "0": 0,
-            "0.0": 0,
-            "false": 0,
-            "1": 1,
-            "1.0": 1,
-            "true": 1,
-        }
-    )
-
-    numeric = pd.to_numeric(normalized, errors="coerce")
-    mapped = mapped.fillna(numeric.where(numeric.isin([0, 1])))
-
-    return mapped.astype("Int64")
+def _format_transition(previous_state, current_state):
+    return f"{int(previous_state)} → {int(current_state)}"
 
 
-def _engine_state_changes(day_df, engine_esn):
-    engine_df = (
-        day_df.loc[
-            day_df["AssetIdentifier"] == engine_esn,
-            ["Timestamp", TR_UNLOCKED_AC_COLUMN],
-        ]
-        .dropna(subset=["Timestamp"])
-        .sort_values("Timestamp", kind="stable")
-        .copy()
-    )
+def _show_tr_unlock_state_changes(change=None):
+    selected_date = tr_date_widget.value
 
-    engine_df["State"] = _binary_state(engine_df[TR_UNLOCKED_AC_COLUMN])
-    engine_df = engine_df.dropna(subset=["State"]).copy()
-
-    if engine_df.empty:
-        return pd.DataFrame(columns=["Timestamp", "Transition"])
-
-    previous_state = engine_df["State"].shift(1)
-    transition_mask = previous_state.notna() & engine_df["State"].ne(previous_state)
-
-    transitions = engine_df.loc[
-        transition_mask,
-        ["Timestamp", "State"],
+    day_df = tr_state_df[
+        tr_state_df["Timestamp"].dt.date == selected_date
     ].copy()
 
-    transitions["PreviousState"] = previous_state.loc[transition_mask].astype("Int64")
-    transitions["Transition"] = (
-        transitions["PreviousState"].astype(str)
-        + " \u2192 "
-        + transitions["State"].astype(str)
-    )
-
-    return transitions[["Timestamp", "Transition"]]
-
-
-def _show_state_changes(change=None):
-    selected_date = state_date_widget.value
-
-    with state_change_output:
+    with tr_state_output:
         clear_output(wait=True)
 
-        day_df = state_change_df.loc[
-            state_change_df["Timestamp"].dt.date == selected_date
+        if day_df.empty:
+            print(f"No valid trIsUnlocked_data samples found for {selected_date}.")
+            return
+
+        day_df["_PreviousState"] = day_df["_State"].shift(1)
+
+        transitions = day_df[
+            day_df["_PreviousState"].notna()
+            & day_df["_State"].ne(day_df["_PreviousState"])
         ].copy()
 
-        engine_1_changes = _engine_state_changes(day_df, engine_1_esn).rename(
-            columns={"Transition": engine_1_esn}
-        )
-        engine_2_changes = _engine_state_changes(day_df, engine_2_esn).rename(
-            columns={"Transition": engine_2_esn}
-        )
-
-        result = (
-            engine_1_changes.merge(
-                engine_2_changes,
-                on="Timestamp",
-                how="outer",
+        if transitions.empty:
+            print(
+                f"No trIsUnlocked_data state changes found for "
+                f"{selected_date}."
             )
-            .sort_values("Timestamp", kind="stable")
-            .reset_index(drop=True)
+            return
+
+        transitions["_Transition"] = transitions.apply(
+            lambda row: _format_transition(
+                row["_PreviousState"],
+                row["_State"],
+            ),
+            axis=1,
         )
 
-        result = result.rename(
-            columns={
-                engine_1_esn: f"Engine-1 ID: {engine_1_esn}",
-                engine_2_esn: f"Engine-2 ID: {engine_2_esn}",
+        engine_1_column = f"Engine-1 ID ({selected_esn})"
+        engine_2_column = "Engine-2 ID"
+
+        result_df = pd.DataFrame(
+            {
+                "Timestamp": transitions["Timestamp"],
+                engine_1_column: transitions["_Transition"],
+                engine_2_column: "",
             }
         )
 
-        if result.empty:
-            print(f"No AC trIsUnlocked state changes on {selected_date}.")
-            return
-
-        display_result = result.copy()
-        display_result["Timestamp"] = display_result["Timestamp"].dt.strftime(
+        result_df["Timestamp"] = result_df["Timestamp"].dt.strftime(
             "%Y-%m-%d %H:%M:%S.%f"
         ).str[:-3]
 
-        ipy_display(display_result)
+        ipy_display(result_df.reset_index(drop=True))
 
 
-state_date_widget.observe(_show_state_changes, names="value")
+tr_date_widget.observe(
+    _show_tr_unlock_state_changes,
+    names="value",
+)
 
 ipy_display(
     widgets.VBox(
         [
-            state_date_widget,
-            state_change_output,
+            tr_date_widget,
+            tr_state_output,
         ]
     )
 )
 
-_show_state_changes()
+_show_tr_unlock_state_changes()
