@@ -1,0 +1,182 @@
+# State-change viewer for AC IThrustReverser_trIsUnlocked_data on both selected engines.
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+TR_UNLOCKED_AC_COLUMN = (
+    f"{PARAMETER_PREFIX}AC_IThrustReverser_trIsUnlocked_data"
+)
+
+if TR_UNLOCKED_AC_COLUMN not in _data_df.columns:
+    raise ValueError(
+        f"Required parameter is not available in the Pandas dataframe: "
+        f"{TR_UNLOCKED_AC_COLUMN}"
+    )
+
+_required_columns = {
+    "Timestamp",
+    "AssetIdentifier",
+    TR_UNLOCKED_AC_COLUMN,
+}
+_missing_columns = sorted(_required_columns.difference(_data_df.columns))
+if _missing_columns:
+    raise ValueError(
+        f"Required columns are missing from _data_df: {_missing_columns}"
+    )
+
+_unlock_df = _data_df[
+    ["Timestamp", "AssetIdentifier", TR_UNLOCKED_AC_COLUMN]
+].copy()
+
+_unlock_df["Timestamp"] = pd.to_datetime(
+    _unlock_df["Timestamp"],
+    errors="coerce",
+)
+_unlock_df = _unlock_df.dropna(subset=["Timestamp"])
+
+_unlock_df["_Date"] = _unlock_df["Timestamp"].dt.date
+
+_available_dates = sorted(_unlock_df["_Date"].dropna().unique().tolist())
+if not _available_dates:
+    raise ValueError("No valid dates are available in _data_df.")
+
+_engine_ids = [
+    engine_id
+    for engine_id in pd.unique(_unlock_df["AssetIdentifier"])
+    if pd.notna(engine_id)
+]
+
+if len(_engine_ids) != 2:
+    raise ValueError(
+        "Expected exactly two engine IDs in the selected data, "
+        f"but found {len(_engine_ids)}: {_engine_ids}"
+    )
+
+_engine_1_id, _engine_2_id = _engine_ids
+
+_date_dropdown = widgets.Dropdown(
+    options=[
+        (selected_date.strftime("%Y-%m-%d"), selected_date)
+        for selected_date in _available_dates
+    ],
+    value=_available_dates[0],
+    description="Date:",
+    style={"description_width": "initial"},
+    layout=widgets.Layout(width="260px"),
+)
+
+_state_change_output = widgets.Output()
+
+
+def _normalise_binary_state(series):
+    numeric = pd.to_numeric(series, errors="coerce")
+    return numeric.where(numeric.isin([0, 1]))
+
+
+def _engine_state_changes(day_df, engine_id):
+    engine_df = (
+        day_df.loc[
+            day_df["AssetIdentifier"].eq(engine_id),
+            ["Timestamp", TR_UNLOCKED_AC_COLUMN],
+        ]
+        .sort_values("Timestamp", kind="stable")
+        .copy()
+    )
+
+    engine_df["_State"] = _normalise_binary_state(
+        engine_df[TR_UNLOCKED_AC_COLUMN]
+    )
+    engine_df = engine_df.dropna(subset=["_State"])
+
+    if engine_df.empty:
+        return pd.DataFrame(columns=["Timestamp", "Transition"])
+
+    engine_df["_State"] = engine_df["_State"].astype("int8")
+    previous_state = engine_df["_State"].shift(1)
+
+    transition_mask = (
+        previous_state.notna()
+        & engine_df["_State"].ne(previous_state)
+    )
+
+    changes = engine_df.loc[
+        transition_mask,
+        ["Timestamp", "_State"],
+    ].copy()
+
+    changes["Transition"] = (
+        previous_state.loc[transition_mask].astype("int8").astype(str)
+        + " \u2192 "
+        + changes["_State"].astype(str)
+    )
+
+    return changes[["Timestamp", "Transition"]].reset_index(drop=True)
+
+
+def _render_unlock_state_changes(selected_date):
+    day_df = _unlock_df.loc[
+        _unlock_df["_Date"].eq(selected_date)
+    ].copy()
+
+    engine_1_changes = _engine_state_changes(
+        day_df,
+        _engine_1_id,
+    ).rename(columns={"Transition": str(_engine_1_id)})
+
+    engine_2_changes = _engine_state_changes(
+        day_df,
+        _engine_2_id,
+    ).rename(columns={"Transition": str(_engine_2_id)})
+
+    state_changes = pd.merge(
+        engine_1_changes,
+        engine_2_changes,
+        on="Timestamp",
+        how="outer",
+    ).sort_values("Timestamp", kind="stable")
+
+    state_changes = state_changes.reset_index(drop=True)
+
+    if state_changes.empty:
+        return pd.DataFrame(
+            columns=[
+                "Timestamp",
+                str(_engine_1_id),
+                str(_engine_2_id),
+            ]
+        )
+
+    state_changes["Timestamp"] = state_changes["Timestamp"].dt.strftime(
+        "%Y-%m-%d %H:%M:%S.%f"
+    ).str[:-3]
+
+    return state_changes.fillna("")
+
+
+def _update_state_change_table(change=None):
+    with _state_change_output:
+        clear_output(wait=True)
+
+        result = _render_unlock_state_changes(
+            _date_dropdown.value
+        )
+
+        print(
+            f"AC trIsUnlocked_data state changes | "
+            f"{_date_dropdown.value:%Y-%m-%d}"
+        )
+        print(
+            f"Engine 1: {_engine_1_id} | "
+            f"Engine 2: {_engine_2_id}"
+        )
+        print(f"Transitions detected: {len(result):,}")
+
+        display(result)
+
+
+_date_dropdown.observe(
+    _update_state_change_table,
+    names="value",
+)
+
+display(_date_dropdown, _state_change_output)
+_update_state_change_table()
